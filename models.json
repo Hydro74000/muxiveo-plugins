@@ -1,0 +1,29 @@
+{
+  "source": "https://github.com/TNTwise/rife-ncnn-vulkan",
+  "commit": "13338e38debe2e400b3eeecf6792312d01a692f9",
+  "license": "MIT (Practical-RIFE, hzwer) — LICENSES/MIT-Practical-RIFE.txt",
+  "default": "rife-v4.26",
+  "models": {
+    "rife-v4.22-lite": {
+      "preset": "fast",
+      "files": {
+        "flownet.param": {"sha256": "091119e19a5891a5477de8f90b3c9e979baece5ee57c27d4e4138a6cc2552cc3", "size": 28965},
+        "flownet.bin": {"sha256": "792da5d62937199886bf8bb781ab8e0eddf663854d57e4a43cd7b32e4e81b29b", "size": 9759728}
+      }
+    },
+    "rife-v4.26": {
+      "preset": "balanced",
+      "files": {
+        "flownet.param": {"sha256": "79f16c28903f93f8308f0c4c947f8c7e0c17d99a57b85473e5f298dd578d137b", "size": 67885},
+        "flownet.bin": {"sha256": "94d58e30b75d7c7609cfa6f3bdad524deddd14f5f75e85c36d2f827ef5c64731", "size": 11360684}
+      }
+    },
+    "rife-v4.25-heavy": {
+      "preset": "max",
+      "files": {
+        "flownet.param": {"sha256": "7ed289c79faf3985cf4fd455c3b9ea25b363c1f477323f12ab3582a1c1f1ba4b", "size": 67835},
+        "flownet.bin": {"sha256": "9b4c71aa1f6d6265585f39e0ea670e52dcf73d43f897e7fc44e5b5563ed2cfb9", "size": 43376108}
+      }
+    }
+  }
+}

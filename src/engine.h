@@ -1,0 +1,86 @@
+// Muxiveo — moteur d'interpolation RIFE v4 sur Vulkan (ncnn).
+// Entrée/sortie : trames YUV brutes au format y4m ; conversion YUV <-> RGB,
+// normalisation et quantification faites sur le GPU.
+
+#ifndef MUXIVEO_RIFE_ENGINE_H
+#define MUXIVEO_RIFE_ENGINE_H
+
+#include <filesystem>
+#include <string>
+
+#include "y4m.h"
+
+// ncnn
+#include "gpu.h"
+#include "net.h"
+
+struct ColorParams
+{
+    float kr = 0.2126f;  // BT.709 par défaut
+    float kb = 0.0722f;
+    bool full_range = false;
+    ChromaSiting siting = ChromaSiting::Left;
+};
+
+// Trame déjà convertie en RGB paddé et résidente sur le GPU.
+struct GpuFrame
+{
+    ncnn::VkMat rgb;
+    bool ready = false;
+
+    void reset()
+    {
+        rgb.release();
+        ready = false;
+    }
+};
+
+class RifeEngine
+{
+public:
+    RifeEngine();
+    ~RifeEngine();
+
+    bool init(int gpu_index, bool fp32, int num_threads, std::string& error);
+    bool load_model(const std::filesystem::path& dir, int padding, std::string& error);
+    bool configure(const FrameFormat& fmt, const ColorParams& color, std::string& error);
+
+    // Envoie une trame brute (padded_frame_bytes() octets, alignée sur 4) et la convertit en RGB.
+    bool upload(const uint8_t* frame, GpuFrame& out, std::string& error);
+
+    // Génère la trame intermédiaire au temps t (0 < t < 1) et l'écrit, au format y4m, dans dst.
+    bool interpolate(const GpuFrame& a, const GpuFrame& b, float t, uint8_t* dst, std::string& error);
+
+    // Diagnostic : conversion YUV -> RGB -> YUV sans réseau (mesure de la perte de conversion).
+    bool roundtrip(const GpuFrame& a, uint8_t* dst, std::string& error);
+
+    std::string device_name() const;
+    bool uses_fp16() const { return opt.use_fp16_storage; }
+
+private:
+    bool convert_and_download(ncnn::VkCompute& cmd, const ncnn::VkMat& rgb, uint8_t* dst, std::string& error);
+    int chroma_mode_x() const;
+    int chroma_mode_y() const;
+    ncnn::Pipeline* make_pipeline(const char* comp_data, int comp_size, int lx, int ly, int lz);
+
+    ncnn::VulkanDevice* vkdev;
+    ncnn::VkAllocator* blob_vkallocator;
+    ncnn::VkAllocator* staging_vkallocator;
+    ncnn::Net flownet;
+    ncnn::Option opt;
+
+    ncnn::Pipeline* pipeline_yuv_to_rgb;
+    ncnn::Pipeline* pipeline_rgb_to_yuv;
+    ncnn::Pipeline* pipeline_pack;
+    ncnn::Pipeline* pipeline_timestep;
+
+    FrameFormat fmt;
+    ColorParams color;
+    int padding;
+    int w_padded;
+    int h_padded;
+    int words;
+    int pack_dispatch_w;
+};
+
+#endif // MUXIVEO_RIFE_ENGINE_H
