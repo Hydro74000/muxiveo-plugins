@@ -6,7 +6,7 @@ cmake_policy(SET CMP0091 NEW)
 set(CMAKE_POLICY_DEFAULT_CMP0091 NEW)
 set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 
-project(muxiveo-rife VERSION 1.0.0 LANGUAGES C CXX)
+project(muxiveo-rife VERSION 1.1.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -106,6 +106,7 @@ add_executable(muxiveo-rife
     src/engine.cpp
     src/y4m.cpp
     src/warp.cpp
+    src/uhd.cpp
     ${SHADER_HEADERS}
 )
 target_include_directories(muxiveo-rife PRIVATE ${CMAKE_CURRENT_BINARY_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/src)

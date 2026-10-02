@@ -14,6 +14,34 @@
 #include "gpu.h"
 #include "net.h"
 
+// Allocateur de blobs Vulkan signalant les échecs d'allocation (VRAM saturée).
+class TrackedBlobAllocator : public ncnn::VkBlobAllocator
+{
+public:
+    explicit TrackedBlobAllocator(const ncnn::VulkanDevice* vkdev)
+        : ncnn::VkBlobAllocator(vkdev), failed(false)
+    {
+    }
+
+    virtual ncnn::VkBufferMemory* fastMalloc(size_t size)
+    {
+        ncnn::VkBufferMemory* ptr = ncnn::VkBlobAllocator::fastMalloc(size);
+        if (!ptr)
+            failed = true;
+        return ptr;
+    }
+
+    virtual ncnn::VkImageMemory* fastMalloc(int w, int h, int c, size_t elemsize, int elempack)
+    {
+        ncnn::VkImageMemory* ptr = ncnn::VkBlobAllocator::fastMalloc(w, h, c, elemsize, elempack);
+        if (!ptr)
+            failed = true;
+        return ptr;
+    }
+
+    bool failed;
+};
+
 struct ColorParams
 {
     float kr = 0.2126f;  // BT.709 par défaut
@@ -42,7 +70,8 @@ public:
     ~RifeEngine();
 
     bool init(int gpu_index, bool fp32, int num_threads, std::string& error);
-    bool load_model(const std::filesystem::path& dir, int padding, std::string& error);
+    // uhd : flux optique calculé à demi-résolution (voir uhd.h).
+    bool load_model(const std::filesystem::path& dir, int padding, bool uhd, std::string& error);
     bool configure(const FrameFormat& fmt, const ColorParams& color, std::string& error);
 
     // Envoie une trame brute (padded_frame_bytes() octets, alignée sur 4) et la convertit en RGB.
@@ -56,6 +85,8 @@ public:
 
     std::string device_name() const;
     bool uses_fp16() const { return opt.use_fp16_storage; }
+    // Vrai si un échec GPU vient d'une allocation refusée (mémoire vidéo insuffisante).
+    bool out_of_memory() const { return blob_vkallocator && blob_vkallocator->failed; }
 
 private:
     bool convert_and_download(ncnn::VkCompute& cmd, const ncnn::VkMat& rgb, uint8_t* dst, std::string& error);
@@ -64,7 +95,7 @@ private:
     ncnn::Pipeline* make_pipeline(const char* comp_data, int comp_size, int lx, int ly, int lz);
 
     ncnn::VulkanDevice* vkdev;
-    ncnn::VkAllocator* blob_vkallocator;
+    TrackedBlobAllocator* blob_vkallocator;
     ncnn::VkAllocator* staging_vkallocator;
     ncnn::Net flownet;
     ncnn::Option opt;

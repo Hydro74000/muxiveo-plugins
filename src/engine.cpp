@@ -12,6 +12,7 @@
 #include <vector>
 
 #include "rife_ops.h"
+#include "uhd.h"
 
 #include "pack_samples.comp.hex.h"
 #include "rgb_to_yuv.comp.hex.h"
@@ -47,8 +48,7 @@ RifeEngine::~RifeEngine()
 
     if (vkdev)
     {
-        if (blob_vkallocator)
-            vkdev->reclaim_blob_allocator(blob_vkallocator);
+        delete blob_vkallocator;
         if (staging_vkallocator)
             vkdev->reclaim_staging_allocator(staging_vkallocator);
     }
@@ -87,12 +87,12 @@ bool RifeEngine::init(int gpu_index, bool fp32, int num_threads, std::string& er
     opt.use_fp16_arithmetic = false;
     opt.use_int8_storage = false;
 
-    blob_vkallocator = vkdev->acquire_blob_allocator();
+    blob_vkallocator = new TrackedBlobAllocator(vkdev);
     staging_vkallocator = vkdev->acquire_staging_allocator();
     return true;
 }
 
-bool RifeEngine::load_model(const std::filesystem::path& dir, int _padding, std::string& error)
+bool RifeEngine::load_model(const std::filesystem::path& dir, int _padding, bool uhd, std::string& error)
 {
     padding = std::max(1, _padding);
 
@@ -109,8 +109,23 @@ bool RifeEngine::load_model(const std::filesystem::path& dir, int _padding, std:
         error = "modèle introuvable : " + param_path.u8string();
         return false;
     }
-    int ret = flownet.load_param(fp);
+    std::string param;
+    char buf[65536];
+    size_t n;
+    while ((n = fread(buf, 1, sizeof(buf), fp)) > 0)
+        param.append(buf, n);
     fclose(fp);
+    if (uhd)
+    {
+        std::string rewritten;
+        if (!make_uhd_param(param, rewritten, error))
+        {
+            error = "mode UHD : " + error + " (" + param_path.u8string() + ")";
+            return false;
+        }
+        param.swap(rewritten);
+    }
+    int ret = flownet.load_param_mem(param.c_str());
     if (ret != 0)
     {
         error = "flownet.param invalide : " + param_path.u8string();
@@ -283,6 +298,11 @@ bool RifeEngine::interpolate(const GpuFrame& a, const GpuFrame& b, float t, uint
     // carte de temps constante (entrée in2 du réseau v4)
     ncnn::VkMat timestep;
     timestep.create(w_padded, h_padded, 1, elemsize, 1, blob_vkallocator);
+    if (timestep.empty())
+    {
+        error = "allocation mémoire GPU impossible (timestep)";
+        return false;
+    }
     {
         std::vector<ncnn::VkMat> bindings(1);
         bindings[0] = timestep;
@@ -333,6 +353,13 @@ bool RifeEngine::convert_and_download(ncnn::VkCompute& cmd, const ncnn::VkMat& o
 
     ncnn::VkMat yuvf;
     yuvf.create((int)fmt.total_samples(), (size_t)4u, 1, blob_vkallocator);
+    ncnn::VkMat packed;
+    packed.create(words, (size_t)4u, 1, blob_vkallocator);
+    if (yuvf.empty() || packed.empty())
+    {
+        error = "allocation mémoire GPU impossible (download)";
+        return false;
+    }
     {
         std::vector<ncnn::VkMat> bindings(2);
         bindings[0] = out_rgb;
@@ -363,8 +390,6 @@ bool RifeEngine::convert_and_download(ncnn::VkCompute& cmd, const ncnn::VkMat& o
         cmd.record_pipeline(pipeline_rgb_to_yuv, bindings, constants, dispatcher);
     }
 
-    ncnn::VkMat packed;
-    packed.create(words, (size_t)4u, 1, blob_vkallocator);
     {
         std::vector<ncnn::VkMat> bindings(2);
         bindings[0] = yuvf;

@@ -54,9 +54,10 @@ enum ExitCode
     EXIT_INPUT = 2,
     EXIT_GPU = 3,
     EXIT_IO = 4,
+    EXIT_VRAM = 5,
 };
 
-static const char* DEFAULT_MODEL = "rife-v4.26";
+static const char* DEFAULT_MODEL = "rife-v4.6";
 
 // ---------------------------------------------------------------------------
 // Utilitaires
@@ -307,6 +308,7 @@ struct Options
     int padding = 0;
     double scene_threshold = 10.0;
     bool fp32 = false;
+    bool uhd = false;
     bool list_gpus = false;
     bool version = false;
     bool quiet = false;
@@ -330,8 +332,9 @@ static void print_usage(FILE* fp)
             "  --range <r>             limited | full (défaut : en-tête y4m, sinon limited)\n"
             "  --chroma-loc <l>        left | center | topleft (défaut : en-tête y4m, sinon left)\n"
             "  --scene-threshold <s>   seuil de changement de scène 0-100 (défaut : 10 ; 0 = désactivé)\n"
+            "  --uhd                   mode rapide : flux optique à demi-résolution (échelles x2)\n"
             "  --fp32                  calcul en float32 (plus lent, précision maximale)\n"
-            "  --padding <n>           padding du réseau (défaut : selon le modèle)\n"
+            "  --padding <n>           padding du réseau (défaut : selon le modèle, x2 avec --uhd)\n"
             "  -j, --threads <n>       threads CPU ncnn (défaut : 2)\n"
             "  --allow-interlaced      accepter une entrée entrelacée\n"
             "  --progress-interval <s> intervalle des lignes de progression (défaut : 1)\n"
@@ -372,6 +375,7 @@ static bool parse_args(const std::vector<std::string>& args, Options& o, std::st
         else if (a == "--scene-threshold") { if (!value(v)) return false; o.scene_threshold = atof(v.c_str()); }
         else if (a == "--progress-interval") { if (!value(v)) return false; o.progress_interval = atof(v.c_str()); }
         else if (a == "--fp32") o.fp32 = true;
+        else if (a == "--uhd") o.uhd = true;
         else if (a == "--allow-interlaced") o.allow_interlaced = true;
         else if (a == "--debug-roundtrip") o.roundtrip = true;
         else if (a == "--quiet") o.quiet = true;
@@ -594,7 +598,8 @@ static int run(const Options& o, const fs::path& exe_dir)
     if (needs_gpu)
     {
         if (!engine.init(o.gpu, o.fp32, o.threads, error)
-                || !engine.load_model(model_dir, o.padding > 0 ? o.padding : model_padding(model_name), error)
+                || !engine.load_model(model_dir, o.padding > 0 ? o.padding : model_padding(model_name) * (o.uhd ? 2 : 1),
+                                      o.uhd, error)
                 || !engine.configure(fmt, color, error))
         {
             fprintf(stderr, "error: %s\n", error.c_str());
@@ -605,11 +610,11 @@ static int run(const Options& o, const fs::path& exe_dir)
     if (!o.quiet)
     {
         fprintf(stderr,
-                "info: %dx%d %d bits sous-échantillonnage %d:%d | %lld/%lld -> %lld/%lld fps | modèle %s | GPU %s (%s)\n",
+                "info: %dx%d %d bits sous-échantillonnage %d:%d | %lld/%lld -> %lld/%lld fps | modèle %s%s | GPU %s (%s)\n",
                 fmt.width, fmt.height, fmt.bit_depth, fmt.sub_x, fmt.sub_y,
                 (long long)fmt.fps_num, (long long)fmt.fps_den,
                 (long long)out_fmt.fps_num, (long long)out_fmt.fps_den,
-                model_name.c_str(), needs_gpu ? engine.device_name().c_str() : "-",
+                model_name.c_str(), o.uhd ? " (uhd)" : "", needs_gpu ? engine.device_name().c_str() : "-",
                 engine.uses_fp16() ? "fp16" : "fp32");
     }
 
@@ -712,6 +717,24 @@ static int run(const Options& o, const fs::path& exe_dir)
         return true;
     };
 
+    // échec GPU : mémoire vidéo insuffisante (code dédié) ou erreur d'exécution
+    auto gpu_failure = [&](const std::string& err) {
+        if (engine.out_of_memory())
+        {
+            fprintf(stderr,
+                    "error: mémoire GPU insuffisante (VRAM) pour %dx%d avec le modèle %s : fermer les applications "
+                    "qui utilisent le GPU%s\n",
+                    fmt.width, fmt.height, model_name.c_str(),
+                    o.uhd ? ", ou choisir un modèle plus léger" : ", activer le mode rapide (--uhd) ou choisir un modèle plus léger");
+            exit_code = EXIT_VRAM;
+        }
+        else
+        {
+            fprintf(stderr, "error: %s\n", err.c_str());
+            exit_code = EXIT_GPU;
+        }
+    };
+
     const auto t_start = std::chrono::steady_clock::now();
     auto t_report = t_start;
 
@@ -754,14 +777,12 @@ static int run(const Options& o, const fs::path& exe_dir)
                 FrameBuffer outbuf = pool.acquire();
                 if (!cur.gpu.ready && !engine.upload((const uint8_t*)cur.data->data(), cur.gpu, err))
                 {
-                    fprintf(stderr, "error: %s\n", err.c_str());
-                    exit_code = EXIT_GPU;
+                    gpu_failure(err);
                     break;
                 }
                 if (!engine.roundtrip(cur.gpu, (uint8_t*)outbuf->data(), err))
                 {
-                    fprintf(stderr, "error: %s\n", err.c_str());
-                    exit_code = EXIT_GPU;
+                    gpu_failure(err);
                     break;
                 }
                 ok = emit(outbuf);
@@ -776,22 +797,19 @@ static int run(const Options& o, const fs::path& exe_dir)
                 std::string err;
                 if (!cur.gpu.ready && !engine.upload((const uint8_t*)cur.data->data(), cur.gpu, err))
                 {
-                    fprintf(stderr, "error: %s\n", err.c_str());
-                    exit_code = EXIT_GPU;
+                    gpu_failure(err);
                     break;
                 }
                 if (!nxt.gpu.ready && !engine.upload((const uint8_t*)nxt.data->data(), nxt.gpu, err))
                 {
-                    fprintf(stderr, "error: %s\n", err.c_str());
-                    exit_code = EXIT_GPU;
+                    gpu_failure(err);
                     break;
                 }
                 FrameBuffer outbuf = pool.acquire();
                 const float t = (float)((double)rem / (double)ra);
                 if (!engine.interpolate(cur.gpu, nxt.gpu, t, (uint8_t*)outbuf->data(), err))
                 {
-                    fprintf(stderr, "error: %s\n", err.c_str());
-                    exit_code = EXIT_GPU;
+                    gpu_failure(err);
                     break;
                 }
                 interpolated++;

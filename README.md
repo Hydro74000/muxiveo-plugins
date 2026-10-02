@@ -20,15 +20,24 @@ ffmpeg -i src.mkv -map 0:v:0 -pix_fmt yuv420p10le -f yuv4mpegpipe -strict -1 - \
   (la dernière trame est dupliquée), ce qui garde l'alignement des métadonnées par trame.
 - Fonctionne sur tout GPU Vulkan (NVIDIA, AMD, Intel, Apple via MoltenVK) ; llvmpipe en secours (lent).
 
+## Mode rapide (`--uhd`)
+
+Flux optique calculé à demi-résolution, équivalent du `scale=0.5` de Practical-RIFE : l'échelle
+de chaque bloc du réseau est doublée (16/8/4/2/1 → 32/16/8/4/2) par réécriture du graphe ncnn au
+chargement (`src/uhd.cpp`), sans modèle dédié ; padding doublé. Mesuré en 4K (RTX 4070 Ti SUPER,
+×2) : +16 % (`rife-v4.26`) à +36 % (`rife-v4.25-heavy`) de débit pour −0,1 à −0,6 dB de PSNR ;
+en 1080p, environ −1 dB.
+
 ## Sortie stderr (lue par Muxiveo)
 
 ```
-info: 3832x1592 10 bits … | 24/1 -> 48/1 fps | modèle rife-v4.26 | GPU … (fp16)
+info: 3832x1592 10 bits … | 24/1 -> 48/1 fps | modèle rife-v4.26 (uhd) | GPU … (fp16)
 progress in=120 out=240 interpolated=119 scenes=1 static=0 fps=28.4
 done in=240 out=480 interpolated=238 scenes=1 static=0 seconds=16.89 exit=0
 ```
 
-Codes de sortie : `0` OK, `1` usage, `2` entrée invalide, `3` GPU/modèle, `4` E/S (pipe fermé).
+Codes de sortie : `0` OK, `1` usage, `2` entrée invalide, `3` GPU/modèle, `4` E/S (pipe fermé),
+`5` mémoire GPU (VRAM) insuffisante.
 `--list-gpus` affiche les GPU en JSON.
 
 ## Build
@@ -45,7 +54,9 @@ python3 native/muxiveo-rife/scripts/fetch_models.py build/muxiveo-rife/rife-mode
 Option : `-DMUXIVEO_RIFE_NCNN_SOURCE_DIR=<checkout ncnn>` pour compiler hors ligne.
 
 Les modèles (`models.json`, sha256 épinglés) sont cherchés dans `<dossier de l'exécutable>/rife-models/<nom>`
-ou passés avec `-m <dossier>`. Préréglages Muxiveo : `rife-v4.22-lite` (rapide), `rife-v4.26`
-(équilibré, défaut), `rife-v4.25-heavy` (qualité max).
+ou passés avec `-m <dossier>`. Préréglages Muxiveo : `rife-v4.6` (Rapide et Équilibré, défaut) et
+`rife-v4.15-lite` (Light, petites cartes graphiques, toujours avec `--uhd`). Choix issu d'un banc de 17 modèles
+sur 4 contenus : v4.6 obtient le meilleur VMAF moyen, le débit le plus élevé et la VRAM la plus basse ; v4.15-lite
++ `--uhd` est la configuration la plus sobre (1,7 Go en 4K).
 
 Provenance du code et procédure de mise à jour : [UPSTREAM.md](UPSTREAM.md).
