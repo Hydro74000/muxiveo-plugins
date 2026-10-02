@@ -1,0 +1,37 @@
+// Muxiveo — TTA : copie retournée (horizontal / vertical) d'une image RGB planaire
+// paddée, entrée du réseau pour une variante retournée.
+
+#version 450
+
+#if NCNN_fp16_storage
+#extension GL_EXT_shader_16bit_storage: require
+#endif
+
+layout (binding = 0) readonly buffer src_blob { sfp src_data[]; };
+layout (binding = 1) writeonly buffer dst_blob { sfp dst_data[]; };
+
+layout (push_constant) uniform parameter
+{
+    int w;
+    int h;
+    int c;
+    int srcw;
+    int srccstep;
+    int dstw;
+    int dstcstep;
+    int flip;     // bit 0 : horizontal, bit 1 : vertical
+} p;
+
+void main()
+{
+    int gx = int(gl_GlobalInvocationID.x);
+    int gy = int(gl_GlobalInvocationID.y);
+    int gz = int(gl_GlobalInvocationID.z);
+
+    if (gx >= p.w || gy >= p.h || gz >= p.c)
+        return;
+
+    int sx = (p.flip & 1) != 0 ? p.w - 1 - gx : gx;
+    int sy = (p.flip & 2) != 0 ? p.h - 1 - gy : gy;
+    dst_data[gz * p.dstcstep + gy * p.dstw + gx] = src_data[gz * p.srccstep + sy * p.srcw + sx];
+}

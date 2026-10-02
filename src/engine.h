@@ -74,6 +74,11 @@ public:
     bool load_model(const std::filesystem::path& dir, int padding, bool uhd, std::string& error);
     bool configure(const FrameFormat& fmt, const ColorParams& color, std::string& error);
 
+    // TTA (test-time augmentation) : 1 = désactivé ; 2 = + sens temporel inverse ;
+    // 4 = + retournement horizontal ; 8 = + retournements vertical et double.
+    // Sorties moyennées (fp32) ; coût x n, VRAM d'une seule variante.
+    void set_tta(int n) { tta = n; }
+
     // Envoie une trame brute (padded_frame_bytes() octets, alignée sur 4) et la convertit en RGB.
     bool upload(const uint8_t* frame, GpuFrame& out, std::string& error);
 
@@ -90,6 +95,11 @@ public:
 
 private:
     bool convert_and_download(ncnn::VkCompute& cmd, const ncnn::VkMat& rgb, uint8_t* dst, std::string& error);
+    bool record_timestep(ncnn::VkCompute& cmd, float t, ncnn::VkMat& timestep, std::string& error);
+    bool record_network(ncnn::VkCompute& cmd, const ncnn::VkMat& in0, const ncnn::VkMat& in1, const ncnn::VkMat& timestep,
+                        ncnn::VkMat& out, std::string& error);
+    bool record_flip(ncnn::VkCompute& cmd, const ncnn::VkMat& src, int flip, ncnn::VkMat& dst, std::string& error);
+    bool interpolate_tta(const GpuFrame& a, const GpuFrame& b, float t, uint8_t* dst, std::string& error);
     int chroma_mode_x() const;
     int chroma_mode_y() const;
     ncnn::Pipeline* make_pipeline(const char* comp_data, int comp_size, int lx, int ly, int lz);
@@ -104,6 +114,9 @@ private:
     ncnn::Pipeline* pipeline_rgb_to_yuv;
     ncnn::Pipeline* pipeline_pack;
     ncnn::Pipeline* pipeline_timestep;
+    ncnn::Pipeline* pipeline_tta_flip;
+    ncnn::Pipeline* pipeline_tta_accumulate;
+    ncnn::Pipeline* pipeline_tta_resolve;
 
     FrameFormat fmt;
     ColorParams color;
@@ -112,6 +125,7 @@ private:
     int h_padded;
     int words;
     int pack_dispatch_w;
+    int tta;
 };
 
 #endif // MUXIVEO_RIFE_ENGINE_H

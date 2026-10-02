@@ -306,6 +306,7 @@ struct Options
     int gpu = -1;
     int threads = 2;
     int padding = 0;
+    int tta = 1;
     double scene_threshold = 10.0;
     bool fp32 = false;
     bool uhd = false;
@@ -334,6 +335,8 @@ static void print_usage(FILE* fp)
             "  --scene-threshold <s>   seuil de changement de scène 0-100 (défaut : 10 ; 0 = désactivé)\n"
             "  --uhd                   mode rapide : flux optique à demi-résolution (échelles x2)\n"
             "  --fp32                  calcul en float32 (plus lent, précision maximale)\n"
+            "  --tta <n>               moyenne de n variantes : 2 = + sens temporel inverse, 4 = + miroir\n"
+            "                          horizontal, 8 = + miroirs vertical et double (coût x n ; défaut : 1)\n"
             "  --padding <n>           padding du réseau (défaut : selon le modèle, x2 avec --uhd)\n"
             "  -j, --threads <n>       threads CPU ncnn (défaut : 2)\n"
             "  --allow-interlaced      accepter une entrée entrelacée\n"
@@ -372,6 +375,16 @@ static bool parse_args(const std::vector<std::string>& args, Options& o, std::st
         else if (a == "-g" || a == "--gpu") { if (!value(v)) return false; o.gpu = atoi(v.c_str()); }
         else if (a == "-j" || a == "--threads") { if (!value(v)) return false; o.threads = atoi(v.c_str()); }
         else if (a == "--padding") { if (!value(v)) return false; o.padding = atoi(v.c_str()); }
+        else if (a == "--tta")
+        {
+            if (!value(v)) return false;
+            o.tta = atoi(v.c_str());
+            if (o.tta != 1 && o.tta != 2 && o.tta != 4 && o.tta != 8)
+            {
+                error = "--tta : 1, 2, 4 ou 8 attendu (reçu : " + v + ")";
+                return false;
+            }
+        }
         else if (a == "--scene-threshold") { if (!value(v)) return false; o.scene_threshold = atof(v.c_str()); }
         else if (a == "--progress-interval") { if (!value(v)) return false; o.progress_interval = atof(v.c_str()); }
         else if (a == "--fp32") o.fp32 = true;
@@ -594,6 +607,7 @@ static int run(const Options& o, const fs::path& exe_dir)
     const fs::path model_dir = resolve_model_dir(o.model, exe_dir);
     const std::string model_name = path_to_utf8(model_dir.filename());
     RifeEngine engine;
+    engine.set_tta(o.tta);
     const bool needs_gpu = ra != rb || o.roundtrip;
     if (needs_gpu)
     {
@@ -610,11 +624,13 @@ static int run(const Options& o, const fs::path& exe_dir)
     if (!o.quiet)
     {
         fprintf(stderr,
-                "info: %dx%d %d bits sous-échantillonnage %d:%d | %lld/%lld -> %lld/%lld fps | modèle %s%s | GPU %s (%s)\n",
+                "info: %dx%d %d bits sous-échantillonnage %d:%d | %lld/%lld -> %lld/%lld fps | modèle %s%s%s | GPU %s (%s)\n",
                 fmt.width, fmt.height, fmt.bit_depth, fmt.sub_x, fmt.sub_y,
                 (long long)fmt.fps_num, (long long)fmt.fps_den,
                 (long long)out_fmt.fps_num, (long long)out_fmt.fps_den,
-                model_name.c_str(), o.uhd ? " (uhd)" : "", needs_gpu ? engine.device_name().c_str() : "-",
+                model_name.c_str(), o.uhd ? " (uhd)" : "",
+                o.tta > 1 ? (" (tta x" + std::to_string(o.tta) + ")").c_str() : "",
+                needs_gpu ? engine.device_name().c_str() : "-",
                 engine.uses_fp16() ? "fp16" : "fp32");
     }
 

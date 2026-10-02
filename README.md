@@ -28,6 +28,14 @@ chargement (`src/uhd.cpp`), sans modèle dédié ; padding doublé. Mesuré en 4
 ×2) : +16 % (`rife-v4.26`) à +36 % (`rife-v4.25-heavy`) de débit pour −0,1 à −0,6 dB de PSNR ;
 en 1080p, environ −1 dB.
 
+## TTA (`--tta 2|4|8`)
+
+Moyenne de plusieurs inférences de la même trame intermédiaire : `2` ajoute le sens temporel inverse
+(trames échangées, temps `1 - t`), `4` le miroir horizontal, `8` les miroirs vertical et double. Les sorties
+sont remises à l'endroit puis moyennées en fp32 ; coût ×n, VRAM d'une seule inférence (une soumission par
+variante). Lisse les petites erreurs d'estimation (léger flou là où les variantes divergent) ; sans effet sur
+les erreurs d'appariement de motifs répétitifs (barreaux en panoramique), communes à toutes les variantes.
+
 ## Sortie stderr (lue par Muxiveo)
 
 ```

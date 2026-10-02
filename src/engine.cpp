@@ -17,6 +17,9 @@
 #include "pack_samples.comp.hex.h"
 #include "rgb_to_yuv.comp.hex.h"
 #include "rife_v4_timestep.comp.hex.h"
+#include "tta_accumulate.comp.hex.h"
+#include "tta_flip.comp.hex.h"
+#include "tta_resolve.comp.hex.h"
 #include "yuv_to_rgb.comp.hex.h"
 
 DEFINE_LAYER_CREATOR(Warp)
@@ -33,7 +36,8 @@ static FILE* open_binary(const std::filesystem::path& path)
 RifeEngine::RifeEngine()
     : vkdev(0), blob_vkallocator(0), staging_vkallocator(0),
       pipeline_yuv_to_rgb(0), pipeline_rgb_to_yuv(0), pipeline_pack(0), pipeline_timestep(0),
-      padding(32), w_padded(0), h_padded(0), words(0), pack_dispatch_w(0)
+      pipeline_tta_flip(0), pipeline_tta_accumulate(0), pipeline_tta_resolve(0),
+      padding(32), w_padded(0), h_padded(0), words(0), pack_dispatch_w(0), tta(1)
 {
 }
 
@@ -43,6 +47,9 @@ RifeEngine::~RifeEngine()
     delete pipeline_rgb_to_yuv;
     delete pipeline_pack;
     delete pipeline_timestep;
+    delete pipeline_tta_flip;
+    delete pipeline_tta_accumulate;
+    delete pipeline_tta_resolve;
 
     flownet.clear();
 
@@ -192,6 +199,17 @@ bool RifeEngine::configure(const FrameFormat& _fmt, const ColorParams& _color, s
         error = "compilation des shaders de conversion impossible";
         return false;
     }
+    if (tta > 1)
+    {
+        pipeline_tta_flip = make_pipeline(tta_flip_comp_data, sizeof(tta_flip_comp_data), 8, 8, 1);
+        pipeline_tta_accumulate = make_pipeline(tta_accumulate_comp_data, sizeof(tta_accumulate_comp_data), 8, 8, 1);
+        pipeline_tta_resolve = make_pipeline(tta_resolve_comp_data, sizeof(tta_resolve_comp_data), 8, 8, 1);
+    }
+    if (tta > 1 && (!pipeline_tta_flip || !pipeline_tta_accumulate || !pipeline_tta_resolve))
+    {
+        error = "compilation des shaders TTA impossible";
+        return false;
+    }
     return true;
 }
 
@@ -289,51 +307,181 @@ bool RifeEngine::upload(const uint8_t* frame, GpuFrame& out, std::string& error)
     return true;
 }
 
-bool RifeEngine::interpolate(const GpuFrame& a, const GpuFrame& b, float t, uint8_t* dst, std::string& error)
+bool RifeEngine::record_timestep(ncnn::VkCompute& cmd, float t, ncnn::VkMat& timestep, std::string& error)
 {
-    const size_t elemsize = opt.use_fp16_storage ? 2u : 4u;
-
-    ncnn::VkCompute cmd(vkdev);
-
     // carte de temps constante (entrée in2 du réseau v4)
-    ncnn::VkMat timestep;
-    timestep.create(w_padded, h_padded, 1, elemsize, 1, blob_vkallocator);
+    timestep.create(w_padded, h_padded, 1, opt.use_fp16_storage ? 2u : 4u, 1, blob_vkallocator);
     if (timestep.empty())
     {
         error = "allocation mémoire GPU impossible (timestep)";
         return false;
     }
+    std::vector<ncnn::VkMat> bindings(1);
+    bindings[0] = timestep;
+
+    std::vector<ncnn::vk_constant_type> constants(4);
+    constants[0].i = timestep.w;
+    constants[1].i = timestep.h;
+    constants[2].i = (int)timestep.cstep;
+    constants[3].f = t;
+
+    cmd.record_pipeline(pipeline_timestep, bindings, constants, timestep);
+    return true;
+}
+
+bool RifeEngine::record_network(ncnn::VkCompute& cmd, const ncnn::VkMat& in0, const ncnn::VkMat& in1,
+                                const ncnn::VkMat& timestep, ncnn::VkMat& out, std::string& error)
+{
+    ncnn::Extractor ex = flownet.create_extractor();
+    ex.set_blob_vkallocator(blob_vkallocator);
+    ex.set_workspace_vkallocator(blob_vkallocator);
+    ex.set_staging_vkallocator(staging_vkallocator);
+
+    ex.input("in0", in0);
+    ex.input("in1", in1);
+    ex.input("in2", timestep);
+    if (ex.extract("out0", out, cmd) != 0 || out.empty())
     {
-        std::vector<ncnn::VkMat> bindings(1);
-        bindings[0] = timestep;
+        error = "échec d'inférence RIFE";
+        return false;
+    }
+    return true;
+}
 
-        std::vector<ncnn::vk_constant_type> constants(4);
-        constants[0].i = timestep.w;
-        constants[1].i = timestep.h;
-        constants[2].i = (int)timestep.cstep;
-        constants[3].f = t;
+bool RifeEngine::interpolate(const GpuFrame& a, const GpuFrame& b, float t, uint8_t* dst, std::string& error)
+{
+    if (tta > 1)
+        return interpolate_tta(a, b, t, dst, error);
 
-        cmd.record_pipeline(pipeline_timestep, bindings, constants, timestep);
+    ncnn::VkCompute cmd(vkdev);
+    ncnn::VkMat timestep;
+    ncnn::VkMat out_rgb;
+    if (!record_timestep(cmd, t, timestep, error) || !record_network(cmd, a.rgb, b.rgb, timestep, out_rgb, error))
+        return false;
+    return convert_and_download(cmd, out_rgb, dst, error);
+}
+
+bool RifeEngine::record_flip(ncnn::VkCompute& cmd, const ncnn::VkMat& src, int flip, ncnn::VkMat& dst, std::string& error)
+{
+    // nouveau tampon : create() réutiliserait celui d'une matrice de mêmes dimensions (écriture sur la source)
+    dst.release();
+    dst.create(src.w, src.h, src.c, src.elemsize, 1, blob_vkallocator);
+    if (dst.empty())
+    {
+        error = "allocation mémoire GPU impossible (TTA)";
+        return false;
+    }
+    std::vector<ncnn::VkMat> bindings(2);
+    bindings[0] = src;
+    bindings[1] = dst;
+
+    std::vector<ncnn::vk_constant_type> constants(8);
+    constants[0].i = src.w;
+    constants[1].i = src.h;
+    constants[2].i = src.c;
+    constants[3].i = src.w;
+    constants[4].i = (int)src.cstep;
+    constants[5].i = dst.w;
+    constants[6].i = (int)dst.cstep;
+    constants[7].i = flip;
+
+    cmd.record_pipeline(pipeline_tta_flip, bindings, constants, dst);
+    return true;
+}
+
+// Moyenne des variantes (retournement x sens temporel). Une soumission par
+// variante : la VRAM reste celle d'une seule inférence (+ accumulateur fp32).
+bool RifeEngine::interpolate_tta(const GpuFrame& a, const GpuFrame& b, float t, uint8_t* dst, std::string& error)
+{
+    const int nflips = tta >= 8 ? 4 : (tta >= 4 ? 2 : 1);
+    const int variants = nflips * 2;
+
+    ncnn::VkMat acc;
+    acc.create(w_padded, h_padded, 3, 4u, 1, blob_vkallocator);
+    if (acc.empty())
+    {
+        error = "allocation mémoire GPU impossible (TTA)";
+        return false;
     }
 
-    ncnn::VkMat out_rgb;
+    for (int i = 0; i < variants; i++)
     {
-        ncnn::Extractor ex = flownet.create_extractor();
-        ex.set_blob_vkallocator(blob_vkallocator);
-        ex.set_workspace_vkallocator(blob_vkallocator);
-        ex.set_staging_vkallocator(staging_vkallocator);
+        const int flip = i / 2;        // 0 : aucun, 1 : horizontal, 2 : vertical, 3 : les deux
+        const bool reverse = (i % 2) == 1;
 
-        ex.input("in0", a.rgb);
-        ex.input("in1", b.rgb);
-        ex.input("in2", timestep);
-        if (ex.extract("out0", out_rgb, cmd) != 0 || out_rgb.empty())
+        ncnn::VkCompute cmd(vkdev);
+        ncnn::VkMat in0;
+        ncnn::VkMat in1;
+        if (!flip)
         {
-            error = "échec d'inférence RIFE";
+            in0 = a.rgb;
+            in1 = b.rgb;
+        }
+        else if (!record_flip(cmd, a.rgb, flip, in0, error) || !record_flip(cmd, b.rgb, flip, in1, error))
+            return false;
+        if (reverse)
+            std::swap(in0, in1);
+
+        ncnn::VkMat timestep;
+        ncnn::VkMat out;
+        if (!record_timestep(cmd, reverse ? 1.f - t : t, timestep, error)
+                || !record_network(cmd, in0, in1, timestep, out, error))
+            return false;
+        if (out.w != w_padded || out.h != h_padded || out.c != 3)
+        {
+            error = "sortie RIFE de dimensions inattendues (TTA)";
+            return false;
+        }
+
+        std::vector<ncnn::VkMat> bindings(2);
+        bindings[0] = out;
+        bindings[1] = acc;
+
+        std::vector<ncnn::vk_constant_type> constants(9);
+        constants[0].i = out.w;
+        constants[1].i = out.h;
+        constants[2].i = 3;
+        constants[3].i = out.w;
+        constants[4].i = (int)out.cstep;
+        constants[5].i = acc.w;
+        constants[6].i = (int)acc.cstep;
+        constants[7].i = flip;
+        constants[8].i = i == 0 ? 1 : 0;
+
+        cmd.record_pipeline(pipeline_tta_accumulate, bindings, constants, acc);
+        if (cmd.submit_and_wait() != 0)
+        {
+            error = "échec d'exécution GPU (TTA)";
             return false;
         }
     }
 
-    return convert_and_download(cmd, out_rgb, dst, error);
+    ncnn::VkCompute cmd(vkdev);
+    ncnn::VkMat merged;
+    merged.create(w_padded, h_padded, 3, opt.use_fp16_storage ? 2u : 4u, 1, blob_vkallocator);
+    if (merged.empty())
+    {
+        error = "allocation mémoire GPU impossible (TTA)";
+        return false;
+    }
+    {
+        std::vector<ncnn::VkMat> bindings(2);
+        bindings[0] = acc;
+        bindings[1] = merged;
+
+        std::vector<ncnn::vk_constant_type> constants(8);
+        constants[0].i = acc.w;
+        constants[1].i = acc.h;
+        constants[2].i = 3;
+        constants[3].i = acc.w;
+        constants[4].i = (int)acc.cstep;
+        constants[5].i = merged.w;
+        constants[6].i = (int)merged.cstep;
+        constants[7].f = 1.f / (float)variants;
+
+        cmd.record_pipeline(pipeline_tta_resolve, bindings, constants, merged);
+    }
+    return convert_and_download(cmd, merged, dst, error);
 }
 
 bool RifeEngine::roundtrip(const GpuFrame& a, uint8_t* dst, std::string& error)
