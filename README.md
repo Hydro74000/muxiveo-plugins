@@ -53,6 +53,9 @@ python3 native/muxiveo-rife/scripts/fetch_models.py build/muxiveo-rife/rife-mode
 
 Option : `-DMUXIVEO_RIFE_NCNN_SOURCE_DIR=<checkout ncnn>` pour compiler hors ligne.
 
+Releases : Linux compilé dans `manylinux_2_28` (glibc ≥ 2.28, runtime C++ statique), macOS 12+ (arm64,
+MoltenVK livré à côté du binaire), Windows x64 (runtime MSVC statique).
+
 Les modèles (`models.json`, sha256 épinglés) sont cherchés dans `<dossier de l'exécutable>/rife-models/<nom>`
 ou passés avec `-m <dossier>`. Préréglages Muxiveo : `rife-v4.6` (Rapide et Équilibré, défaut) et
 `rife-v4.15-lite` (Light, petites cartes graphiques, toujours avec `--uhd`). Choix issu d'un banc de 17 modèles

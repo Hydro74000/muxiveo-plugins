@@ -54,9 +54,15 @@ def fetch(dest: Path, models: list[str] | None = None) -> int:
             print(f"téléchargement {name}/{filename}", file=sys.stderr)
             with tempfile.NamedTemporaryFile(dir=model_dir, delete=False) as tmp:
                 tmp_path = Path(tmp.name)
-                with urllib.request.urlopen(url, timeout=120) as resp:
-                    while chunk := resp.read(1 << 20):
-                        tmp.write(chunk)
+                try:
+                    with urllib.request.urlopen(url, timeout=120) as resp:
+                        while chunk := resp.read(1 << 20):
+                            tmp.write(chunk)
+                except BaseException:
+                    # téléchargement interrompu : pas de fichier partiel laissé
+                    tmp.close()
+                    tmp_path.unlink(missing_ok=True)
+                    raise
             actual = _sha256(tmp_path)
             if actual != meta["sha256"]:
                 tmp_path.unlink(missing_ok=True)
