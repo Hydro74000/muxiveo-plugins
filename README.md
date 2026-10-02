@@ -56,6 +56,11 @@ Option : `-DMUXIVEO_RIFE_NCNN_SOURCE_DIR=<checkout ncnn>` pour compiler hors lig
 Releases : Linux compilé dans `manylinux_2_28` (glibc ≥ 2.28, runtime C++ statique), macOS 12+ (arm64,
 MoltenVK livré à côté du binaire), Windows x64 (runtime MSVC statique).
 
+Publication automatique : incrémenter la version (`project()` du CMakeLists **et** `MUXIVEO_RIFE_VERSION`
+de `core/version.py`) puis pousser. Le workflow de release de Muxiveo (`release.yml`) compile et publie
+`muxiveo-rife-vX.Y.Z` si cette release n'existe pas, avant d'empaqueter l'application. Un code natif
+modifié sans changement de version fait échouer la release. Le tag manuel `muxiveo-rife-vX.Y.Z` reste possible.
+
 Les modèles (`models.json`, sha256 épinglés) sont cherchés dans `<dossier de l'exécutable>/rife-models/<nom>`
 ou passés avec `-m <dossier>`. Préréglages Muxiveo : `rife-v4.6` (Rapide et Équilibré, défaut) et
 `rife-v4.15-lite` (Light, petites cartes graphiques, toujours avec `--uhd`). Choix issu d'un banc de 17 modèles
