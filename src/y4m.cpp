@@ -63,14 +63,15 @@ bool Y4mReader::read_line(std::string& line, size_t max_len)
     line.clear();
     for (;;)
     {
-        int ch = fgetc(fp);
+        // Lecture d'un caractère ; taille contrôlée avant ajout au std::string.
+        int ch = fgetc(fp); // flawfinder: ignore
         if (ch == EOF)
             return false;
         if (ch == '\n')
             return true;
-        line.push_back((char)ch);
-        if (line.size() > max_len)
+        if (line.size() >= max_len)
             return false;
+        line.push_back((char)ch);
     }
 }
 

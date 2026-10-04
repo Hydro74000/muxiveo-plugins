@@ -567,8 +567,15 @@ bool RifeEngine::convert_and_download(ncnn::VkCompute& cmd, const ncnn::VkMat& o
     }
     if (out.data != (void*)dst)
     {
-        // ncnn a réalloué la destination : recopie explicite
-        memcpy(dst, out.data, (size_t)words * 4u);
+        // dst contient padded_frame_bytes() octets (contrat du pool de trames).
+        const size_t frame_bytes = fmt.padded_frame_bytes();
+        if (out.empty() || out.total() * out.elemsize < frame_bytes)
+        {
+            error = "buffer de sortie GPU incomplet";
+            return false;
+        }
+        // ncnn a réalloué la destination : copie bornée à la taille de la trame.
+        std::copy_n(static_cast<const uint8_t*>(out.data), frame_bytes, dst);
     }
     return true;
 }

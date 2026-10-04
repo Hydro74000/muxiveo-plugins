@@ -105,10 +105,10 @@ static fs::path executable_dir(const char* argv0)
     if (_NSGetExecutablePath(buf, &size) == 0)
         return fs::weakly_canonical(fs::path(buf)).parent_path();
 #else
-    char buf[4096];
-    ssize_t n = readlink("/proc/self/exe", buf, sizeof(buf) - 1);
-    if (n > 0)
-        return fs::path(std::string(buf, (size_t)n)).parent_path();
+    std::error_code ec;
+    const fs::path executable = fs::read_symlink("/proc/self/exe", ec);
+    if (!ec)
+        return executable.parent_path();
 #endif
     return fs::absolute(fs::path(argv0 ? argv0 : ".")).parent_path();
 }
@@ -874,7 +874,7 @@ static int run(const Options& o, const fs::path& exe_dir)
     reader_thread.join();
     writer_thread.join();
 
-    if (exit_code == EXIT_OK && read_failed)
+    if (read_failed)
     {
         fprintf(stderr, "error: %s\n", read_error.c_str());
         exit_code = EXIT_INPUT;
@@ -986,17 +986,21 @@ int main(int argc, char** argv)
     const fs::path exe_dir = executable_dir(argc > 0 ? argv[0] : 0);
 
     // macOS : MoltenVK livré à côté de l'exécutable (sinon chargeur Vulkan système).
-    std::string driver_path;
+    const char* driver_path = nullptr;
 #if __APPLE__
+    std::string driver_storage;
     {
         std::error_code ec;
         const fs::path moltenvk = exe_dir / "libMoltenVK.dylib";
         if (fs::is_regular_file(moltenvk, ec))
-            driver_path = moltenvk.string();
+        {
+            driver_storage = moltenvk.string();
+            driver_path = driver_storage.c_str();
+        }
     }
 #endif
 
-    if (create_gpu_instance_quiet(o.verbose, driver_path.empty() ? 0 : driver_path.c_str()) != 0 && !o.list_gpus)
+    if (create_gpu_instance_quiet(o.verbose, driver_path) != 0 && !o.list_gpus)
     {
         fprintf(stderr, "error: Vulkan indisponible (pilote ou chargeur libvulkan absent)\n");
         return EXIT_GPU;

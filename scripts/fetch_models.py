@@ -55,7 +55,8 @@ def fetch(dest: Path, models: list[str] | None = None) -> int:
             with tempfile.NamedTemporaryFile(dir=model_dir, delete=False) as tmp:
                 tmp_path = Path(tmp.name)
                 try:
-                    with urllib.request.urlopen(url, timeout=120) as resp:
+                    # URL construite avec le préfixe HTTPS raw.githubusercontent.com constant.
+                    with urllib.request.urlopen(url, timeout=120) as resp:  # nosec B310
                         while chunk := resp.read(1 << 20):
                             tmp.write(chunk)
                 except BaseException:
