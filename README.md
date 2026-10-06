@@ -48,6 +48,12 @@ Codes de sortie : `0` OK, `1` usage, `2` entrée invalide, `3` GPU/modèle, `4` 
 `5` mémoire GPU (VRAM) insuffisante.
 `--list-gpus` affiche les GPU en JSON.
 
+En-têtes y4m et options numériques sont lus strictement (1.2.3) : jetons
+entièrement numériques, dimensions de 1 à 32768 et au plus 2²⁸ échantillons de
+luma (16384 × 16384), termes de cadence et rapport sortie/entrée sur 31 bits,
+réels finis ; une entrée hors limites est refusée (code `2` pour le flux, `1`
+pour une option) avant tout calcul.
+
 Avec `-i` et `-o`, l'entrée et la sortie doivent désigner des fichiers distincts,
 y compris à travers un lien symbolique ou un hardlink. Sinon, la commande est
 refusée avec le code `1` avant toute écriture. Le pipeline Muxiveo utilise

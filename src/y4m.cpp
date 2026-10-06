@@ -5,18 +5,21 @@
 #include <cstdlib>
 #include <cstring>
 
+#include "numparse.h"
+
 static bool parse_colorspace(const std::string& c, FrameFormat& fmt)
 {
     std::string base = c;
     int depth = 8;
 
-    // suffixe de profondeur : 420p10, 422p12, 444p16…
+    // suffixe de profondeur : 420p10, 422p12, 444p16… (chiffres seuls, 8 à 16)
     if (c.size() > 4 && c[3] == 'p' && c[4] >= '0' && c[4] <= '9')
     {
         base = c.substr(0, 3);
-        depth = atoi(c.c_str() + 4);
-        if (depth < 8 || depth > 16)
+        int64_t parsed = 0;
+        if (!parse_int64_strict(c.substr(4), 8, 16, parsed))
             return false;
+        depth = (int)parsed;
     }
 
     if (base.compare(0, 3, "420") == 0)
@@ -108,15 +111,25 @@ bool Y4mReader::read_header(std::string& error)
         switch (tok[0])
         {
         case 'W':
-            fmt.width = atoi(tok.c_str() + 1);
-            break;
         case 'H':
-            fmt.height = atoi(tok.c_str() + 1);
+        {
+            int64_t value = 0;
+            if (!parse_int64_strict(tok.substr(1), 1, Y4M_MAX_DIMENSION, value))
+            {
+                error = std::string(tok[0] == 'W' ? "largeur" : "hauteur") + " y4m invalide ou hors limites (1 à "
+                        + std::to_string(Y4M_MAX_DIMENSION) + ") : " + tok;
+                return false;
+            }
+            (tok[0] == 'W' ? fmt.width : fmt.height) = (int)value;
             break;
+        }
         case 'F':
         {
-            long long num = 0, den = 0;
-            if (sscanf(tok.c_str() + 1, "%lld:%lld", &num, &den) != 2 || num <= 0 || den <= 0)
+            const size_t colon = tok.find(':');
+            int64_t num = 0, den = 0;
+            if (colon == std::string::npos
+                    || !parse_int64_strict(tok.substr(1, colon - 1), 1, Y4M_MAX_RATE_TERM, num)
+                    || !parse_int64_strict(tok.substr(colon + 1), 1, Y4M_MAX_RATE_TERM, den))
             {
                 error = "cadence y4m invalide : " + tok;
                 return false;
@@ -153,6 +166,11 @@ bool Y4mReader::read_header(std::string& error)
     if (fmt.width <= 0 || fmt.height <= 0)
     {
         error = "dimensions y4m absentes ou invalides";
+        return false;
+    }
+    if (fmt.luma_samples() > Y4M_MAX_LUMA_SAMPLES)
+    {
+        error = "dimensions y4m trop grandes : " + std::to_string(fmt.width) + "x" + std::to_string(fmt.height);
         return false;
     }
     if (fmt.fps_num <= 0)

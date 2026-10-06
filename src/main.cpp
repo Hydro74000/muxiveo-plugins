@@ -38,6 +38,7 @@
 #endif
 
 #include "engine.h"
+#include "numparse.h"
 #include "y4m.h"
 
 #ifndef MUXIVEO_RIFE_VERSION
@@ -124,35 +125,64 @@ static FILE* open_file(const fs::path& path, bool write)
 
 static bool parse_ratio(const std::string& s, int64_t& num, int64_t& den)
 {
-    long long n = 0, d = 1;
-    const char* sep = strpbrk(s.c_str(), "/:");
-    if (sep)
+    int64_t n = 0, d = 1;
+    const size_t sep = s.find_first_of("/:");
+    if (sep != std::string::npos)
     {
-        if (sscanf(s.c_str(), "%lld", &n) != 1 || sscanf(sep + 1, "%lld", &d) != 1)
+        // « a/b » ou « a:b » : deux entiers stricts, chacun sur 31 bits.
+        if (!parse_int64_strict(s.substr(0, sep), 1, Y4M_MAX_RATE_TERM, n)
+                || !parse_int64_strict(s.substr(sep + 1), 1, Y4M_MAX_RATE_TERM, d))
             return false;
     }
     else
     {
-        // décimal toléré (ex. 59.94) : converti en fraction /1000
-        double v = atof(s.c_str());
-        if (v <= 0)
+        // décimal toléré (ex. 59.94) : converti en fraction /1000 ; NaN, infini
+        // et suffixes refusés.
+        double v = 0.0;
+        if (!parse_double_strict(s, 0.001, 1000000.0, v))
             return false;
         if (std::floor(v) == v)
         {
-            n = (long long)v;
+            n = (int64_t)v;
             d = 1;
         }
         else
         {
-            n = (long long)std::llround(v * 1000.0);
+            n = (int64_t)std::llround(v * 1000.0);
             d = 1000;
         }
     }
     if (n <= 0 || d <= 0)
         return false;
-    int64_t g = std::gcd((int64_t)n, (int64_t)d);
+    int64_t g = std::gcd(n, d);
     num = n / g;
     den = d / g;
+    return true;
+}
+
+// Option entière stricte : message d'erreur explicite si la valeur est invalide.
+static bool parse_int_option(const std::string& name, const std::string& text, int64_t min_value,
+                             int64_t max_value, int& out, std::string& error)
+{
+    int64_t value = 0;
+    if (!parse_int64_strict(text, min_value, max_value, value))
+    {
+        error = name + " : entier attendu entre " + std::to_string(min_value) + " et "
+                + std::to_string(max_value) + " (reçu : " + text + ")";
+        return false;
+    }
+    out = (int)value;
+    return true;
+}
+
+static bool parse_double_option(const std::string& name, const std::string& text, double min_value,
+                                double max_value, double& out, std::string& error)
+{
+    if (!parse_double_strict(text, min_value, max_value, out))
+    {
+        error = name + " : nombre fini attendu (reçu : " + text + ")";
+        return false;
+    }
     return true;
 }
 
@@ -372,21 +402,37 @@ static bool parse_args(const std::vector<std::string>& args, Options& o, std::st
         else if (a == "--matrix") { if (!value(o.matrix)) return false; }
         else if (a == "--range") { if (!value(o.range)) return false; }
         else if (a == "--chroma-loc") { if (!value(o.chroma_loc)) return false; }
-        else if (a == "-g" || a == "--gpu") { if (!value(v)) return false; o.gpu = atoi(v.c_str()); }
-        else if (a == "-j" || a == "--threads") { if (!value(v)) return false; o.threads = atoi(v.c_str()); }
-        else if (a == "--padding") { if (!value(v)) return false; o.padding = atoi(v.c_str()); }
+        else if (a == "-g" || a == "--gpu")
+        {
+            if (!value(v) || !parse_int_option(a, v, -1, 255, o.gpu, error)) return false;
+        }
+        else if (a == "-j" || a == "--threads")
+        {
+            if (!value(v) || !parse_int_option(a, v, 0, 1024, o.threads, error)) return false;
+        }
+        else if (a == "--padding")
+        {
+            if (!value(v) || !parse_int_option(a, v, 0, 4096, o.padding, error)) return false;
+        }
         else if (a == "--tta")
         {
             if (!value(v)) return false;
-            o.tta = atoi(v.c_str());
-            if (o.tta != 1 && o.tta != 2 && o.tta != 4 && o.tta != 8)
+            int64_t tta = 0;
+            if (!parse_int64_strict(v, 1, 8, tta) || (tta != 1 && tta != 2 && tta != 4 && tta != 8))
             {
                 error = "--tta : 1, 2, 4 ou 8 attendu (reçu : " + v + ")";
                 return false;
             }
+            o.tta = (int)tta;
         }
-        else if (a == "--scene-threshold") { if (!value(v)) return false; o.scene_threshold = atof(v.c_str()); }
-        else if (a == "--progress-interval") { if (!value(v)) return false; o.progress_interval = atof(v.c_str()); }
+        else if (a == "--scene-threshold")
+        {
+            if (!value(v) || !parse_double_option(a, v, 0.0, 1.0e9, o.scene_threshold, error)) return false;
+        }
+        else if (a == "--progress-interval")
+        {
+            if (!value(v) || !parse_double_option(a, v, 0.0, 86400.0, o.progress_interval, error)) return false;
+        }
         else if (a == "--fp32") o.fp32 = true;
         else if (a == "--uhd") o.uhd = true;
         else if (a == "--allow-interlaced") o.allow_interlaced = true;
@@ -593,9 +639,19 @@ static int run(const Options& o, const fs::path& exe_dir)
             fprintf(stderr, "error: --fps invalide : %s\n", o.fps.c_str());
             return EXIT_USAGE;
         }
-        ra = fn * fmt.fps_den;
-        rb = fd * fmt.fps_num;
+        if (!mul_int64_checked(fn, fmt.fps_den, ra) || !mul_int64_checked(fd, fmt.fps_num, rb))
+        {
+            fprintf(stderr, "error: --fps hors limites : %s\n", o.fps.c_str());
+            return EXIT_USAGE;
+        }
         reduce(ra, rb);
+    }
+    // Rapport sur 31 bits : les calculs de planification (indice × rapport)
+    // et de cadence de sortie restent sans dépassement.
+    if (ra > Y4M_MAX_RATE_TERM || rb > Y4M_MAX_RATE_TERM)
+    {
+        fprintf(stderr, "error: rapport de cadence hors limites (%lld/%lld)\n", (long long)ra, (long long)rb);
+        return EXIT_USAGE;
     }
     if (o.roundtrip)
     {
@@ -616,8 +672,11 @@ static int run(const Options& o, const fs::path& exe_dir)
     }
 
     FrameFormat out_fmt = fmt;
-    out_fmt.fps_num = fmt.fps_num * ra;
-    out_fmt.fps_den = fmt.fps_den * rb;
+    if (!mul_int64_checked(fmt.fps_num, ra, out_fmt.fps_num) || !mul_int64_checked(fmt.fps_den, rb, out_fmt.fps_den))
+    {
+        fprintf(stderr, "error: cadence de sortie hors limites\n");
+        return EXIT_USAGE;
+    }
     reduce(out_fmt.fps_num, out_fmt.fps_den);
 
     // moteur GPU

@@ -24,6 +24,12 @@ enum class ColorRange
     Full,
 };
 
+// Bornes des en-têtes acceptés : tailles calculées sans dépassement en 64 bits
+// et allocations raisonnables (refus explicite au-delà).
+constexpr int64_t Y4M_MAX_DIMENSION = 32768;
+constexpr int64_t Y4M_MAX_LUMA_SAMPLES = int64_t(1) << 28; // 16384 × 16384
+constexpr int64_t Y4M_MAX_RATE_TERM = 0x7FFFFFFF;          // numérateur/dénominateur de cadence
+
 struct FrameFormat
 {
     int width = 0;
@@ -38,8 +44,9 @@ struct FrameFormat
     ChromaSiting siting = ChromaSiting::Unknown;
     ColorRange range = ColorRange::Unknown;
 
-    int chroma_width() const { return (width + sub_x - 1) / sub_x; }
-    int chroma_height() const { return (height + sub_y - 1) / sub_y; }
+    // Calcul en 64 bits : dimensions bornées par Y4M_MAX_DIMENSION à la lecture.
+    int chroma_width() const { return (int)(((int64_t)width + sub_x - 1) / sub_x); }
+    int chroma_height() const { return (int)(((int64_t)height + sub_y - 1) / sub_y); }
     int64_t luma_samples() const { return (int64_t)width * height; }
     int64_t chroma_samples() const { return (int64_t)chroma_width() * chroma_height(); }
     int64_t total_samples() const { return luma_samples() + 2 * chroma_samples(); }
