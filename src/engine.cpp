@@ -184,8 +184,18 @@ bool RifeEngine::configure(const FrameFormat& _fmt, const ColorParams& _color, s
     fmt = _fmt;
     color = _color;
 
-    w_padded = (fmt.width + padding - 1) / padding * padding;
-    h_padded = (fmt.height + padding - 1) / padding * padding;
+    // Padding fourni par l'utilisateur : calcul en 64 bits avant conversion
+    // vers les dimensions int de ncnn et les index des shaders.
+    const int64_t padded_w = ((int64_t)fmt.width + padding - 1) / padding * padding;
+    const int64_t padded_h = ((int64_t)fmt.height + padding - 1) / padding * padding;
+    if (padded_w > INT32_MAX || padded_h > INT32_MAX
+            || padded_w * padded_h > Y4M_MAX_LUMA_SAMPLES)
+    {
+        error = "dimensions après padding hors limites du moteur";
+        return false;
+    }
+    w_padded = (int)padded_w;
+    h_padded = (int)padded_h;
     words = (int)(fmt.padded_frame_bytes() / 4);
     pack_dispatch_w = std::min(words, 8192);
 

@@ -39,6 +39,7 @@
 
 #include "engine.h"
 #include "numparse.h"
+#include <limits>
 #include "y4m.h"
 
 #ifndef MUXIVEO_RIFE_VERSION
@@ -139,7 +140,7 @@ static bool parse_ratio(const std::string& s, int64_t& num, int64_t& den)
         // décimal toléré (ex. 59.94) : converti en fraction /1000 ; NaN, infini
         // et suffixes refusés.
         double v = 0.0;
-        if (!parse_double_strict(s, 0.001, 1000000.0, v))
+        if (!parse_double_strict(s, 0.0, (double)Y4M_MAX_RATE_TERM, v))
             return false;
         if (std::floor(v) == v)
         {
@@ -404,15 +405,15 @@ static bool parse_args(const std::vector<std::string>& args, Options& o, std::st
         else if (a == "--chroma-loc") { if (!value(o.chroma_loc)) return false; }
         else if (a == "-g" || a == "--gpu")
         {
-            if (!value(v) || !parse_int_option(a, v, -1, 255, o.gpu, error)) return false;
+            if (!value(v) || !parse_int_option(a, v, -1, std::numeric_limits<int>::max(), o.gpu, error)) return false;
         }
         else if (a == "-j" || a == "--threads")
         {
-            if (!value(v) || !parse_int_option(a, v, 0, 1024, o.threads, error)) return false;
+            if (!value(v) || !parse_int_option(a, v, 0, std::numeric_limits<int>::max(), o.threads, error)) return false;
         }
         else if (a == "--padding")
         {
-            if (!value(v) || !parse_int_option(a, v, 0, 4096, o.padding, error)) return false;
+            if (!value(v) || !parse_int_option(a, v, 0, std::numeric_limits<int>::max(), o.padding, error)) return false;
         }
         else if (a == "--tta")
         {
@@ -427,11 +428,11 @@ static bool parse_args(const std::vector<std::string>& args, Options& o, std::st
         }
         else if (a == "--scene-threshold")
         {
-            if (!value(v) || !parse_double_option(a, v, 0.0, 1.0e9, o.scene_threshold, error)) return false;
+            if (!value(v) || !parse_double_option(a, v, 0.0, std::numeric_limits<double>::max(), o.scene_threshold, error)) return false;
         }
         else if (a == "--progress-interval")
         {
-            if (!value(v) || !parse_double_option(a, v, 0.0, 86400.0, o.progress_interval, error)) return false;
+            if (!value(v) || !parse_double_option(a, v, 0.0, std::numeric_limits<double>::max(), o.progress_interval, error)) return false;
         }
         else if (a == "--fp32") o.fp32 = true;
         else if (a == "--uhd") o.uhd = true;
