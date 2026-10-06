@@ -48,6 +48,11 @@ Codes de sortie : `0` OK, `1` usage, `2` entrée invalide, `3` GPU/modèle, `4` 
 `5` mémoire GPU (VRAM) insuffisante.
 `--list-gpus` affiche les GPU en JSON.
 
+Avec `-i` et `-o`, l'entrée et la sortie doivent désigner des fichiers distincts,
+y compris à travers un lien symbolique ou un hardlink. Sinon, la commande est
+refusée avec le code `1` avant toute écriture. Le pipeline Muxiveo utilise
+`stdin → stdout` et conserve ce fonctionnement.
+
 ## Build
 
 Prérequis : CMake ≥ 3.20, compilateur C++17, Git (ncnn et glslang sont téléchargés au tag épinglé).

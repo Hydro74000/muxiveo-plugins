@@ -414,6 +414,23 @@ static bool parse_args(const std::vector<std::string>& args, Options& o, std::st
     return true;
 }
 
+static bool validate_file_paths(const Options& o, std::string& error)
+{
+    // Les pipes n'ont pas de chemin de fichier à comparer. equivalent()
+    // reconnaît aussi les chemins relatifs, liens symboliques et hardlinks.
+    if (o.input == "-" || o.output == "-")
+        return true;
+    std::error_code ec;
+    if (fs::equivalent(path_from_utf8(o.input), path_from_utf8(o.output), ec))
+    {
+        error = "l'entrée et la sortie désignent le même fichier ; choisissez une sortie distincte";
+        return false;
+    }
+    // Une sortie inexistante est normale ; les autres erreurs d'ouverture
+    // restent diagnostiquées par run(), avant le traitement des trames.
+    return true;
+}
+
 static bool resolve_color(const Options& o, const FrameFormat& fmt, ColorParams& color, std::string& error)
 {
     std::string m = o.matrix;
@@ -981,6 +998,13 @@ int main(int argc, char** argv)
     {
         printf("muxiveo-rife %s (ncnn %s)\n", MUXIVEO_RIFE_VERSION, MUXIVEO_RIFE_NCNN_VERSION);
         return EXIT_OK;
+    }
+
+    // Refus avant toute ouverture en écriture et avant l'initialisation GPU.
+    if (!o.list_gpus && !validate_file_paths(o, error))
+    {
+        fprintf(stderr, "error: %s\n", error.c_str());
+        return EXIT_USAGE;
     }
 
     const fs::path exe_dir = executable_dir(argc > 0 ? argv[0] : 0);
