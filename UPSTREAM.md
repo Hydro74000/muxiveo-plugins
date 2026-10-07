@@ -11,6 +11,7 @@ partie du code amont est reprise ; le reste est propre à Muxiveo.
 | fork modèles v4.7–v4.26 | https://github.com/TNTwise/rife-ncnn-vulkan | `13338e38debe2e400b3eeecf6792312d01a692f9` | MIT |
 | ncnn | https://github.com/Tencent/ncnn | tag `20260526` | BSD-3-Clause (`LICENSES/BSD-3-Clause-ncnn.txt`) |
 | modèles RIFE | https://github.com/hzwer/Practical-RIFE | via TNTwise (`models.json`) | MIT (`LICENSES/MIT-Practical-RIFE.txt`) |
+| NVIDIA Optical Flow SDK (en-tête) | https://github.com/NVIDIA/NVIDIAOpticalFlowSDK | `edb50da3cf849840d680249aa6dbef248ebce2ca` (API 2.0) | BSD-3-Clause (`LICENSES/BSD-3-Clause-NVIDIA-Optical-Flow-SDK.txt`) |
 
 ## Fichiers repris
 
@@ -20,6 +21,7 @@ partie du code amont est reprise ; le reste est propre à Muxiveo.
 | `src/shaders/warp.comp`, `warp_pack4.comp` | TNTwise `src/` | aucune |
 | `src/shaders/rife_v4_timestep.comp` | TNTwise `src/` | aucune |
 | `cmake/generate_shader_comp_header.cmake` | TNTwise `src/` | octets castés en `(char)` : shaders UTF-8 (commentaires accentués) acceptés |
+| `src/third_party/nvof/nvOpticalFlowCommon.h` | NVIDIA Optical Flow SDK | aucune (structures et énumérations seulement ; la table de fonctions CUDA est redéclarée dans `src/nvof.cpp`) |
 
 ## Code propre à Muxiveo
 
@@ -31,6 +33,9 @@ partie du code amont est reprise ; le reste est propre à Muxiveo.
 - `src/y4m.{h,cpp}`, `src/main.cpp` : streaming y4m stdin → stdout, cadence de
   sortie exacte (rationnelle), détection de coupes (score façon `scdet`) et des
   trames figées, recopie octet pour octet des trames d'origine.
+- Moteur hybride (1.3.0) : `src/shaders/mc_*.comp` (pyramide de luminance, recherche
+  bilatérale par blocs, propagation, OBMC, décision par région) et `src/nvof.{h,cpp}`
+  (flux optique matériel NVIDIA, pilote chargé à l'exécution).
 
 ## Mettre à jour l'amont
 
@@ -39,3 +44,5 @@ partie du code amont est reprise ; le reste est propre à Muxiveo.
 2. Modèles : changer `commit` dans `models.json`, recalculer les `sha256`
    (`sha256sum`), vérifier le `padding` attendu dans `model_padding()` (`src/main.cpp`).
 3. Shaders `warp*` : comparer avec l'amont, reporter les correctifs.
+4. En-tête NVOF : seulement si une nouvelle version de l'API est nécessaire (`NV_OF_API_VERSION`) ;
+   vérifier la disposition de `NV_OF_CUDA_API_FUNCTION_LIST` dans `src/nvof.cpp`.

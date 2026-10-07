@@ -18,6 +18,7 @@
 #include <cstring>
 #include <deque>
 #include <filesystem>
+#include <future>
 #include <memory>
 #include <mutex>
 #include <numeric>
@@ -38,6 +39,7 @@
 #endif
 
 #include "engine.h"
+#include "nvof.h"
 #include "numparse.h"
 #include <limits>
 #include "y4m.h"
@@ -338,6 +340,8 @@ struct Options
     int threads = 2;
     int padding = 0;
     int tta = 1;
+    std::string engine = "rife";   // rife | hybrid | mc (diagnostic)
+    std::string nvof = "auto";     // auto | off : flux optique matériel NVIDIA si disponible
     double scene_threshold = 10.0;
     bool fp32 = false;
     bool uhd = false;
@@ -368,13 +372,17 @@ static void print_usage(FILE* fp)
             "  --fp32                  calcul en float32 (plus lent, précision maximale)\n"
             "  --tta <n>               moyenne de n variantes : 2 = + sens temporel inverse, 4 = + miroir\n"
             "                          horizontal, 8 = + miroirs vertical et double (coût x n ; défaut : 1)\n"
+            "  --engine <e>            rife (défaut) | hybrid : RIFE + compensation de mouvement par blocs,\n"
+            "                          robuste sur les motifs fins répétitifs | mc : compensation seule (diagnostic)\n"
+            "  --nvof <auto|off>       moteur hybride : flux optique matériel NVIDIA si le GPU Vulkan est une\n"
+            "                          carte NVIDIA compatible (défaut : auto ; sinon calcul Vulkan seul)\n"
             "  --padding <n>           padding du réseau (défaut : selon le modèle, x2 avec --uhd)\n"
             "  -j, --threads <n>       threads CPU ncnn (défaut : 2)\n"
             "  --allow-interlaced      accepter une entrée entrelacée\n"
             "  --progress-interval <s> intervalle des lignes de progression (défaut : 1)\n"
             "  --quiet                 pas de ligne de progression\n"
             "  --verbose               affiche les diagnostics Vulkan de ncnn\n"
-            "  --list-gpus             liste les GPU Vulkan (JSON) et quitte\n"
+            "  --list-gpus             liste les GPU Vulkan (JSON, disponibilité du flux NVIDIA) et quitte\n"
             "  --version               affiche la version et quitte\n",
             DEFAULT_MODEL);
 }
@@ -425,6 +433,26 @@ static bool parse_args(const std::vector<std::string>& args, Options& o, std::st
                 return false;
             }
             o.tta = (int)tta;
+        }
+        else if (a == "--engine")
+        {
+            if (!value(v)) return false;
+            if (v != "rife" && v != "mc" && v != "hybrid")
+            {
+                error = "--engine : rife, mc ou hybrid attendu (reçu : " + v + ")";
+                return false;
+            }
+            o.engine = v;
+        }
+        else if (a == "--nvof")
+        {
+            if (!value(v)) return false;
+            if (v != "auto" && v != "off")
+            {
+                error = "--nvof : auto ou off attendu (reçu : " + v + ")";
+                return false;
+            }
+            o.nvof = v;
         }
         else if (a == "--scene-threshold")
         {
@@ -543,6 +571,32 @@ static int model_padding(const std::string& name)
     return 32;
 }
 
+static const uint32_t NVIDIA_VENDOR_ID = 0x10de;
+
+// Rang du GPU Vulkan parmi ceux de même nom (appariement avec l'énumération CUDA).
+static int same_name_rank(int gpu_index)
+{
+    const std::string name = ncnn::get_gpu_info(gpu_index).device_name();
+    int rank = 0;
+    for (int i = 0; i < gpu_index; i++)
+        if (name == ncnn::get_gpu_info(i).device_name())
+            rank++;
+    return rank;
+}
+
+static std::string json_escape(const std::string& s)
+{
+    std::string out;
+    for (char c : s)
+    {
+        if (c == '"' || c == '\\')
+            out.push_back('\\');
+        if ((unsigned char)c >= 0x20)
+            out.push_back(c);
+    }
+    return out;
+}
+
 static int list_gpus()
 {
     const int count = ncnn::get_gpu_count();
@@ -559,16 +613,20 @@ static int list_gpus()
         case 2: type = "virtual"; break;
         case 3: type = "cpu"; break;
         }
-        std::string name = info.device_name();
-        std::string escaped;
-        for (char c : name)
+        // flux optique matériel (moteur hybride) : session d'essai sur ce GPU
+        bool nvof_ok = false;
+        std::string nvof_status = "GPU non NVIDIA";
+        if (info.vendor_id() == NVIDIA_VENDOR_ID)
         {
-            if (c == '"' || c == '\\')
-                escaped.push_back('\\');
-            escaped.push_back(c);
+            NvofFlow probe;
+            std::string err;
+            nvof_ok = probe.init(1920, 1080, info.device_name(), same_name_rank(i), err);
+            nvof_status = nvof_ok ? "disponible" : err;
         }
-        printf("%s{\"index\": %d, \"name\": \"%s\", \"type\": \"%s\", \"fp16\": %s}", i ? ", " : "", i,
-               escaped.c_str(), type, info.support_fp16_storage() ? "true" : "false");
+        printf("%s{\"index\": %d, \"name\": \"%s\", \"type\": \"%s\", \"fp16\": %s, \"nvof\": %s, \"nvof_status\": \"%s\"}",
+               i ? ", " : "", i, json_escape(info.device_name()).c_str(), type,
+               info.support_fp16_storage() ? "true" : "false", nvof_ok ? "true" : "false",
+               json_escape(nvof_status).c_str());
     }
     printf("]}\n");
     return EXIT_OK;
@@ -577,6 +635,40 @@ static int list_gpus()
 // ---------------------------------------------------------------------------
 // Traitement
 // ---------------------------------------------------------------------------
+
+// Luma 8 bits (entrée du flux optique matériel) depuis une trame y4m brute.
+static void to_luma8(const uint8_t* frame, const FrameFormat& fmt, std::vector<uint8_t>& out, int scale = 1)
+{
+    // scale 2 : moyenne 2×2 (flux calculé à demi-résolution)
+    const int w = fmt.width;
+    const int h = fmt.height;
+    const int ow = (w + scale - 1) / scale;
+    const int oh = (h + scale - 1) / scale;
+    out.resize((size_t)ow * oh);
+    const int shift = fmt.bit_depth - 8;
+    auto at = [&](int x, int y) -> unsigned {
+        const size_t i = (size_t)y * w + x;
+        if (fmt.bytes_per_sample == 1)
+            return frame[i];
+        return ((unsigned)frame[2 * i] | ((unsigned)frame[2 * i + 1] << 8)) >> shift;
+    };
+    for (int y = 0; y < oh; y++)
+    {
+        for (int x = 0; x < ow; x++)
+        {
+            unsigned v;
+            if (scale == 1)
+                v = at(x, y);
+            else
+            {
+                const int x1 = std::min(2 * x + 1, w - 1);
+                const int y1 = std::min(2 * y + 1, h - 1);
+                v = (at(2 * x, 2 * y) + at(x1, 2 * y) + at(2 * x, y1) + at(x1, y1) + 2) / 4;
+            }
+            out[(size_t)y * ow + x] = (uint8_t)std::min(255u, v);
+        }
+    }
+}
 
 struct SourceFrame
 {
@@ -685,6 +777,7 @@ static int run(const Options& o, const fs::path& exe_dir)
     const std::string model_name = path_to_utf8(model_dir.filename());
     RifeEngine engine;
     engine.set_tta(o.tta);
+    engine.set_engine(o.engine == "mc" ? InterpEngine::Mc : (o.engine == "hybrid" ? InterpEngine::Hybrid : InterpEngine::Rife));
     const bool needs_gpu = ra != rb || o.roundtrip;
     if (needs_gpu)
     {
@@ -697,6 +790,33 @@ static int run(const Options& o, const fs::path& exe_dir)
             return EXIT_GPU;
         }
     }
+
+    // Flux optique matériel : GPU Vulkan NVIDIA + pilote compatible, moteurs hybride / MC.
+    NvofFlow nvof;
+    std::string nvof_status = "désactivé";
+    if (needs_gpu && o.nvof == "auto" && engine.engine() != InterpEngine::Rife)
+    {
+        if (engine.vendor_id() != NVIDIA_VENDOR_ID)
+            nvof_status = "indisponible (GPU non NVIDIA)";
+        else
+        {
+            std::string nerr;
+            nvof_status = nvof.init(fmt.width, fmt.height, engine.device_name(), same_name_rank(engine.gpu_index()), nerr)
+                              ? "actif"
+                              : "indisponible (" + nerr + ")";
+        }
+    }
+
+    if (!o.quiet && engine.engine() != InterpEngine::Rife)
+        fprintf(stderr, "info: moteur %s | flux optique NVIDIA : %s\n", o.engine.c_str(), nvof_status.c_str());
+    int64_t nvof_pair = -1;
+    bool nvof_failed = false;
+    std::vector<uint8_t> luma_a, luma_b;
+    std::vector<int16_t> flow_f, flow_b;
+    bool nvof_pending = false;
+    std::string nvof_err;
+    // déclaré après les tampons qu'il utilise : détruit (donc attendu) avant eux
+    std::future<bool> nvof_job;
 
     if (!o.quiet)
     {
@@ -898,9 +1018,36 @@ static int run(const Options& o, const fs::path& exe_dir)
                     gpu_failure(err);
                     break;
                 }
+                // flux NVOF de la nouvelle paire lancé en parallèle : recouvert par l'inférence RIFE
+                if (nvof.active() && !nvof_failed && cur.index != nvof_pair)
+                {
+                    const uint8_t* fa = (const uint8_t*)cur.data->data();
+                    const uint8_t* fb = (const uint8_t*)nxt.data->data();
+                    nvof_job = std::async(std::launch::async, [&, fa, fb]() {
+                        to_luma8(fa, fmt, luma_a, nvof.scale());
+                        to_luma8(fb, fmt, luma_b, nvof.scale());
+                        return nvof.compute(luma_a.data(), luma_b.data(), flow_f, flow_b, nvof_err);
+                    });
+                    nvof_pending = true;
+                    nvof_pair = cur.index;
+                }
+                auto before_mc = [&]() {
+                    if (!nvof_pending)
+                        return;
+                    nvof_pending = false;
+                    if (nvof_job.get())
+                        engine.set_flow_hints(flow_f.data(), flow_b.data(), nvof.grid_w(), nvof.grid_h(), nvof.grid() * nvof.scale(), (float)nvof.scale());
+                    else
+                    {
+                        engine.clear_flow_hints();
+                        if (!o.quiet)
+                            fprintf(stderr, "warning: flux optique NVIDIA désactivé (%s)\n", nvof_err.c_str());
+                        nvof_failed = true;
+                    }
+                };
                 FrameBuffer outbuf = pool.acquire();
                 const float t = (float)((double)rem / (double)ra);
-                if (!engine.interpolate(cur.gpu, nxt.gpu, t, (uint8_t*)outbuf->data(), err))
+                if (!engine.interpolate(cur.gpu, nxt.gpu, t, (uint8_t*)outbuf->data(), err, before_mc))
                 {
                     gpu_failure(err);
                     break;
@@ -933,6 +1080,8 @@ static int run(const Options& o, const fs::path& exe_dir)
     }
 
     // libère les trames GPU avant le moteur
+    if (nvof_job.valid())
+        nvof_job.wait();
     cur.gpu.reset();
     nxt.gpu.reset();
 

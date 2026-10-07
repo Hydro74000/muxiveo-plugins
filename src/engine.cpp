@@ -21,6 +21,30 @@
 #include "tta_flip.comp.hex.h"
 #include "tta_resolve.comp.hex.h"
 #include "yuv_to_rgb.comp.hex.h"
+#include "mc_blend.comp.hex.h"
+#include "mc_down.comp.hex.h"
+#include "mc_filter.comp.hex.h"
+#include "mc_luma.comp.hex.h"
+#include "mc_median.comp.hex.h"
+#include "mc_recon.comp.hex.h"
+#include "mc_region.comp.hex.h"
+#include "mc_search.comp.hex.h"
+
+// Luminance des noyaux MC en unités de code 10 bits (plage limitée) : seuils indépendants
+// de la profondeur réelle du flux.
+static const float MC_LUM_SCALE = 876.f;
+
+// Réglages de la compensation de mouvement (valeurs validées sur les bancs de motifs répétitifs).
+static const float MC_LAMBDA_COARSE = 0.05f;   // pénalité de longueur, niveau 1/8 exhaustif
+static const float MC_LAMBDA = 0.5f;           // cohérence avec le prédicteur, niveaux 1/4 à 1/1
+static const float MC_LAMBDA_PROP = 2.f;       // passes de propagation
+static const int MC_PROP_PASSES = 2;           // propagation aux niveaux grossiers (repliement de période)
+static const int MC_MARGIN_FINE = 8;           // fenêtre 32×32 aux niveaux 1/1 et 1/2
+static const int MC_MARGIN_COARSE = 16;        // fenêtre 48×48 aux niveaux 1/4 et 1/8
+static const int MC_COARSE_RADIUS = 8;         // recherche exhaustive ±8 px au niveau 1/8
+static const float MC_Q_THRESHOLD = 20.f;      // erreur bilatérale d'un pixel mal expliqué
+static const float MC_DENSITY = 0.25f;         // densité au-delà de laquelle RIFE prend la main
+static const float MC_AGREE = 20.f;            // écart MC / RIFE sous lequel les deux sont moyennés
 
 DEFINE_LAYER_CREATOR(Warp)
 
@@ -37,6 +61,9 @@ RifeEngine::RifeEngine()
     : vkdev(0), blob_vkallocator(0), staging_vkallocator(0),
       pipeline_yuv_to_rgb(0), pipeline_rgb_to_yuv(0), pipeline_pack(0), pipeline_timestep(0),
       pipeline_tta_flip(0), pipeline_tta_accumulate(0), pipeline_tta_resolve(0),
+      pipeline_mc_luma(0), pipeline_mc_down(0), pipeline_mc_search(0), pipeline_mc_median(0),
+      pipeline_mc_recon(0), pipeline_mc_filter(0), pipeline_mc_region(0), pipeline_mc_blend(0),
+      engine_mode(InterpEngine::Rife), lw{0, 0, 0, 0}, lh{0, 0, 0, 0},
       padding(32), w_padded(0), h_padded(0), words(0), pack_dispatch_w(0), tta(1)
 {
 }
@@ -50,6 +77,17 @@ RifeEngine::~RifeEngine()
     delete pipeline_tta_flip;
     delete pipeline_tta_accumulate;
     delete pipeline_tta_resolve;
+    delete pipeline_mc_luma;
+    delete pipeline_mc_down;
+    delete pipeline_mc_search;
+    delete pipeline_mc_median;
+    delete pipeline_mc_recon;
+    delete pipeline_mc_filter;
+    delete pipeline_mc_region;
+    delete pipeline_mc_blend;
+    dummy.release();
+    hints_gpu.release();
+    cached_field.release();
 
     flownet.clear();
 
@@ -77,6 +115,7 @@ bool RifeEngine::init(int gpu_index, bool fp32, int num_threads, std::string& er
         return false;
     }
 
+    gpu = gpu_index;
     vkdev = ncnn::get_gpu_device(gpu_index);
     if (!vkdev)
     {
@@ -220,6 +259,362 @@ bool RifeEngine::configure(const FrameFormat& _fmt, const ColorParams& _color, s
         error = "compilation des shaders TTA impossible";
         return false;
     }
+    if (engine_mode != InterpEngine::Rife)
+    {
+        pipeline_mc_luma = make_pipeline(mc_luma_comp_data, sizeof(mc_luma_comp_data), 8, 8, 1);
+        pipeline_mc_down = make_pipeline(mc_down_comp_data, sizeof(mc_down_comp_data), 8, 8, 1);
+        pipeline_mc_search = make_pipeline(mc_search_comp_data, sizeof(mc_search_comp_data), 16, 16, 1);
+        pipeline_mc_median = make_pipeline(mc_median_comp_data, sizeof(mc_median_comp_data), 8, 8, 1);
+        pipeline_mc_recon = make_pipeline(mc_recon_comp_data, sizeof(mc_recon_comp_data), 8, 8, 1);
+        pipeline_mc_filter = make_pipeline(mc_filter_comp_data, sizeof(mc_filter_comp_data), 8, 8, 1);
+        pipeline_mc_region = make_pipeline(mc_region_comp_data, sizeof(mc_region_comp_data), 64, 1, 1);
+        pipeline_mc_blend = make_pipeline(mc_blend_comp_data, sizeof(mc_blend_comp_data), 8, 8, 1);
+        if (!pipeline_mc_luma || !pipeline_mc_down || !pipeline_mc_search || !pipeline_mc_median
+                || !pipeline_mc_recon || !pipeline_mc_filter || !pipeline_mc_region || !pipeline_mc_blend)
+        {
+            error = "compilation des shaders de compensation de mouvement impossible";
+            return false;
+        }
+        lw[0] = w_padded;
+        lh[0] = h_padded;
+        for (int l = 1; l < 4; l++)
+        {
+            lw[l] = (lw[l - 1] + 1) / 2;
+            lh[l] = (lh[l - 1] + 1) / 2;
+        }
+        dummy.create(4, (size_t)4u, 1, blob_vkallocator);
+        if (dummy.empty())
+        {
+            error = "allocation mémoire GPU impossible (MC)";
+            return false;
+        }
+    }
+    return true;
+}
+
+uint32_t RifeEngine::vendor_id() const
+{
+    return vkdev ? vkdev->info.vendor_id() : 0;
+}
+
+static float median_of(std::vector<float>& v)
+{
+    std::nth_element(v.begin(), v.begin() + v.size() / 2, v.end());
+    return v[v.size() / 2];
+}
+
+void RifeEngine::set_flow_hints(const int16_t* fwd, const int16_t* bwd, int gw, int gh, int grid, float vscale)
+{
+    // grid : taille de cellule en pixels pleine résolution ; vscale : facteur des vecteurs
+    const int bw = (lw[0] + 15) / 16;
+    const int bh = (lh[0] + 15) / 16;
+    const int cells = std::max(1, 16 / grid);
+    hints_host.assign((size_t)bw * bh * 4, 0.f);
+    std::vector<float> fx, fy, bx_, by_;
+    for (int by = 0; by < bh; by++)
+    {
+        for (int bx = 0; bx < bw; bx++)
+        {
+            fx.clear(); fy.clear(); bx_.clear(); by_.clear();
+            for (int j = 0; j < cells; j++)
+            {
+                const int gy = by * cells + j;
+                if (gy >= gh)
+                    break;
+                for (int i = 0; i < cells; i++)
+                {
+                    const int gx = bx * cells + i;
+                    if (gx >= gw)
+                        break;
+                    const size_t k = ((size_t)gy * gw + gx) * 2;
+                    fx.push_back(vscale * fwd[k] / 32.f);
+                    fy.push_back(vscale * fwd[k + 1] / 32.f);
+                    bx_.push_back(-vscale * bwd[k] / 32.f);
+                    by_.push_back(-vscale * bwd[k + 1] / 32.f);
+                }
+            }
+            float* dst = &hints_host[((size_t)by * bw + bx) * 4];
+            if (fx.empty())
+                continue;   // bloc entièrement dans le padding : vecteur nul
+            dst[0] = median_of(fx);
+            dst[1] = median_of(fy);
+            dst[2] = median_of(bx_);
+            dst[3] = median_of(by_);
+        }
+    }
+    hints_dirty = true;
+}
+
+ncnn::VkMat RifeEngine::float_mat(int n)
+{
+    ncnn::VkMat m;
+    m.create(n, (size_t)4u, 1, blob_vkallocator);
+    return m;
+}
+
+void RifeEngine::record_filter(ncnn::VkCompute& cmd, const ncnn::VkMat& src, ncnn::VkMat& dst, int r, int axis, int op,
+                               int threshold, float thr)
+{
+    std::vector<ncnn::VkMat> bindings(2);
+    bindings[0] = src;
+    bindings[1] = dst;
+    std::vector<ncnn::vk_constant_type> constants(7);
+    constants[0].i = w_padded;
+    constants[1].i = h_padded;
+    constants[2].i = r;
+    constants[3].i = axis;
+    constants[4].i = op;
+    constants[5].i = threshold;
+    constants[6].f = thr;
+    ncnn::VkMat dispatcher;
+    dispatcher.w = w_padded;
+    dispatcher.h = h_padded;
+    dispatcher.c = 1;
+    cmd.record_pipeline(pipeline_mc_filter, bindings, constants, dispatcher);
+}
+
+// Compensation de mouvement : pyramide bilatérale par blocs de 16 (1/8 → 1/1), reconstruction
+// recouvrante, puis, en mode hybride, choix par région entre MC et RIFE (rife non vide).
+bool RifeEngine::record_mc(ncnn::VkCompute& cmd, const GpuFrame& a, const GpuFrame& b, float t, const ncnn::VkMat& rife,
+                           ncnn::VkMat& out, std::string& error)
+{
+    const int plane = w_padded * h_padded;
+    // Champ unique par paire : recherche au milieu de la paire (t = 0,5), réutilisée pour toutes
+    // les positions t (un tiers des recherches évité en 24 → 60, qualité égale aux bancs).
+    const bool reuse = !cached_field.empty() && a.id == cache_a && b.id == cache_b;
+    ncnn::VkMat field[4];
+    if (reuse)
+        field[0] = cached_field;
+    for (int l = 3; l >= 0 && !reuse; l--)
+    {
+        const int bw = (lw[l] + 15) / 16;
+        const int bh = (lh[l] + 15) / 16;
+        const int iw = (fmt.width + (1 << l) - 1) >> l;
+        const int ih = (fmt.height + (1 << l) - 1) >> l;
+        ncnn::VkMat raw = float_mat(bw * bh * 2);
+        if (raw.empty())
+        {
+            error = "allocation mémoire GPU impossible (vecteurs)";
+            return false;
+        }
+        const bool coarse = l == 3;
+        std::vector<ncnn::VkMat> bindings(5);
+        bindings[0] = a.lum[l];
+        bindings[1] = b.lum[l];
+        bindings[2] = coarse ? dummy : field[l + 1];
+        bindings[3] = raw;
+        const bool hinted = l == 0 && !hints_host.empty() && (int)hints_host.size() == bw * bh * 4;
+        if (hinted && hints_dirty)
+        {
+            ncnn::Option o = opt;
+            o.blob_vkallocator = blob_vkallocator;
+            o.workspace_vkallocator = blob_vkallocator;
+            o.staging_vkallocator = staging_vkallocator;
+            ncnn::Mat host((int)hints_host.size(), (void*)hints_host.data(), (size_t)4u, 1);
+            cmd.record_clone(host, hints_gpu, o);
+            hints_dirty = false;
+        }
+        bindings[4] = hinted ? hints_gpu : dummy;
+        std::vector<ncnn::vk_constant_type> constants(15);
+        constants[0].i = lw[l];
+        constants[1].i = lh[l];
+        constants[2].i = iw;
+        constants[3].i = ih;
+        constants[4].i = bw;
+        constants[5].i = bh;
+        constants[6].i = coarse ? 1 : (lw[l + 1] + 15) / 16;
+        constants[7].i = coarse ? 1 : (lh[l + 1] + 15) / 16;
+        constants[8].i = coarse ? 0 : 1;
+        constants[9].i = MC_COARSE_RADIUS;
+        constants[10].i = l == 0 ? 1 : 0;
+        constants[11].i = hinted ? 2 : 0;
+        constants[12].f = coarse ? MC_LAMBDA_COARSE : MC_LAMBDA;
+        constants[13].f = 0.5f;
+        constants[14].i = l <= 1 ? MC_MARGIN_FINE : MC_MARGIN_COARSE;
+        ncnn::VkMat dispatcher;
+        dispatcher.w = bw * 16;
+        dispatcher.h = bh * 16;
+        dispatcher.c = 1;
+        cmd.record_pipeline(pipeline_mc_search, bindings, constants, dispatcher);
+
+        if (l == 0)
+        {
+            field[l] = raw;
+            continue;
+        }
+        // niveaux grossiers : médiane 3×3, puis passes de propagation (voisins du même niveau,
+        // prédicteur = médiane) qui corrigent les régions prises sur une mauvaise période d'un
+        // motif répétitif
+        field[l] = float_mat(bw * bh * 2);
+        {
+            std::vector<ncnn::VkMat> mb(2);
+            mb[0] = raw;
+            mb[1] = field[l];
+            std::vector<ncnn::vk_constant_type> mc(2);
+            mc[0].i = bw;
+            mc[1].i = bh;
+            ncnn::VkMat md;
+            md.w = bw;
+            md.h = bh;
+            md.c = 1;
+            cmd.record_pipeline(pipeline_mc_median, mb, mc, md);
+        }
+        for (int it = 0; it < MC_PROP_PASSES; it++)
+        {
+            ncnn::VkMat next = float_mat(bw * bh * 2);
+            if (field[l].empty() || next.empty())
+            {
+                error = "allocation mémoire GPU impossible (vecteurs)";
+                return false;
+            }
+            std::vector<ncnn::VkMat> pb(5);
+            pb[0] = a.lum[l];
+            pb[1] = b.lum[l];
+            pb[2] = field[l];
+            pb[3] = next;
+            pb[4] = dummy;
+            std::vector<ncnn::vk_constant_type> pc = constants;
+            pc[6].i = bw;
+            pc[7].i = bh;
+            pc[8].i = 2;
+            pc[11].i = 0;
+            pc[12].f = MC_LAMBDA_PROP;
+            cmd.record_pipeline(pipeline_mc_search, pb, pc, dispatcher);
+            field[l] = next;
+        }
+    }
+
+    if (!reuse)
+    {
+        cached_field = field[0];
+        cache_a = a.id;
+        cache_b = b.id;
+    }
+    ncnn::VkMat mc = float_mat(plane * 3);
+    ncnn::VkMat q = float_mat(plane);
+    ncnn::VkMat edge = float_mat(plane);
+    out.create(w_padded, h_padded, 3, a.rgb.elemsize, 1, blob_vkallocator);
+    if (mc.empty() || q.empty() || edge.empty() || out.empty() || out.cstep != a.rgb.cstep)
+    {
+        error = "allocation mémoire GPU impossible (reconstruction MC)";
+        return false;
+    }
+    {
+        std::vector<ncnn::VkMat> bindings(6);
+        bindings[0] = a.rgb;
+        bindings[1] = b.rgb;
+        bindings[2] = field[0];
+        bindings[3] = mc;
+        bindings[4] = q;
+        bindings[5] = edge;
+        std::vector<ncnn::vk_constant_type> constants(11);
+        constants[0].i = w_padded;
+        constants[1].i = h_padded;
+        constants[2].i = (int)a.rgb.cstep;
+        constants[3].i = fmt.width;
+        constants[4].i = fmt.height;
+        constants[5].i = (lw[0] + 15) / 16;
+        constants[6].i = (lh[0] + 15) / 16;
+        constants[7].f = t;
+        constants[8].f = color.kr;
+        constants[9].f = color.kb;
+        constants[10].f = MC_LUM_SCALE;
+        ncnn::VkMat dispatcher;
+        dispatcher.w = w_padded;
+        dispatcher.h = h_padded;
+        dispatcher.c = 1;
+        cmd.record_pipeline(pipeline_mc_recon, bindings, constants, dispatcher);
+    }
+
+    const bool hybrid = !rife.empty();
+    ncnn::VkMat u = dummy;
+    ncnn::VkMat diffs = dummy;
+    if (hybrid)
+    {
+        if (rife.w != w_padded || rife.h != h_padded || rife.c != 3 || rife.cstep != out.cstep || rife.elemsize != out.elemsize)
+        {
+            error = "sortie RIFE incompatible avec le mode hybride";
+            return false;
+        }
+        ncnn::VkMat t1 = float_mat(plane), qs = float_mat(plane), dens = float_mat(plane), edged = float_mat(plane);
+        ncnn::VkMat u0 = float_mat(plane);
+        u = float_mat(plane);
+        ncnn::VkMat diff = float_mat(plane);
+        diffs = float_mat(plane);
+        if (t1.empty() || qs.empty() || dens.empty() || edged.empty() || u0.empty() || u.empty() || diff.empty() || diffs.empty())
+        {
+            error = "allocation mémoire GPU impossible (hybride)";
+            return false;
+        }
+        record_filter(cmd, q, t1, 4, 0, 0, 0, 0.f);        // erreur lissée 9×9
+        record_filter(cmd, t1, qs, 4, 1, 0, 0, 0.f);
+        record_filter(cmd, qs, t1, 15, 0, 0, 1, MC_Q_THRESHOLD);  // densité de pixels non fiables, 31×31
+        record_filter(cmd, t1, dens, 15, 1, 0, 0, 0.f);
+        record_filter(cmd, edge, t1, 16, 0, 1, 0, 0.f);    // bord de cadre dilaté 33×33
+        record_filter(cmd, t1, edged, 16, 1, 1, 0, 0.f);
+        {
+            std::vector<ncnn::VkMat> bindings(3);
+            bindings[0] = dens;
+            bindings[1] = edged;
+            bindings[2] = u0;
+            std::vector<ncnn::vk_constant_type> constants(2);
+            constants[0].i = plane;
+            constants[1].f = MC_DENSITY;
+            ncnn::VkMat dispatcher;
+            dispatcher.w = plane;
+            dispatcher.h = 1;
+            dispatcher.c = 1;
+            cmd.record_pipeline(pipeline_mc_region, bindings, constants, dispatcher);
+        }
+        record_filter(cmd, u0, t1, 7, 0, 0, 0, 0.f);       // transition adoucie 15×15
+        record_filter(cmd, t1, u, 7, 1, 0, 0, 0.f);
+        {
+            std::vector<ncnn::VkMat> bindings(5);
+            bindings[0] = mc;
+            bindings[1] = rife;
+            bindings[2] = dummy;
+            bindings[3] = diff;
+            bindings[4] = out;
+            std::vector<ncnn::vk_constant_type> constants(8);
+            constants[0].i = w_padded;
+            constants[1].i = h_padded;
+            constants[2].i = (int)out.cstep;
+            constants[3].i = 1;
+            constants[4].f = color.kr;
+            constants[5].f = color.kb;
+            constants[6].f = MC_LUM_SCALE;
+            constants[7].f = MC_AGREE;
+            ncnn::VkMat dispatcher;
+            dispatcher.w = w_padded;
+            dispatcher.h = h_padded;
+            dispatcher.c = 1;
+            cmd.record_pipeline(pipeline_mc_blend, bindings, constants, dispatcher);
+        }
+        record_filter(cmd, diff, t1, 2, 0, 0, 0, 0.f);     // écart MC / RIFE lissé 5×5
+        record_filter(cmd, t1, diffs, 2, 1, 0, 0, 0.f);
+    }
+    {
+        std::vector<ncnn::VkMat> bindings(5);
+        bindings[0] = mc;
+        bindings[1] = hybrid ? rife : out;
+        bindings[2] = u;
+        bindings[3] = diffs;
+        bindings[4] = out;
+        std::vector<ncnn::vk_constant_type> constants(8);
+        constants[0].i = w_padded;
+        constants[1].i = h_padded;
+        constants[2].i = (int)out.cstep;
+        constants[3].i = hybrid ? 2 : 0;
+        constants[4].f = color.kr;
+        constants[5].f = color.kb;
+        constants[6].f = MC_LUM_SCALE;
+        constants[7].f = MC_AGREE;
+        ncnn::VkMat dispatcher;
+        dispatcher.w = w_padded;
+        dispatcher.h = h_padded;
+        dispatcher.c = 1;
+        cmd.record_pipeline(pipeline_mc_blend, bindings, constants, dispatcher);
+    }
     return true;
 }
 
@@ -308,11 +703,59 @@ bool RifeEngine::upload(const uint8_t* frame, GpuFrame& out, std::string& error)
     dispatcher.c = 1;
     cmd.record_pipeline(pipeline_yuv_to_rgb, bindings, constants, dispatcher);
 
+    if (engine_mode != InterpEngine::Rife)
+    {
+        // pyramide de luminance, calculée une fois par trame source (réutilisée par deux paires)
+        for (int l = 0; l < 4; l++)
+        {
+            out.lum[l] = float_mat(lw[l] * lh[l]);
+            if (out.lum[l].empty())
+            {
+                error = "allocation mémoire GPU impossible (pyramide)";
+                return false;
+            }
+        }
+        {
+            std::vector<ncnn::VkMat> lb(2);
+            lb[0] = out.rgb;
+            lb[1] = out.lum[0];
+            std::vector<ncnn::vk_constant_type> lc(6);
+            lc[0].i = w_padded;
+            lc[1].i = h_padded;
+            lc[2].i = (int)out.rgb.cstep;
+            lc[3].f = color.kr;
+            lc[4].f = color.kb;
+            lc[5].f = MC_LUM_SCALE;
+            ncnn::VkMat ld;
+            ld.w = w_padded;
+            ld.h = h_padded;
+            ld.c = 1;
+            cmd.record_pipeline(pipeline_mc_luma, lb, lc, ld);
+        }
+        for (int l = 1; l < 4; l++)
+        {
+            std::vector<ncnn::VkMat> db(2);
+            db[0] = out.lum[l - 1];
+            db[1] = out.lum[l];
+            std::vector<ncnn::vk_constant_type> dc(4);
+            dc[0].i = lw[l - 1];
+            dc[1].i = lh[l - 1];
+            dc[2].i = lw[l];
+            dc[3].i = lh[l];
+            ncnn::VkMat dd;
+            dd.w = lw[l];
+            dd.h = lh[l];
+            dd.c = 1;
+            cmd.record_pipeline(pipeline_mc_down, db, dc, dd);
+        }
+    }
+
     if (cmd.submit_and_wait() != 0)
     {
         error = "échec d'exécution GPU (conversion YUV -> RGB)";
         return false;
     }
+    out.id = ++upload_seq;
     out.ready = true;
     return true;
 }
@@ -358,8 +801,35 @@ bool RifeEngine::record_network(ncnn::VkCompute& cmd, const ncnn::VkMat& in0, co
     return true;
 }
 
-bool RifeEngine::interpolate(const GpuFrame& a, const GpuFrame& b, float t, uint8_t* dst, std::string& error)
+bool RifeEngine::interpolate(const GpuFrame& a, const GpuFrame& b, float t, uint8_t* dst, std::string& error,
+                             const std::function<void()>& before_mc)
 {
+    if (engine_mode != InterpEngine::Rife)
+    {
+        ncnn::VkMat rife_rgb;
+        if (engine_mode == InterpEngine::Hybrid && tta > 1 && !rife_tta_rgb(a, b, t, rife_rgb, error))
+            return false;
+        ncnn::VkCompute cmd(vkdev);
+        if (engine_mode == InterpEngine::Hybrid && tta <= 1)
+        {
+            ncnn::VkMat timestep;
+            if (!record_timestep(cmd, t, timestep, error) || !record_network(cmd, a.rgb, b.rgb, timestep, rife_rgb, error))
+                return false;
+        }
+        if (before_mc)
+        {
+            // RIFE exécuté pendant que l'appelant termine ses candidats (flux NVOF)
+            if (cmd.submit_and_wait() != 0)
+            {
+                error = "échec d'exécution GPU (RIFE)";
+                return false;
+            }
+            cmd.reset();
+            before_mc();
+        }
+        ncnn::VkMat out_rgb;
+        return record_mc(cmd, a, b, t, rife_rgb, out_rgb, error) && convert_and_download(cmd, out_rgb, dst, error);
+    }
     if (tta > 1)
         return interpolate_tta(a, b, t, dst, error);
 
@@ -402,6 +872,15 @@ bool RifeEngine::record_flip(ncnn::VkCompute& cmd, const ncnn::VkMat& src, int f
 // Moyenne des variantes (retournement x sens temporel). Une soumission par
 // variante : la VRAM reste celle d'une seule inférence (+ accumulateur fp32).
 bool RifeEngine::interpolate_tta(const GpuFrame& a, const GpuFrame& b, float t, uint8_t* dst, std::string& error)
+{
+    ncnn::VkMat merged;
+    if (!rife_tta_rgb(a, b, t, merged, error))
+        return false;
+    ncnn::VkCompute cmd(vkdev);
+    return convert_and_download(cmd, merged, dst, error);
+}
+
+bool RifeEngine::rife_tta_rgb(const GpuFrame& a, const GpuFrame& b, float t, ncnn::VkMat& merged, std::string& error)
 {
     const int nflips = tta >= 8 ? 4 : (tta >= 4 ? 2 : 1);
     const int variants = nflips * 2;
@@ -467,7 +946,6 @@ bool RifeEngine::interpolate_tta(const GpuFrame& a, const GpuFrame& b, float t, 
     }
 
     ncnn::VkCompute cmd(vkdev);
-    ncnn::VkMat merged;
     merged.create(w_padded, h_padded, 3, opt.use_fp16_storage ? 2u : 4u, 1, blob_vkallocator);
     if (merged.empty())
     {
@@ -491,7 +969,12 @@ bool RifeEngine::interpolate_tta(const GpuFrame& a, const GpuFrame& b, float t, 
 
         cmd.record_pipeline(pipeline_tta_resolve, bindings, constants, merged);
     }
-    return convert_and_download(cmd, merged, dst, error);
+    if (cmd.submit_and_wait() != 0)
+    {
+        error = "échec d'exécution GPU (TTA)";
+        return false;
+    }
+    return true;
 }
 
 bool RifeEngine::roundtrip(const GpuFrame& a, uint8_t* dst, std::string& error)

@@ -11,6 +11,13 @@
         "flownet.bin": {"sha256": "f334ed2260149ce0188a6dcf049844e8b0cdd912e01cbcfb63553157d2508958", "size": 10614320}
       }
     },
+    "rife-v4.15": {
+      "preset": "quality",
+      "files": {
+        "flownet.param": {"sha256": "13b6407289b9888d65f2da2ad58b40c1db93a0e53cb3add26288f95f36241168", "size": 28659},
+        "flownet.bin": {"sha256": "d01f3b9098a999c1aa46607f4851ae728d78866c060f782743b3b80d9fef279a", "size": 10793232}
+      }
+    },
     "rife-v4.15-lite": {
       "preset": "light",
       "files": {

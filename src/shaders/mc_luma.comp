@@ -1,0 +1,33 @@
+// Muxiveo — MC : luminance (unités de code 10 bits limités) depuis le RGB planaire paddé.
+
+#version 450
+
+#if NCNN_fp16_storage
+#extension GL_EXT_shader_16bit_storage: require
+#endif
+
+layout (binding = 0) readonly buffer rgb_blob { sfp rgb_data[]; };
+layout (binding = 1) writeonly buffer lum_blob { float lum_data[]; };
+
+layout (push_constant) uniform parameter
+{
+    int w;
+    int h;
+    int cstep;
+    float kr;
+    float kb;
+    float scale;
+} p;
+
+void main()
+{
+    int gx = int(gl_GlobalInvocationID.x);
+    int gy = int(gl_GlobalInvocationID.y);
+    if (gx >= p.w || gy >= p.h)
+        return;
+    int i = gy * p.w + gx;
+    float r = float(rgb_data[i]);
+    float g = float(rgb_data[p.cstep + i]);
+    float b = float(rgb_data[2 * p.cstep + i]);
+    lum_data[i] = p.scale * (p.kr * r + (1.f - p.kr - p.kb) * g + p.kb * b);
+}

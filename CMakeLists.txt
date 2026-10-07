@@ -6,7 +6,7 @@ cmake_policy(SET CMP0091 NEW)
 set(CMAKE_POLICY_DEFAULT_CMP0091 NEW)
 set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 
-project(muxiveo-rife VERSION 1.2.3 LANGUAGES C CXX)
+project(muxiveo-rife VERSION 1.3.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -86,6 +86,7 @@ endif()
 set(MUXIVEO_RIFE_SHADERS
     yuv_to_rgb rgb_to_yuv pack_samples rife_v4_timestep warp warp_pack4
     tta_flip tta_accumulate tta_resolve
+    mc_luma mc_down mc_search mc_median mc_recon mc_filter mc_region mc_blend
 )
 set(SHADER_HEADERS)
 foreach(shader ${MUXIVEO_RIFE_SHADERS})
@@ -108,6 +109,7 @@ add_executable(muxiveo-rife
     src/y4m.cpp
     src/warp.cpp
     src/uhd.cpp
+    src/nvof.cpp
     ${SHADER_HEADERS}
 )
 target_include_directories(muxiveo-rife PRIVATE ${CMAKE_CURRENT_BINARY_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/src)
@@ -115,7 +117,8 @@ target_compile_definitions(muxiveo-rife PRIVATE
     MUXIVEO_RIFE_VERSION="${PROJECT_VERSION}"
     MUXIVEO_RIFE_NCNN_VERSION="${MUXIVEO_RIFE_NCNN_TAG}"
 )
-target_link_libraries(muxiveo-rife PRIVATE ncnn Threads::Threads)
+# CMAKE_DL_LIBS : pilote NVIDIA (CUDA / Optical Flow) chargé à l'exécution, s'il existe.
+target_link_libraries(muxiveo-rife PRIVATE ncnn Threads::Threads ${CMAKE_DL_LIBS})
 
 if(WIN32)
     target_compile_definitions(muxiveo-rife PRIVATE UNICODE _UNICODE NOMINMAX _CRT_SECURE_NO_WARNINGS)

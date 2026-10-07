@@ -28,6 +28,33 @@ chargement (`src/uhd.cpp`), sans modèle dédié ; padding doublé. Mesuré en 4
 ×2) : +16 % (`rife-v4.26`) à +36 % (`rife-v4.25-heavy`) de débit pour −0,1 à −0,6 dB de PSNR ;
 en 1080p, environ −1 dB.
 
+## Moteur hybride (`--engine hybrid`, 1.3.0)
+
+RIFE retient parfois la mauvaise période sur les motifs fins et répétitifs (barreaux devant un bardage
+rayé, grilles en panoramique) : les barreaux ondulent ou se dédoublent. Le moteur hybride ajoute, dans le
+même lot de commandes Vulkan que RIFE, une **compensation de mouvement par blocs** :
+
+1. pyramide de luminance 1/8 → 1/1, recherche bilatérale par blocs de 16 centrée sur l'image à créer
+   (recherche exhaustive au niveau 1/8, puis raffinement avec pénalité de cohérence), deux passes de
+   propagation aux niveaux grossiers (repliement de période) ; un seul champ de vecteurs par paire,
+   réutilisé pour toutes les positions intermédiaires ;
+2. reconstruction recouvrante (OBMC) des blocs voisins, en écartant le côté qui échantillonne hors image ;
+3. décision par région : RIFE là où la densité de pixels mal expliqués dépasse 25 % (fenêtre de 31 px)
+   et au bord du cadre, compensation ailleurs, moyenne des deux là où ils coïncident ; transition adoucie.
+
+**Flux optique NVIDIA (`--nvof auto|off`)** : sur une carte NVIDIA compatible (Turing ou plus récente,
+pilote avec CUDA et Optical Flow), les médianes par bloc du flux matériel aller / retour servent de
+candidats supplémentaires au niveau final. Le pilote est chargé à l'exécution
+(`libnvidia-opticalflow.so.1` + `libcuda.so.1`, `nvofapi64.dll` + `nvcuda.dll`) : aucune dépendance
+au lancement. Le flux est calculé sur un thread, pendant l'inférence RIFE. Sans carte NVIDIA, ou si le
+GPU n'a pas d'accélérateur de flux optique (Pascal et antérieurs), le moteur reste entièrement en Vulkan,
+avec une qualité très proche. `--list-gpus` indique la disponibilité par GPU (`nvof`, `nvof_status`).
+
+Mesures (4K, RTX 4070 Ti SUPER, PSNR-Y en dB image entière / zone des barreaux) : barrières ×2
+35,30 / 32,54 (RIFE v4.6) → 36,48 / 34,67 (hybride v4.6) ; ville avec hélice ×2 identique à RIFE.
+Vrai 24 → 59,94 en 4K : hybride ≈ 1,35 × le temps de RIFE avec `rife-v4.6`, ≈ 2 × avec `rife-v4.15`.
+`--engine mc` (compensation seule) sert au diagnostic.
+
 ## TTA (`--tta 2|4|8`)
 
 Moyenne de plusieurs inférences de la même trame intermédiaire : `2` ajoute le sens temporel inverse
@@ -39,6 +66,7 @@ les erreurs d'appariement de motifs répétitifs (barreaux en panoramique), comm
 ## Sortie stderr (lue par Muxiveo)
 
 ```
+info: moteur hybrid | flux optique NVIDIA : actif
 info: 3832x1592 10 bits … | 24/1 -> 48/1 fps | modèle rife-v4.26 (uhd) | GPU … (fp16)
 progress in=120 out=240 interpolated=119 scenes=1 static=0 fps=28.4
 done in=240 out=480 interpolated=238 scenes=1 static=0 seconds=16.89 exit=0
@@ -46,7 +74,7 @@ done in=240 out=480 interpolated=238 scenes=1 static=0 seconds=16.89 exit=0
 
 Codes de sortie : `0` OK, `1` usage, `2` entrée invalide, `3` GPU/modèle, `4` E/S (pipe fermé),
 `5` mémoire GPU (VRAM) insuffisante.
-`--list-gpus` affiche les GPU en JSON.
+`--list-gpus` affiche les GPU en JSON (avec la disponibilité du flux optique NVIDIA).
 
 En-têtes y4m et options numériques sont lus strictement (1.2.3) : jetons
 entièrement numériques, dimensions de 1 à 32768 et au plus 2²⁸ échantillons de
@@ -81,9 +109,17 @@ de `core/version.py`) puis pousser. Le workflow de release de Muxiveo (`release.
 modifié sans changement de version fait échouer la release. Le tag manuel `muxiveo-rife-vX.Y.Z` reste possible.
 
 Les modèles (`models.json`, sha256 épinglés) sont cherchés dans `<dossier de l'exécutable>/rife-models/<nom>`
-ou passés avec `-m <dossier>`. Préréglages Muxiveo : `rife-v4.6` (Rapide et Équilibré, défaut) et
-`rife-v4.15-lite` (Light, petites cartes graphiques, toujours avec `--uhd`). Choix issu d'un banc de 17 modèles
-sur 4 contenus : v4.6 obtient le meilleur VMAF moyen, le débit le plus élevé et la VRAM la plus basse ; v4.15-lite
-+ `--uhd` est la configuration la plus sobre (1,7 Go en 4K).
+ou passés avec `-m <dossier>`. Préréglages Muxiveo :
+
+| Préréglage | Moteur | Modèle |
+|---|---|---|
+| Rapide | `rife` | `rife-v4.6` |
+| Normal (défaut) | `hybrid` | `rife-v4.6` |
+| Qualité | `hybrid` | `rife-v4.15` |
+| Light (petites cartes graphiques) | `rife` + `--uhd` | `rife-v4.15-lite` |
+
+Choix issus d'un banc de 17 modèles sur 4 contenus (v4.6 : meilleur VMAF moyen, débit le plus élevé, VRAM la
+plus basse ; v4.15-lite + `--uhd` : configuration la plus sobre, 1,7 Go en 4K), puis du banc des motifs
+répétitifs (hybride + v4.15 : meilleur résultat ; v4.25 / v4.26 sans gain sur ces contenus).
 
 Provenance du code et procédure de mise à jour : [UPSTREAM.md](UPSTREAM.md).

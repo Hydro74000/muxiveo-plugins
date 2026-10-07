@@ -1,4 +1,5 @@
-// Muxiveo — moteur d'interpolation RIFE v4 sur Vulkan (ncnn).
+// Muxiveo — moteur d'interpolation RIFE v4 sur Vulkan (ncnn), seul ou hybride avec une
+// compensation de mouvement par blocs (MC).
 // Entrée/sortie : trames YUV brutes au format y4m ; conversion YUV <-> RGB,
 // normalisation et quantification faites sur le GPU.
 
@@ -6,7 +7,9 @@
 #define MUXIVEO_RIFE_ENGINE_H
 
 #include <filesystem>
+#include <functional>
 #include <string>
+#include <vector>
 
 #include "y4m.h"
 
@@ -50,15 +53,29 @@ struct ColorParams
     ChromaSiting siting = ChromaSiting::Left;
 };
 
+// Moteur d'interpolation : RIFE seul, compensation de mouvement par blocs (MC) seule
+// (diagnostic), ou hybride (MC là où sa correspondance est fiable, RIFE ailleurs).
+enum class InterpEngine
+{
+    Rife,
+    Mc,
+    Hybrid
+};
+
 // Trame déjà convertie en RGB paddé et résidente sur le GPU.
 struct GpuFrame
 {
     ncnn::VkMat rgb;
+    ncnn::VkMat lum[4];   // pyramide de luminance 1, 1/2, 1/4, 1/8 (moteurs MC / hybride)
+    uint64_t id = 0;      // numéro d'envoi : identifie la paire (cache du champ de vecteurs)
     bool ready = false;
 
     void reset()
     {
         rgb.release();
+        for (ncnn::VkMat& l : lum)
+            l.release();
+        id = 0;
         ready = false;
     }
 };
@@ -78,12 +95,24 @@ public:
     // 4 = + retournement horizontal ; 8 = + retournements vertical et double.
     // Sorties moyennées (fp32) ; coût x n, VRAM d'une seule variante.
     void set_tta(int n) { tta = n; }
+    void set_engine(InterpEngine e) { engine_mode = e; }
+    InterpEngine engine() const { return engine_mode; }
+
+    // Candidats de flux matériel (NVOF) pour la paire courante : flux aller et retour sur une
+    // grille de `grid` px (S10.5, entrelacés), réduits en médianes par bloc de 16.
+    void set_flow_hints(const int16_t* fwd, const int16_t* bwd, int gw, int gh, int grid, float vscale = 1.f);
+    void clear_flow_hints() { hints_host.clear(); hints_dirty = true; }
+    int gpu_index() const { return gpu; }
+    uint32_t vendor_id() const;
 
     // Envoie une trame brute (padded_frame_bytes() octets, alignée sur 4) et la convertit en RGB.
     bool upload(const uint8_t* frame, GpuFrame& out, std::string& error);
 
     // Génère la trame intermédiaire au temps t (0 < t < 1) et l'écrit, au format y4m, dans dst.
-    bool interpolate(const GpuFrame& a, const GpuFrame& b, float t, uint8_t* dst, std::string& error);
+    // before_mc : appelé (moteurs MC / hybride) une fois RIFE soumis et terminé, juste avant la
+    // recherche de mouvement — permet de recouvrir un calcul externe (flux NVOF) par RIFE.
+    bool interpolate(const GpuFrame& a, const GpuFrame& b, float t, uint8_t* dst, std::string& error,
+                     const std::function<void()>& before_mc = {});
 
     // Diagnostic : conversion YUV -> RGB -> YUV sans réseau (mesure de la perte de conversion).
     bool roundtrip(const GpuFrame& a, uint8_t* dst, std::string& error);
@@ -100,6 +129,12 @@ private:
                         ncnn::VkMat& out, std::string& error);
     bool record_flip(ncnn::VkCompute& cmd, const ncnn::VkMat& src, int flip, ncnn::VkMat& dst, std::string& error);
     bool interpolate_tta(const GpuFrame& a, const GpuFrame& b, float t, uint8_t* dst, std::string& error);
+    bool rife_tta_rgb(const GpuFrame& a, const GpuFrame& b, float t, ncnn::VkMat& merged, std::string& error);
+    bool record_mc(ncnn::VkCompute& cmd, const GpuFrame& a, const GpuFrame& b, float t, const ncnn::VkMat& rife,
+                   ncnn::VkMat& out, std::string& error);
+    void record_filter(ncnn::VkCompute& cmd, const ncnn::VkMat& src, ncnn::VkMat& dst, int r, int axis, int op,
+                       int threshold, float thr);
+    ncnn::VkMat float_mat(int n);
     int chroma_mode_x() const;
     int chroma_mode_y() const;
     ncnn::Pipeline* make_pipeline(const char* comp_data, int comp_size, int lx, int ly, int lz);
@@ -117,6 +152,27 @@ private:
     ncnn::Pipeline* pipeline_tta_flip;
     ncnn::Pipeline* pipeline_tta_accumulate;
     ncnn::Pipeline* pipeline_tta_resolve;
+    ncnn::Pipeline* pipeline_mc_luma;
+    ncnn::Pipeline* pipeline_mc_down;
+    ncnn::Pipeline* pipeline_mc_search;
+    ncnn::Pipeline* pipeline_mc_median;
+    ncnn::Pipeline* pipeline_mc_recon;
+    ncnn::Pipeline* pipeline_mc_filter;
+    ncnn::Pipeline* pipeline_mc_region;
+    ncnn::Pipeline* pipeline_mc_blend;
+    InterpEngine engine_mode;
+    int lw[4];   // dimensions des niveaux de la pyramide
+    int lh[4];
+    ncnn::VkMat dummy;
+    std::vector<float> hints_host;   // (bw × bh) × 2 candidats vec2, vide = aucun
+    bool hints_dirty = false;
+    ncnn::VkMat hints_gpu;
+    // Champ de vecteurs calculé une fois par paire (à t = 0,5), réutilisé pour chaque position t.
+    ncnn::VkMat cached_field;
+    uint64_t cache_a = 0;
+    uint64_t cache_b = 0;
+    uint64_t upload_seq = 0;
+    int gpu = 0;
 
     FrameFormat fmt;
     ColorParams color;

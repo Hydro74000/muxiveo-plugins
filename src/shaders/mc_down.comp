@@ -1,0 +1,28 @@
+// Muxiveo — MC : réduction 2×2 (moyenne) d'un niveau de pyramide de luminance.
+
+#version 450
+
+layout (binding = 0) readonly buffer src_blob { float src_data[]; };
+layout (binding = 1) writeonly buffer dst_blob { float dst_data[]; };
+
+layout (push_constant) uniform parameter
+{
+    int sw;
+    int sh;
+    int dw;
+    int dh;
+} p;
+
+void main()
+{
+    int gx = int(gl_GlobalInvocationID.x);
+    int gy = int(gl_GlobalInvocationID.y);
+    if (gx >= p.dw || gy >= p.dh)
+        return;
+    int x0 = min(2 * gx, p.sw - 1);
+    int x1 = min(2 * gx + 1, p.sw - 1);
+    int y0 = min(2 * gy, p.sh - 1);
+    int y1 = min(2 * gy + 1, p.sh - 1);
+    dst_data[gy * p.dw + gx] = 0.25f * (src_data[y0 * p.sw + x0] + src_data[y0 * p.sw + x1]
+                                        + src_data[y1 * p.sw + x0] + src_data[y1 * p.sw + x1]);
+}
