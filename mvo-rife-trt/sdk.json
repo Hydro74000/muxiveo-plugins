@@ -1,0 +1,18 @@
+{
+  "tensorrt_rtx": "1.6.1.120",
+  "cuda": "12.9",
+  "linux-x86_64": {
+    "url": "https://developer.nvidia.com/downloads/trt/rtx_sdk/secure/1.6/TensorRT-RTX-1.6.1.120-Linux-x86_64-cuda-12.9-Release-external.tar.zst",
+    "sha256": "5506d864e261b2794e033c61302108f0b76703944a2c178986be3527763b5f50"
+  },
+  "windows-x86_64": {
+    "url": "https://developer.nvidia.com/downloads/trt/rtx_sdk/secure/1.6/TensorRT-RTX-1.6.1.120-Windows-amd64-cuda-12.9-Release-external.zip",
+    "sha256": "a688478af9e7b824f4918ef3b3038c3aca6f1ea84ff30a52d7ba8196c65a5a5a"
+  },
+  "abi": {
+    "repository": "Hydro74000/muxiveo",
+    "ref": "devel-cli",
+    "path": "native/muxiveo-rife/src/trt_plugin_abi.h",
+    "min_muxiveo_rife": "1.4.0"
+  }
+}

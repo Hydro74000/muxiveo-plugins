@@ -1,0 +1,20 @@
+{
+  "weights": {
+    "rife-v4.6": {
+      "url": "https://github.com/HolyWu/vs-rife/releases/download/model/flownet_v4.6.pkl",
+      "sha256": "008646e761f0e67cb77f0c6c44cfe3c3e5a05d9d9465311b9681ca650ce030db"
+    },
+    "rife-v4.15": {
+      "url": "https://github.com/HolyWu/vs-rife/releases/download/model/flownet_v4.15.pkl",
+      "sha256": "bf969affb3f6e9a09eea8c1da6c51bb22d6da45e92cafb9273689d05e2360dd2"
+    },
+    "rife-v4.15-lite": {
+      "url": "https://github.com/HolyWu/vs-rife/releases/download/model/flownet_v4.15.lite.pkl",
+      "sha256": "54fe3fb51efb880f64ffe2048a88220ad2b0b3d03f7cb800742e90821dcfb24f"
+    }
+  },
+  "variants": [
+    "",
+    "-uhd"
+  ]
+}

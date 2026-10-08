@@ -1,0 +1,173 @@
+name: mvo-rife-trt
+
+# Plugin d'accélération NVIDIA (TensorRT for RTX) de muxiveo-rife : contrôle de l'interface, export des
+# modèles, builds Linux / Windows et release `mvo-rife-trt-vX.Y.Z` (jamais « latest ») sur tag.
+
+on:
+  push:
+    branches: ["**"]
+    paths:
+      - "mvo-rife-trt/**"
+      - ".github/workflows/mvo-rife-trt.yml"
+    tags:
+      - "mvo-rife-trt-v*"
+  pull_request:
+    paths:
+      - "mvo-rife-trt/**"
+      - ".github/workflows/mvo-rife-trt.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: mvo-rife-trt-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    working-directory: mvo-rife-trt
+
+jobs:
+  abi:
+    name: Interface muxiveo-rife
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: En-tête identique à la référence
+        run: python3 scripts/check_abi.py
+
+  models:
+    name: Modèles ONNX
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Dépendances d'export (torch CPU)
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install --index-url https://download.pytorch.org/whl/cpu "torch==2.8.*"
+          python -m pip install "onnx>=1.17"
+      - name: Export
+        run: python models/export_onnx.py "$RUNNER_TEMP/weights" "$RUNNER_TEMP/onnx"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mvo-rife-trt-models
+          path: ${{ runner.temp }}/onnx/*.onnx
+          if-no-files-found: error
+
+  build-linux:
+    name: Build linux-x86_64
+    needs: [abi, models]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: mvo-rife-trt-models
+          path: mvo-rife-trt/build/models
+      # manylinux_2_28 (AlmaLinux 8) : plugin exécutable dès glibc 2.28, comme muxiveo-rife.
+      - name: Build et paquet (manylinux_2_28)
+        working-directory: .
+        run: |
+          set -euo pipefail
+          docker run --rm -v "$PWD:/src" -w /src/mvo-rife-trt quay.io/pypa/manylinux_2_28_x86_64 bash -euo pipefail -c '
+            dnf install -y -q zstd
+            PY=/opt/python/cp312-cp312/bin
+            $PY/pip install -q cmake ninja
+            export PATH=$PY:$PATH
+            SDK=$(python scripts/fetch_sdk.py linux-x86_64 build/sdk)
+            cmake -S . -B build/plugin -G Ninja -DCMAKE_BUILD_TYPE=Release -DTRTRTX_ROOT="$SDK"
+            cmake --build build/plugin
+            python scripts/package.py linux-x86_64 build/plugin/libmvo_rife_trt.so "$SDK" build/models build/dist'
+          sudo chown -R "$(id -u):$(id -g)" mvo-rife-trt/build
+      - name: Chargement du plugin (sans GPU)
+        run: |
+          set -euo pipefail
+          DIR=$(ls -d build/dist/mvo-rife-trt-*-linux-x86_64)
+          MAX=$(objdump -T "$DIR"/*.so* | grep -oE 'GLIBC_[0-9.]+' | sort -V -u | tail -1)
+          echo "glibc requise : $MAX"
+          python3 - "$DIR" <<'PY'
+          import ctypes, sys
+          lib = ctypes.CDLL(sys.argv[1] + "/libmvo_rife_trt.so")
+          lib.mvo_trt_get_api.restype = ctypes.c_void_p
+          assert lib.mvo_trt_get_api(1), "interface 1 absente"
+          assert not lib.mvo_trt_get_api(2), "interface inconnue acceptée"
+          print("plugin chargé, interface 1")
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mvo-rife-trt-linux-x86_64
+          path: mvo-rife-trt/build/dist/*.tar.gz
+          if-no-files-found: error
+
+  build-windows:
+    name: Build windows-x86_64
+    needs: [abi, models]
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/download-artifact@v4
+        with:
+          name: mvo-rife-trt-models
+          path: mvo-rife-trt/build/models
+      - name: Build et paquet
+        shell: bash
+        run: |
+          set -euo pipefail
+          SDK=$(python scripts/fetch_sdk.py windows-x86_64 build/sdk)
+          cmake -S . -B build/plugin -G "Visual Studio 17 2022" -A x64 -DTRTRTX_ROOT="$SDK"
+          cmake --build build/plugin --config Release
+          python scripts/package.py windows-x86_64 build/plugin/Release/mvo_rife_trt.dll "$SDK" build/models build/dist
+      # Le runtime TensorRT importe nvcuda.dll (absente du runner) : exports vérifiés sans chargement.
+      - name: Exports du plugin
+        shell: bash
+        run: |
+          set -euo pipefail
+          DLL=$(ls build/dist/mvo-rife-trt-*-windows-x86_64/mvo_rife_trt.dll)
+          python - "$DLL" <<'PY'
+          import sys
+          data = open(sys.argv[1], "rb").read()
+          assert b"mvo_trt_get_api" in data, "export mvo_trt_get_api absent"
+          print("export mvo_trt_get_api présent")
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mvo-rife-trt-windows-x86_64
+          path: mvo-rife-trt/build/dist/*.zip
+          if-no-files-found: error
+
+  release:
+    name: Release
+    if: startsWith(github.ref, 'refs/tags/mvo-rife-trt-v')
+    needs: [build-linux, build-windows]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: assets
+          pattern: mvo-rife-trt-*-x86_64
+          merge-multiple: true
+      - name: Publier
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          VERSION=$(sed -n 's/^project(mvo-rife-trt VERSION \([0-9.]*\).*/\1/p' CMakeLists.txt)
+          if [ "$TAG" != "mvo-rife-trt-v$VERSION" ]; then
+            echo "::error::Tag $TAG différent de la version du CMakeLists ($VERSION)"
+            exit 1
+          fi
+          ls -la ../assets
+          gh release create "$TAG" ../assets/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "mvo-rife-trt $VERSION — Accélération NVIDIA (TensorRT) pour Muxiveo" \
+            --notes-file README.md \
+            --latest=false
