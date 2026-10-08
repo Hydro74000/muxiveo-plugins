@@ -124,7 +124,7 @@ public:
     int gpu_index() const { return gpu; }
     uint32_t vendor_id() const;
 
-    // Envoie une trame brute (padded_frame_bytes() octets, alignée sur 4) et la convertit en RGB.
+    // Envoie une trame brute (padded_frame_bytes() octets, alignée sur 16) et la convertit en RGB.
     bool upload(const uint8_t* frame, GpuFrame& out, std::string& error);
 
     // Génère la trame intermédiaire au temps t (0 < t < 1) et l'écrit, au format y4m, dans dst.

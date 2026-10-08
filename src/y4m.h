@@ -51,8 +51,9 @@ struct FrameFormat
     int64_t chroma_samples() const { return (int64_t)chroma_width() * chroma_height(); }
     int64_t total_samples() const { return luma_samples() + 2 * chroma_samples(); }
     size_t frame_bytes() const { return (size_t)(total_samples() * bytes_per_sample); }
-    // taille arrondie au mot 32 bits (transferts GPU)
-    size_t padded_frame_bytes() const { return (frame_bytes() + 3) / 4 * 4; }
+    // taille arrondie à 16 octets : ncnn aligne sur 16 octets le pas d'une image hôte 1D et copie cette
+    // taille entière entre l'hôte et le GPU (au-delà de la trame sinon : lecture et écriture hors tampon)
+    size_t padded_frame_bytes() const { return (frame_bytes() + 15) / 16 * 16; }
 };
 
 class Y4mReader
