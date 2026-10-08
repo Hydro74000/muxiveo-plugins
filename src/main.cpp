@@ -344,6 +344,8 @@ struct Options
     int tta = 1;
     std::string engine = "rife";   // rife | hybrid | mc (diagnostic)
     std::string nvof = "auto";     // auto | off : flux optique matériel NVIDIA si disponible
+    std::string large_motion = "auto";  // auto | off | seuil (px) : moteur hybride, RIFE demi-résolution sur les grands mouvements
+    double large_motion_px = 16.0;      // seuil bas (déplacement entre les sources) ; remplacement complet à 3x
     std::string backend = "auto";  // auto | vulkan | tensorrt : inférence RIFE
     std::string trt_plugin;        // dossier du plugin TensorRT (mvo-rife-trt), vide = Vulkan
     std::string trt_cache;         // moteurs et caches TensorRT (défaut : cache utilisateur)
@@ -385,6 +387,9 @@ static void print_usage(FILE* fp)
             "  --backend <b>           auto (défaut) | vulkan | tensorrt (erreur si indisponible)\n"
             "  --nvof <auto|off>       moteur hybride : flux optique matériel NVIDIA si le GPU Vulkan est une\n"
             "                          carte NVIDIA compatible (défaut : auto ; sinon calcul Vulkan seul)\n"
+            "  --large-motion <auto|off|px> moteur hybride : RIFE à flux demi-résolution là où le déplacement\n"
+            "                          entre les sources dépasse le seuil (auto : 16 px, remplacement complet\n"
+            "                          à 3x le seuil ; sans effet avec --uhd)\n"
             "  --padding <n>           padding du réseau (défaut : selon le modèle, x2 avec --uhd)\n"
             "  -j, --threads <n>       threads CPU ncnn (défaut : 2)\n"
             "  --allow-interlaced      accepter une entrée entrelacée\n"
@@ -474,6 +479,17 @@ static bool parse_args(const std::vector<std::string>& args, Options& o, std::st
                 return false;
             }
             o.nvof = v;
+        }
+        else if (a == "--large-motion")
+        {
+            if (!value(v)) return false;
+            if (v != "auto" && v != "off")
+            {
+                if (!parse_double_option(a, v, 1.0, 4096.0, o.large_motion_px, error))
+                    return false;
+                v = "auto";
+            }
+            o.large_motion = v;
         }
         else if (a == "--scene-threshold")
         {
@@ -856,15 +872,29 @@ static int run(const Options& o, const fs::path& exe_dir)
     engine.set_tta(o.tta);
     engine.set_engine(o.engine == "mc" ? InterpEngine::Mc : (o.engine == "hybrid" ? InterpEngine::Hybrid : InterpEngine::Rife));
     const bool needs_gpu = ra != rb || o.roundtrip;
+    // moteur hybride : second réseau à flux demi-résolution (padding x2) pour les grands mouvements
+    const bool large_motion = needs_gpu && !o.roundtrip && o.engine == "hybrid" && !o.uhd && o.large_motion == "auto";
+    std::string large_motion_status = o.uhd ? "flux demi-résolution partout (--uhd)" : "désactivé";
     if (needs_gpu)
     {
         if (!engine.init(o.gpu, o.fp32, o.threads, error)
-                || !engine.load_model(model_dir, o.padding > 0 ? o.padding : model_padding(model_name) * (o.uhd ? 2 : 1),
+                || !engine.load_model(model_dir,
+                                      o.padding > 0 ? o.padding : model_padding(model_name) * (o.uhd || large_motion ? 2 : 1),
                                       o.uhd, error)
                 || !engine.configure(fmt, color, error))
         {
             fprintf(stderr, "error: %s\n", error.c_str());
             return EXIT_GPU;
+        }
+        if (large_motion)
+        {
+            std::string lm_error;
+            engine.set_large_motion_threshold((float)o.large_motion_px);
+            char seuil[64];
+            snprintf(seuil, sizeof seuil, "RIFE flux demi-résolution au-delà de %g px", o.large_motion_px);
+            large_motion_status = engine.load_large_motion_model(model_dir, lm_error)
+                                      ? std::string(seuil)
+                                      : "indisponible (" + lm_error + ")";
         }
     }
 
@@ -881,6 +911,21 @@ static int run(const Options& o, const fs::path& exe_dir)
                              o.trt_cache.empty() ? default_trt_cache() : path_from_utf8(o.trt_cache), reason))
             engine.set_trt(&trt);
         backend_status = engine.uses_trt() ? trt.description() : "Vulkan (TensorRT indisponible : " + reason + ")";
+    }
+    // réseau des grands mouvements : modèle « -uhd » du plugin, sinon ncnn Vulkan
+    TrtBackend trt_large;
+    if (engine.uses_trt() && engine.large_motion())
+    {
+        std::string reason;
+        if (trt_large.load(path_from_utf8(o.trt_plugin), engine.device(), o.quiet, reason)
+                && trt_large.open(model_name + "-uhd", engine.padded_width(), engine.padded_height(),
+                                  o.trt_cache.empty() ? default_trt_cache() : path_from_utf8(o.trt_cache), reason))
+        {
+            engine.set_trt_large(&trt_large);
+            large_motion_status += " (TensorRT)";
+        }
+        else
+            large_motion_status += " (Vulkan : " + reason + ")";
     }
     if (needs_gpu && !o.roundtrip && o.backend == "tensorrt" && !engine.uses_trt())
     {
@@ -908,7 +953,8 @@ static int run(const Options& o, const fs::path& exe_dir)
     }
 
     if (!o.quiet && engine.engine() != InterpEngine::Rife)
-        fprintf(stderr, "info: moteur %s | flux optique NVIDIA : %s\n", o.engine.c_str(), nvof_status.c_str());
+        fprintf(stderr, "info: moteur %s | flux optique NVIDIA : %s%s\n", o.engine.c_str(), nvof_status.c_str(),
+                engine.engine() == InterpEngine::Hybrid ? (" | grands mouvements : " + large_motion_status).c_str() : "");
     int64_t nvof_pair = -1;
     bool nvof_failed = false;
     std::vector<uint8_t> luma_a, luma_b;
@@ -1211,6 +1257,9 @@ static int run(const Options& o, const fs::path& exe_dir)
         exit_code = EXIT_IO;
     }
 
+    if (!o.quiet && engine.large_motion())
+        fprintf(stderr, "info: grands mouvements : %lld paire(s) sur %lld\n", (long long)engine.large_motion_pairs_active(),
+                (long long)engine.large_motion_pairs_total());
     const double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_start).count();
     fprintf(stderr, "done in=%lld out=%lld interpolated=%lld scenes=%lld static=%lld seconds=%.2f exit=%d\n",
             (long long)frames_in, (long long)frames_out, (long long)interpolated,

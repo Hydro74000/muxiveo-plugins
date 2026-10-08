@@ -28,6 +28,7 @@
 #include "mc_filter.comp.hex.h"
 #include "mc_luma.comp.hex.h"
 #include "mc_median.comp.hex.h"
+#include "mc_motion.comp.hex.h"
 #include "mc_recon.comp.hex.h"
 #include "mc_region.comp.hex.h"
 #include "mc_search.comp.hex.h"
@@ -47,6 +48,15 @@ static const int MC_COARSE_RADIUS = 8;         // recherche exhaustive ±8 px au
 static const float MC_Q_THRESHOLD = 20.f;      // erreur bilatérale d'un pixel mal expliqué
 static const float MC_DENSITY = 0.25f;         // densité au-delà de laquelle RIFE prend la main
 static const float MC_AGREE = 20.f;            // écart MC / RIFE sous lequel les deux sont moyennés
+// Grands mouvements : RIFE à flux demi-résolution remplace l'hybride entre le seuil (lm_lo, px entre
+// les deux sources) et 3x le seuil ; champ dilaté (vecteurs faux du flou entourés de grands vecteurs).
+static const float LARGE_MOTION_SPAN = 3.f;
+static const int LARGE_MOTION_RADIUS = 4;      // dilatation du champ, en blocs de 16
+// Mouvement d'ensemble (médiane de la paire, en multiples du seuil) : la compensation sous-estime
+// les vecteurs dans le flou d'un panoramique rapide ; RIFE demi-résolution s'impose alors partout.
+static const float LARGE_MOTION_TRIGGER = 1.5f;  // amplitude (x seuil) des blocs qui déclenchent la passe
+static const float LARGE_MOTION_GLOBAL_LO = 1.5f;
+static const float LARGE_MOTION_GLOBAL_HI = 2.5f;
 
 DEFINE_LAYER_CREATOR(Warp)
 
@@ -64,7 +74,8 @@ RifeEngine::RifeEngine()
       pipeline_yuv_to_rgb(0), pipeline_rgb_to_yuv(0), pipeline_pack(0), pipeline_timestep(0),
       pipeline_tta_flip(0), pipeline_tta_accumulate(0), pipeline_tta_resolve(0),
       pipeline_mc_luma(0), pipeline_mc_down(0), pipeline_mc_search(0), pipeline_mc_median(0),
-      pipeline_mc_recon(0), pipeline_mc_filter(0), pipeline_mc_region(0), pipeline_mc_blend(0), pipeline_trt_pack(0),
+      pipeline_mc_recon(0), pipeline_mc_filter(0), pipeline_mc_region(0), pipeline_mc_blend(0), pipeline_mc_motion(0),
+      pipeline_trt_pack(0),
       engine_mode(InterpEngine::Rife), lw{0, 0, 0, 0}, lh{0, 0, 0, 0},
       padding(32), w_padded(0), h_padded(0), words(0), pack_dispatch_w(0), tta(1)
 {
@@ -87,12 +98,14 @@ RifeEngine::~RifeEngine()
     delete pipeline_mc_filter;
     delete pipeline_mc_region;
     delete pipeline_mc_blend;
+    delete pipeline_mc_motion;
     delete pipeline_trt_pack;
     dummy.release();
     hints_gpu.release();
     cached_field.release();
 
     flownet.clear();
+    flownet_lm.clear();
 
     if (vkdev)
     {
@@ -141,13 +154,13 @@ bool RifeEngine::init(int gpu_index, bool fp32, int num_threads, std::string& er
     return true;
 }
 
-bool RifeEngine::load_model(const std::filesystem::path& dir, int _padding, bool uhd, std::string& error)
+// Réseau RIFE v4 (param + poids) ; uhd : graphe réécrit pour un flux à demi-résolution.
+static bool load_flownet(ncnn::Net& net, const ncnn::Option& opt, ncnn::VulkanDevice* vkdev,
+                         const std::filesystem::path& dir, bool uhd, std::string& error)
 {
-    padding = std::max(1, _padding);
-
-    flownet.opt = opt;
-    flownet.set_vulkan_device(vkdev);
-    flownet.register_custom_layer("rife.Warp", Warp_layer_creator);
+    net.opt = opt;
+    net.set_vulkan_device(vkdev);
+    net.register_custom_layer("rife.Warp", Warp_layer_creator);
 
     const std::filesystem::path param_path = dir / "flownet.param";
     const std::filesystem::path model_path = dir / "flownet.bin";
@@ -174,7 +187,7 @@ bool RifeEngine::load_model(const std::filesystem::path& dir, int _padding, bool
         }
         param.swap(rewritten);
     }
-    int ret = flownet.load_param_mem(param.c_str());
+    int ret = net.load_param_mem(param.c_str());
     if (ret != 0)
     {
         error = "flownet.param invalide : " + param_path.u8string();
@@ -187,7 +200,7 @@ bool RifeEngine::load_model(const std::filesystem::path& dir, int _padding, bool
         error = "poids introuvables : " + model_path.u8string();
         return false;
     }
-    ret = flownet.load_model(fp);
+    ret = net.load_model(fp);
     fclose(fp);
     if (ret != 0)
     {
@@ -195,7 +208,7 @@ bool RifeEngine::load_model(const std::filesystem::path& dir, int _padding, bool
         return false;
     }
 
-    const std::vector<const char*>& inputs = flownet.input_names();
+    const std::vector<const char*>& inputs = net.input_names();
     const bool has_timestep = std::any_of(inputs.begin(), inputs.end(), [](const char* n) { return strcmp(n, "in2") == 0; });
     if (!has_timestep)
     {
@@ -203,6 +216,20 @@ bool RifeEngine::load_model(const std::filesystem::path& dir, int _padding, bool
         return false;
     }
     return true;
+}
+
+bool RifeEngine::load_model(const std::filesystem::path& dir, int _padding, bool uhd, std::string& error)
+{
+    padding = std::max(1, _padding);
+    return load_flownet(flownet, opt, vkdev, dir, uhd, error);
+}
+
+bool RifeEngine::load_large_motion_model(const std::filesystem::path& dir, std::string& error)
+{
+    lm_loaded = load_flownet(flownet_lm, opt, vkdev, dir, true, error);
+    if (!lm_loaded)
+        flownet_lm.clear();
+    return lm_loaded;
 }
 
 ncnn::Pipeline* RifeEngine::make_pipeline(const char* comp_data, int comp_size, int lx, int ly, int lz)
@@ -279,8 +306,10 @@ bool RifeEngine::configure(const FrameFormat& _fmt, const ColorParams& _color, s
         pipeline_mc_filter = make_pipeline(mc_filter_comp_data, sizeof(mc_filter_comp_data), 8, 8, 1);
         pipeline_mc_region = make_pipeline(mc_region_comp_data, sizeof(mc_region_comp_data), 64, 1, 1);
         pipeline_mc_blend = make_pipeline(mc_blend_comp_data, sizeof(mc_blend_comp_data), 8, 8, 1);
+        pipeline_mc_motion = make_pipeline(mc_motion_comp_data, sizeof(mc_motion_comp_data), 8, 8, 1);
         if (!pipeline_mc_luma || !pipeline_mc_down || !pipeline_mc_search || !pipeline_mc_median
-                || !pipeline_mc_recon || !pipeline_mc_filter || !pipeline_mc_region || !pipeline_mc_blend)
+                || !pipeline_mc_recon || !pipeline_mc_filter || !pipeline_mc_region || !pipeline_mc_blend
+                || !pipeline_mc_motion)
         {
             error = "compilation des shaders de compensation de mouvement impossible";
             return false;
@@ -792,10 +821,10 @@ bool RifeEngine::record_timestep(ncnn::VkCompute& cmd, float t, ncnn::VkMat& tim
     return true;
 }
 
-bool RifeEngine::record_network(ncnn::VkCompute& cmd, const ncnn::VkMat& in0, const ncnn::VkMat& in1,
+bool RifeEngine::record_network(ncnn::Net& net, ncnn::VkCompute& cmd, const ncnn::VkMat& in0, const ncnn::VkMat& in1,
                                 const ncnn::VkMat& timestep, ncnn::VkMat& out, std::string& error)
 {
-    ncnn::Extractor ex = flownet.create_extractor();
+    ncnn::Extractor ex = net.create_extractor();
     ex.set_blob_vkallocator(blob_vkallocator);
     ex.set_workspace_vkallocator(blob_vkallocator);
     ex.set_staging_vkallocator(staging_vkallocator);
@@ -812,9 +841,10 @@ bool RifeEngine::record_network(ncnn::VkCompute& cmd, const ncnn::VkMat& in0, co
 }
 
 bool RifeEngine::infer_rife(ncnn::VkCompute& cmd, const ncnn::VkMat& in0, const ncnn::VkMat& in1, float t,
-                            ncnn::VkMat& out, std::string& error)
+                            ncnn::VkMat& out, std::string& error, bool large)
 {
-    if (trt)
+    TrtBackend*& backend = large ? trt_lm : trt;
+    if (backend)
     {
         // Entrées copiées dans les tampons partagés (plans contigus), Vulkan terminé avant l'inférence CUDA.
         for (int i = 0; i < 2; i++)
@@ -822,12 +852,12 @@ bool RifeEngine::infer_rife(ncnn::VkCompute& cmd, const ncnn::VkMat& in0, const 
             const ncnn::VkMat& src = i == 0 ? in0 : in1;
             std::vector<ncnn::VkMat> bindings(2);
             bindings[0] = src;
-            bindings[1] = trt->input(i);
+            bindings[1] = backend->input(i);
             std::vector<ncnn::vk_constant_type> constants(4);
             constants[0].i = w_padded;
             constants[1].i = h_padded;
             constants[2].i = (int)src.cstep;
-            constants[3].i = (int)trt->input(i).cstep;
+            constants[3].i = (int)backend->input(i).cstep;
             ncnn::VkMat dispatcher;
             dispatcher.w = w_padded;
             dispatcher.h = h_padded;
@@ -841,17 +871,18 @@ bool RifeEngine::infer_rife(ncnn::VkCompute& cmd, const ncnn::VkMat& in0, const 
         }
         cmd.reset();
         std::string trt_error;
-        if (trt->infer(t, trt_error))
+        if (backend->infer(t, trt_error))
         {
-            out = trt->output();
+            out = backend->output();
             return true;
         }
         // Jamais d'échec d'encodage à cause du plugin : inférence ncnn pour la suite.
         fprintf(stderr, "warning: inférence TensorRT désactivée (%s) : inférence Vulkan pour la suite\n", trt_error.c_str());
-        trt = nullptr;
+        backend = nullptr;
     }
     ncnn::VkMat timestep;
-    return record_timestep(cmd, t, timestep, error) && record_network(cmd, in0, in1, timestep, out, error);
+    return record_timestep(cmd, t, timestep, error)
+           && record_network(large ? flownet_lm : flownet, cmd, in0, in1, timestep, out, error);
 }
 
 bool RifeEngine::interpolate(const GpuFrame& a, const GpuFrame& b, float t, uint8_t* dst, std::string& error,
@@ -880,7 +911,11 @@ bool RifeEngine::interpolate(const GpuFrame& a, const GpuFrame& b, float t, uint
             before_mc();
         }
         ncnn::VkMat out_rgb;
-        return record_mc(cmd, a, b, t, rife_rgb, out_rgb, error) && convert_and_download(cmd, out_rgb, dst, error);
+        if (!record_mc(cmd, a, b, t, rife_rgb, out_rgb, error))
+            return false;
+        if (engine_mode == InterpEngine::Hybrid && lm_loaded && !record_large_motion(cmd, a, b, t, out_rgb, error))
+            return false;
+        return convert_and_download(cmd, out_rgb, dst, error);
     }
     if (tta > 1)
         return interpolate_tta(a, b, t, dst, error);
@@ -890,6 +925,92 @@ bool RifeEngine::interpolate(const GpuFrame& a, const GpuFrame& b, float t, uint
     if (!infer_rife(cmd, a.rgb, b.rgb, t, out_rgb, error))
         return false;
     return convert_and_download(cmd, out_rgb, dst, error);
+}
+
+// Grands mouvements (moteur hybride) : là où le déplacement entre les deux sources dépasse
+// lm_lo, RIFE à flux demi-résolution remplace progressivement l'image hybride (la
+// compensation par blocs déforme le flou et les occultations, RIFE pleine résolution suit mal les
+// grands déplacements). Décision par paire : sans grand mouvement, aucun calcul supplémentaire.
+bool RifeEngine::record_large_motion(ncnn::VkCompute& cmd, const GpuFrame& a, const GpuFrame& b, float t,
+                                     ncnn::VkMat& out, std::string& error)
+{
+    const int bw = (lw[0] + 15) / 16;
+    const int bh = (lh[0] + 15) / 16;
+    if (a.id != lm_a || b.id != lm_b)
+    {
+        ncnn::Option o = opt;
+        o.blob_vkallocator = blob_vkallocator;
+        o.workspace_vkallocator = blob_vkallocator;
+        o.staging_vkallocator = staging_vkallocator;
+        ncnn::Mat field_host;
+        cmd.record_clone(cached_field, field_host, o);
+        if (cmd.submit_and_wait() != 0 || field_host.empty())
+        {
+            error = "échec d'exécution GPU (champ de vecteurs)";
+            return false;
+        }
+        cmd.reset();
+        const float* v = (const float*)field_host.data;
+        std::vector<float> mags(bw * bh);
+        for (int i = 0; i < bw * bh; i++)
+            mags[i] = std::hypot(v[2 * i], v[2 * i + 1]);
+        // passe déclenchée si une zone rapide notable existe (>= 1 % des blocs au-delà de 1,5x le seuil)
+        const float fast = LARGE_MOTION_TRIGGER * lm_lo;
+        const size_t fast_blocks = (size_t)std::count_if(mags.begin(), mags.end(), [fast](float m) { return m > fast; });
+        std::nth_element(mags.begin(), mags.begin() + mags.size() / 2, mags.end());
+        const float median = mags[mags.size() / 2];
+        lm_floor = std::clamp((median - LARGE_MOTION_GLOBAL_LO * lm_lo) / ((LARGE_MOTION_GLOBAL_HI - LARGE_MOTION_GLOBAL_LO) * lm_lo),
+                              0.f, 1.f);
+        lm_a = a.id;
+        lm_b = b.id;
+        lm_active = lm_floor > 0.f || fast_blocks * 100 >= mags.size();
+        lm_pairs_total++;
+        if (lm_active)
+            lm_pairs_active++;
+    }
+    if (!lm_active)
+        return true;
+
+    ncnn::VkMat r05;
+    if (!infer_rife(cmd, a.rgb, b.rgb, t, r05, error, true))
+        return false;
+    if (r05.w != w_padded || r05.h != h_padded || r05.c != 3 || r05.elemsize != out.elemsize)
+    {
+        error = "sortie RIFE demi-résolution incompatible avec le mode hybride";
+        return false;
+    }
+    ncnn::VkMat mag = float_mat(bw * bh);
+    if (mag.empty())
+    {
+        error = "allocation mémoire GPU impossible (grands mouvements)";
+        return false;
+    }
+    for (int mode = 0; mode < 2; mode++)
+    {
+        std::vector<ncnn::VkMat> bindings(4);
+        bindings[0] = mode == 0 ? cached_field : dummy;
+        bindings[1] = mag;
+        bindings[2] = mode == 0 ? dummy : r05;
+        bindings[3] = mode == 0 ? dummy : out;
+        std::vector<ncnn::vk_constant_type> constants(11);
+        constants[0].i = mode;
+        constants[1].i = w_padded;
+        constants[2].i = h_padded;
+        constants[3].i = bw;
+        constants[4].i = bh;
+        constants[5].i = LARGE_MOTION_RADIUS;
+        constants[6].i = (int)out.cstep;
+        constants[7].i = (int)r05.cstep;
+        constants[8].f = lm_lo;
+        constants[9].f = lm_lo * LARGE_MOTION_SPAN;
+        constants[10].f = lm_floor;
+        ncnn::VkMat dispatcher;
+        dispatcher.w = mode == 0 ? bw : w_padded;
+        dispatcher.h = mode == 0 ? bh : h_padded;
+        dispatcher.c = 1;
+        cmd.record_pipeline(pipeline_mc_motion, bindings, constants, dispatcher);
+    }
+    return true;
 }
 
 bool RifeEngine::record_flip(ncnn::VkCompute& cmd, const ncnn::VkMat& src, int flip, ncnn::VkMat& dst, std::string& error)

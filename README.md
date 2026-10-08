@@ -55,6 +55,26 @@ Mesures (4K, RTX 4070 Ti SUPER, PSNR-Y en dB image entière / zone des barreaux)
 Vrai 24 → 59,94 en 4K : hybride ≈ 1,35 × le temps de RIFE avec `rife-v4.6`, ≈ 2 × avec `rife-v4.15`.
 `--engine mc` (compensation seule) sert au diagnostic.
 
+**Grands mouvements (`--large-motion auto|off|<px>`, 1.5.0)** : dans le flou de bougé et les occultations
+d'un mouvement rapide (panoramique derrière un poteau, objet flou qui traverse le cadre), la compensation
+par blocs trouve des vecteurs faux à faible coût et déforme l'image (« gouttes », contours ondulés), et
+RIFE pleine résolution suit mal les grands déplacements. Le moteur hybride charge donc un second réseau
+RIFE à flux demi-résolution (même graphe que `--uhd`, padding du modèle ×2) et l'utilise là où le
+déplacement entre les deux sources est grand :
+
+1. décision par paire : champ de vecteurs relu une fois ; passe lancée si au moins 1 % des blocs
+   dépassent 1,5 × le seuil (aucun coût sur les plans calmes) ;
+2. poids par pixel : amplitude du champ dilatée (maximum sur 9 × 9 blocs), rampe du seuil (16 px par
+   défaut) à 3 × le seuil ; plancher pour toute l'image quand le mouvement médian de la paire dépasse
+   1,5 × le seuil (complet à 2,5 ×), la compensation sous-estimant les vecteurs d'un panoramique flou.
+
+Avec le plugin TensorRT, ce réseau utilise le modèle `<modèle>-uhd` du plugin (sinon Vulkan). Mesures
+(4K, images paires interpolées ×2 comparées aux impaires, PSNR-Y en dB image entière / 1 % des blocs
+64 × 64 les pires) : passage derrière un poteau 27,33 / 16,09 → 29,09 / 16,93, descente en rappel
+34,16 / 19,63 → 34,70 / 20,44 ; barreaux et hélice inchangés (36,75 / 34,82 et 35,39 / 32,86, image
+entière / zone). Vrai 24 → 59,94 en 4K (Vulkan) : +20 % de temps sur une séquence de barreaux où la passe
+s'active pour 43 % des paires, rien sur un plan calme.
+
 ## Accélération NVIDIA (TensorRT, 1.4.0)
 
 Avec le plugin facultatif `mvo-rife-trt` ([dépôt muxiveo-plugins](https://github.com/Hydro74000/muxiveo-plugins)),
@@ -91,9 +111,10 @@ les erreurs d'appariement de motifs répétitifs (barreaux en panoramique), comm
 
 ```
 info: inférence RIFE : TensorRT, plugin 1.0.0 (TensorRT-RTX 1.6.1)
-info: moteur hybrid | flux optique NVIDIA : actif
+info: moteur hybrid | flux optique NVIDIA : actif | grands mouvements : RIFE flux demi-résolution au-delà de 16 px
 info: 3832x1592 10 bits … | 24/1 -> 48/1 fps | modèle rife-v4.26 (uhd) | GPU … (fp16)
 progress in=120 out=240 interpolated=119 scenes=1 static=0 fps=28.4
+info: grands mouvements : 57 paire(s) sur 238
 done in=240 out=480 interpolated=238 scenes=1 static=0 seconds=16.89 exit=0
 ```
 
