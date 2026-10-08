@@ -6,7 +6,7 @@ cmake_policy(SET CMP0091 NEW)
 set(CMAKE_POLICY_DEFAULT_CMP0091 NEW)
 set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 
-project(muxiveo-rife VERSION 1.3.0 LANGUAGES C CXX)
+project(muxiveo-rife VERSION 1.4.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -63,7 +63,9 @@ foreach(layer ${MUXIVEO_RIFE_NCNN_LAYERS})
     set(WITH_LAYER_${layer} ON CACHE BOOL "" FORCE)
 endforeach()
 
+include(cmake/patch_ncnn.cmake)
 if(MUXIVEO_RIFE_NCNN_SOURCE_DIR)
+    muxiveo_patch_ncnn(${MUXIVEO_RIFE_NCNN_SOURCE_DIR})
     add_subdirectory(${MUXIVEO_RIFE_NCNN_SOURCE_DIR} ${CMAKE_CURRENT_BINARY_DIR}/ncnn EXCLUDE_FROM_ALL)
 else()
     include(FetchContent)
@@ -76,6 +78,7 @@ else()
     FetchContent_GetProperties(ncnn)
     if(NOT ncnn_POPULATED)
         FetchContent_Populate(ncnn)
+        muxiveo_patch_ncnn(${ncnn_SOURCE_DIR})
         add_subdirectory(${ncnn_SOURCE_DIR} ${ncnn_BINARY_DIR} EXCLUDE_FROM_ALL)
     endif()
 endif()
@@ -87,6 +90,7 @@ set(MUXIVEO_RIFE_SHADERS
     yuv_to_rgb rgb_to_yuv pack_samples rife_v4_timestep warp warp_pack4
     tta_flip tta_accumulate tta_resolve
     mc_luma mc_down mc_search mc_median mc_recon mc_filter mc_region mc_blend
+    trt_pack
 )
 set(SHADER_HEADERS)
 foreach(shader ${MUXIVEO_RIFE_SHADERS})
@@ -110,6 +114,8 @@ add_executable(muxiveo-rife
     src/warp.cpp
     src/uhd.cpp
     src/nvof.cpp
+    src/cuda_driver.cpp
+    src/trt_backend.cpp
     ${SHADER_HEADERS}
 )
 target_include_directories(muxiveo-rife PRIVATE ${CMAKE_CURRENT_BINARY_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/src)

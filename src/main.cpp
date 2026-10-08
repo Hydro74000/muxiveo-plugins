@@ -40,6 +40,8 @@
 
 #include "engine.h"
 #include "nvof.h"
+#include "cuda_driver.h"
+#include "trt_backend.h"
 #include "numparse.h"
 #include <limits>
 #include "y4m.h"
@@ -342,6 +344,9 @@ struct Options
     int tta = 1;
     std::string engine = "rife";   // rife | hybrid | mc (diagnostic)
     std::string nvof = "auto";     // auto | off : flux optique matériel NVIDIA si disponible
+    std::string backend = "auto";  // auto | vulkan | tensorrt : inférence RIFE
+    std::string trt_plugin;        // dossier du plugin TensorRT (mvo-rife-trt), vide = Vulkan
+    std::string trt_cache;         // moteurs et caches TensorRT (défaut : cache utilisateur)
     double scene_threshold = 10.0;
     bool fp32 = false;
     bool uhd = false;
@@ -374,6 +379,10 @@ static void print_usage(FILE* fp)
             "                          horizontal, 8 = + miroirs vertical et double (coût x n ; défaut : 1)\n"
             "  --engine <e>            rife (défaut) | hybrid : RIFE + compensation de mouvement par blocs,\n"
             "                          robuste sur les motifs fins répétitifs | mc : compensation seule (diagnostic)\n"
+            "  --trt-plugin <dossier>  plugin TensorRT (mvo-rife-trt) : inférence RIFE sur les Tensor Cores\n"
+            "                          des GPU NVIDIA Turing ou plus récents ; repli Vulkan sinon\n"
+            "  --trt-cache <dossier>   moteurs et caches TensorRT (défaut : cache utilisateur)\n"
+            "  --backend <b>           auto (défaut) | vulkan | tensorrt (erreur si indisponible)\n"
             "  --nvof <auto|off>       moteur hybride : flux optique matériel NVIDIA si le GPU Vulkan est une\n"
             "                          carte NVIDIA compatible (défaut : auto ; sinon calcul Vulkan seul)\n"
             "  --padding <n>           padding du réseau (défaut : selon le modèle, x2 avec --uhd)\n"
@@ -443,6 +452,18 @@ static bool parse_args(const std::vector<std::string>& args, Options& o, std::st
                 return false;
             }
             o.engine = v;
+        }
+        else if (a == "--trt-plugin") { if (!value(o.trt_plugin)) return false; }
+        else if (a == "--trt-cache") { if (!value(o.trt_cache)) return false; }
+        else if (a == "--backend")
+        {
+            if (!value(v)) return false;
+            if (v != "auto" && v != "vulkan" && v != "tensorrt")
+            {
+                error = "--backend : auto, vulkan ou tensorrt attendu (reçu : " + v + ")";
+                return false;
+            }
+            o.backend = v;
         }
         else if (a == "--nvof")
         {
@@ -597,9 +618,39 @@ static std::string json_escape(const std::string& s)
     return out;
 }
 
-static int list_gpus()
+// Plates-formes du plugin TensorRT (TensorRT for RTX) : Linux et Windows x86-64.
+#if (defined(__x86_64__) || defined(_M_X64)) && !defined(__APPLE__)
+static const bool TRT_PLATFORM = true;
+#else
+static const bool TRT_PLATFORM = false;
+#endif
+
+// Cache des moteurs TensorRT par défaut (Muxiveo passe le sien avec --trt-cache).
+static fs::path default_trt_cache()
+{
+#if _WIN32
+    const char* base = getenv("LOCALAPPDATA");
+    return (base && *base ? fs::path(base) : fs::temp_directory_path()) / "Muxiveo" / "cache" / "trt-engines";
+#else
+    const char* xdg = getenv("XDG_CACHE_HOME");
+    const char* home = getenv("HOME");
+    const fs::path base = xdg && *xdg ? fs::path(xdg) : (home && *home ? fs::path(home) / ".cache" : fs::temp_directory_path());
+    return base / "muxiveo" / "trt-engines";
+#endif
+}
+
+static int list_gpus(const Options& o)
 {
     const int count = ncnn::get_gpu_count();
+    // Plugin TensorRT éventuel : interface vérifiée une fois pour tous les GPU.
+    const MvoTrtApi* trt_api = nullptr;
+    std::string trt_plugin_error;
+    if (!o.trt_plugin.empty())
+    {
+        void* handle = nullptr;
+        trt_api = TrtBackend::load_api(path_from_utf8(o.trt_plugin), handle, trt_plugin_error);
+    }
+    const int cuda_version = CudaDriver::get().driver_version();
     const int def = count > 0 ? ncnn::get_default_gpu_index() : -1;
     printf("{\"version\": \"%s\", \"default\": %d, \"gpus\": [", MUXIVEO_RIFE_VERSION, def);
     for (int i = 0; i < count; i++)
@@ -623,10 +674,36 @@ static int list_gpus()
             nvof_ok = probe.init(1920, 1080, info.device_name(), same_name_rank(i), err);
             nvof_status = nvof_ok ? "disponible" : err;
         }
-        printf("%s{\"index\": %d, \"name\": \"%s\", \"type\": \"%s\", \"fp16\": %s, \"nvof\": %s, \"nvof_status\": \"%s\"}",
+        // inférence TensorRT : GPU compatible (Turing+, pilote récent), puis plugin réellement utilisable
+        std::string trt_reason;
+        int ordinal = -1;
+        if (!TRT_PLATFORM)
+            trt_reason = "plate-forme non prise en charge";
+        else
+            ordinal = TrtBackend::cuda_ordinal(info, trt_reason);
+        std::string trt_fields = std::string(", \"trt_compatible\": ") + (ordinal >= 0 ? "true" : "false");
+        if (!o.trt_plugin.empty())
+        {
+            bool trt_ok = false;
+            if (ordinal >= 0 && !trt_api)
+                trt_reason = trt_plugin_error;
+            else if (ordinal >= 0)
+            {
+                char err[512] = {0};
+                trt_ok = trt_api->device_supported(ordinal, err, sizeof err) != 0;
+                trt_reason = trt_ok ? std::string("prêt (") + trt_api->version() + ")" : err;
+            }
+            trt_fields += std::string(", \"trt\": ") + (trt_ok ? "true" : "false");
+        }
+        else if (ordinal >= 0)
+            trt_reason = "compatible";
+        trt_fields += ", \"trt_status\": \"" + json_escape(trt_reason) + "\"";
+        if (info.vendor_id() == NVIDIA_VENDOR_ID && cuda_version > 0)
+            trt_fields += ", \"cuda_driver\": \"" + std::to_string(cuda_version / 1000) + "." + std::to_string((cuda_version % 1000) / 10) + "\"";
+        printf("%s{\"index\": %d, \"name\": \"%s\", \"type\": \"%s\", \"fp16\": %s, \"nvof\": %s, \"nvof_status\": \"%s\"%s}",
                i ? ", " : "", i, json_escape(info.device_name()).c_str(), type,
                info.support_fp16_storage() ? "true" : "false", nvof_ok ? "true" : "false",
-               json_escape(nvof_status).c_str());
+               json_escape(nvof_status).c_str(), trt_fields.c_str());
     }
     printf("]}\n");
     return EXIT_OK;
@@ -790,6 +867,29 @@ static int run(const Options& o, const fs::path& exe_dir)
             return EXIT_GPU;
         }
     }
+
+    // Inférence RIFE par le plugin TensorRT (GPU NVIDIA) si fourni ; repli Vulkan au moindre obstacle.
+    TrtBackend trt;
+    std::string backend_status;
+    if (needs_gpu && !o.roundtrip && o.backend != "vulkan" && !o.trt_plugin.empty())
+    {
+        std::string reason;
+        if (!engine.uses_fp16())
+            reason = "calcul fp32 demandé";
+        else if (trt.load(path_from_utf8(o.trt_plugin), engine.device(), o.quiet, reason)
+                 && trt.open(model_name + (o.uhd ? "-uhd" : ""), engine.padded_width(), engine.padded_height(),
+                             o.trt_cache.empty() ? default_trt_cache() : path_from_utf8(o.trt_cache), reason))
+            engine.set_trt(&trt);
+        backend_status = engine.uses_trt() ? trt.description() : "Vulkan (TensorRT indisponible : " + reason + ")";
+    }
+    if (needs_gpu && !o.roundtrip && o.backend == "tensorrt" && !engine.uses_trt())
+    {
+        fprintf(stderr, "error: inférence TensorRT indisponible : %s\n",
+                o.trt_plugin.empty() ? "aucun plugin (--trt-plugin)" : backend_status.c_str());
+        return EXIT_GPU;
+    }
+    if (!o.quiet && !backend_status.empty())
+        fprintf(stderr, "info: inférence RIFE : %s\n", backend_status.c_str());
 
     // Flux optique matériel : GPU Vulkan NVIDIA + pilote compatible, moteurs hybride / MC.
     NvofFlow nvof;
@@ -1241,7 +1341,7 @@ int main(int argc, char** argv)
 
     int ret;
     if (o.list_gpus)
-        ret = list_gpus();
+        ret = list_gpus(o);
     else
         ret = run(o, exe_dir);
 

@@ -22,6 +22,7 @@ partie du code amont est reprise ; le reste est propre à Muxiveo.
 | `src/shaders/rife_v4_timestep.comp` | TNTwise `src/` | aucune |
 | `cmake/generate_shader_comp_header.cmake` | TNTwise `src/` | octets castés en `(char)` : shaders UTF-8 (commentaires accentués) acceptés |
 | `src/third_party/nvof/nvOpticalFlowCommon.h` | NVIDIA Optical Flow SDK | aucune (structures et énumérations seulement ; la table de fonctions CUDA est redéclarée dans `src/nvof.cpp`) |
+| ncnn `src/gpu.cpp` (au build) | ncnn, tag épinglé | `cmake/patch_ncnn.cmake` insère `cmake/ncnn_external_memory.inc` : active `VK_KHR_external_memory_fd` / `_win32` si le GPU les propose (tampons partagés avec CUDA pour le plugin TensorRT). Correctif idempotent, appliqué au tag téléchargé comme à `MUXIVEO_RIFE_NCNN_SOURCE_DIR` ; ancre introuvable = erreur de configuration |
 
 ## Code propre à Muxiveo
 
@@ -33,13 +34,17 @@ partie du code amont est reprise ; le reste est propre à Muxiveo.
 - `src/y4m.{h,cpp}`, `src/main.cpp` : streaming y4m stdin → stdout, cadence de
   sortie exacte (rationnelle), détection de coupes (score façon `scdet`) et des
   trames figées, recopie octet pour octet des trames d'origine.
+- Plugin TensorRT (1.4.0) : `src/trt_plugin_abi.h` (interface C de référence, copiée dans le dépôt
+  muxiveo-plugins), `src/trt_backend.{h,cpp}` (chargement du plugin, tampons Vulkan exportés vers CUDA,
+  repli), `src/cuda_driver.{h,cpp}` (pilote CUDA chargé à l'exécution), `src/shaders/trt_pack.comp`.
 - Moteur hybride (1.3.0) : `src/shaders/mc_*.comp` (pyramide de luminance, recherche
   bilatérale par blocs, propagation, OBMC, décision par région) et `src/nvof.{h,cpp}`
   (flux optique matériel NVIDIA, pilote chargé à l'exécution).
 
 ## Mettre à jour l'amont
 
-1. ncnn : changer `MUXIVEO_RIFE_NCNN_TAG` dans `CMakeLists.txt`, recompiler, relancer
+1. ncnn : changer `MUXIVEO_RIFE_NCNN_TAG` dans `CMakeLists.txt` (vérifier que l'ancre du correctif
+   `cmake/patch_ncnn.cmake` existe toujours), recompiler, relancer
    `tests/native/test_muxiveo_rife.py` (aller-retour de conversion + vérité terrain).
 2. Modèles : changer `commit` dans `models.json`, recalculer les `sha256`
    (`sha256sum`), vérifier le `padding` attendu dans `model_padding()` (`src/main.cpp`).

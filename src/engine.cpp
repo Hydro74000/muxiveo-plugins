@@ -21,6 +21,8 @@
 #include "tta_flip.comp.hex.h"
 #include "tta_resolve.comp.hex.h"
 #include "yuv_to_rgb.comp.hex.h"
+#include "trt_pack.comp.hex.h"
+#include "trt_backend.h"
 #include "mc_blend.comp.hex.h"
 #include "mc_down.comp.hex.h"
 #include "mc_filter.comp.hex.h"
@@ -62,7 +64,7 @@ RifeEngine::RifeEngine()
       pipeline_yuv_to_rgb(0), pipeline_rgb_to_yuv(0), pipeline_pack(0), pipeline_timestep(0),
       pipeline_tta_flip(0), pipeline_tta_accumulate(0), pipeline_tta_resolve(0),
       pipeline_mc_luma(0), pipeline_mc_down(0), pipeline_mc_search(0), pipeline_mc_median(0),
-      pipeline_mc_recon(0), pipeline_mc_filter(0), pipeline_mc_region(0), pipeline_mc_blend(0),
+      pipeline_mc_recon(0), pipeline_mc_filter(0), pipeline_mc_region(0), pipeline_mc_blend(0), pipeline_trt_pack(0),
       engine_mode(InterpEngine::Rife), lw{0, 0, 0, 0}, lh{0, 0, 0, 0},
       padding(32), w_padded(0), h_padded(0), words(0), pack_dispatch_w(0), tta(1)
 {
@@ -85,6 +87,7 @@ RifeEngine::~RifeEngine()
     delete pipeline_mc_filter;
     delete pipeline_mc_region;
     delete pipeline_mc_blend;
+    delete pipeline_trt_pack;
     dummy.release();
     hints_gpu.release();
     cached_field.release();
@@ -257,6 +260,13 @@ bool RifeEngine::configure(const FrameFormat& _fmt, const ColorParams& _color, s
     if (tta > 1 && (!pipeline_tta_flip || !pipeline_tta_accumulate || !pipeline_tta_resolve))
     {
         error = "compilation des shaders TTA impossible";
+        return false;
+    }
+    // copie vers les tampons partagés du plugin TensorRT (utilisée seulement s'il est actif)
+    pipeline_trt_pack = make_pipeline(trt_pack_comp_data, sizeof(trt_pack_comp_data), 8, 8, 1);
+    if (!pipeline_trt_pack)
+    {
+        error = "compilation du shader de copie TensorRT impossible";
         return false;
     }
     if (engine_mode != InterpEngine::Rife)
@@ -801,6 +811,49 @@ bool RifeEngine::record_network(ncnn::VkCompute& cmd, const ncnn::VkMat& in0, co
     return true;
 }
 
+bool RifeEngine::infer_rife(ncnn::VkCompute& cmd, const ncnn::VkMat& in0, const ncnn::VkMat& in1, float t,
+                            ncnn::VkMat& out, std::string& error)
+{
+    if (trt)
+    {
+        // Entrées copiées dans les tampons partagés (plans contigus), Vulkan terminé avant l'inférence CUDA.
+        for (int i = 0; i < 2; i++)
+        {
+            const ncnn::VkMat& src = i == 0 ? in0 : in1;
+            std::vector<ncnn::VkMat> bindings(2);
+            bindings[0] = src;
+            bindings[1] = trt->input(i);
+            std::vector<ncnn::vk_constant_type> constants(4);
+            constants[0].i = w_padded;
+            constants[1].i = h_padded;
+            constants[2].i = (int)src.cstep;
+            constants[3].i = (int)trt->input(i).cstep;
+            ncnn::VkMat dispatcher;
+            dispatcher.w = w_padded;
+            dispatcher.h = h_padded;
+            dispatcher.c = 3;
+            cmd.record_pipeline(pipeline_trt_pack, bindings, constants, dispatcher);
+        }
+        if (cmd.submit_and_wait() != 0)
+        {
+            error = "échec d'exécution GPU (entrées TensorRT)";
+            return false;
+        }
+        cmd.reset();
+        std::string trt_error;
+        if (trt->infer(t, trt_error))
+        {
+            out = trt->output();
+            return true;
+        }
+        // Jamais d'échec d'encodage à cause du plugin : inférence ncnn pour la suite.
+        fprintf(stderr, "warning: inférence TensorRT désactivée (%s) : inférence Vulkan pour la suite\n", trt_error.c_str());
+        trt = nullptr;
+    }
+    ncnn::VkMat timestep;
+    return record_timestep(cmd, t, timestep, error) && record_network(cmd, in0, in1, timestep, out, error);
+}
+
 bool RifeEngine::interpolate(const GpuFrame& a, const GpuFrame& b, float t, uint8_t* dst, std::string& error,
                              const std::function<void()>& before_mc)
 {
@@ -812,8 +865,7 @@ bool RifeEngine::interpolate(const GpuFrame& a, const GpuFrame& b, float t, uint
         ncnn::VkCompute cmd(vkdev);
         if (engine_mode == InterpEngine::Hybrid && tta <= 1)
         {
-            ncnn::VkMat timestep;
-            if (!record_timestep(cmd, t, timestep, error) || !record_network(cmd, a.rgb, b.rgb, timestep, rife_rgb, error))
+            if (!infer_rife(cmd, a.rgb, b.rgb, t, rife_rgb, error))
                 return false;
         }
         if (before_mc)
@@ -834,9 +886,8 @@ bool RifeEngine::interpolate(const GpuFrame& a, const GpuFrame& b, float t, uint
         return interpolate_tta(a, b, t, dst, error);
 
     ncnn::VkCompute cmd(vkdev);
-    ncnn::VkMat timestep;
     ncnn::VkMat out_rgb;
-    if (!record_timestep(cmd, t, timestep, error) || !record_network(cmd, a.rgb, b.rgb, timestep, out_rgb, error))
+    if (!infer_rife(cmd, a.rgb, b.rgb, t, out_rgb, error))
         return false;
     return convert_and_download(cmd, out_rgb, dst, error);
 }
@@ -911,10 +962,8 @@ bool RifeEngine::rife_tta_rgb(const GpuFrame& a, const GpuFrame& b, float t, ncn
         if (reverse)
             std::swap(in0, in1);
 
-        ncnn::VkMat timestep;
         ncnn::VkMat out;
-        if (!record_timestep(cmd, reverse ? 1.f - t : t, timestep, error)
-                || !record_network(cmd, in0, in1, timestep, out, error))
+        if (!infer_rife(cmd, in0, in1, reverse ? 1.f - t : t, out, error))
             return false;
         if (out.w != w_padded || out.h != h_padded || out.c != 3)
         {

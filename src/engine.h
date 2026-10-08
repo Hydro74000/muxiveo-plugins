@@ -13,6 +13,8 @@
 
 #include "y4m.h"
 
+class TrtBackend;
+
 // ncnn
 #include "gpu.h"
 #include "net.h"
@@ -96,6 +98,12 @@ public:
     // Sorties moyennées (fp32) ; coût x n, VRAM d'une seule variante.
     void set_tta(int n) { tta = n; }
     void set_engine(InterpEngine e) { engine_mode = e; }
+    // Inférence RIFE par le plugin TensorRT (nul = ncnn Vulkan). Le backend doit survivre aux interpolations.
+    void set_trt(TrtBackend* backend) { trt = backend; }
+    bool uses_trt() const { return trt != nullptr; }
+    const ncnn::VulkanDevice* device() const { return vkdev; }
+    int padded_width() const { return w_padded; }
+    int padded_height() const { return h_padded; }
     InterpEngine engine() const { return engine_mode; }
 
     // Candidats de flux matériel (NVOF) pour la paire courante : flux aller et retour sur une
@@ -127,6 +135,10 @@ private:
     bool record_timestep(ncnn::VkCompute& cmd, float t, ncnn::VkMat& timestep, std::string& error);
     bool record_network(ncnn::VkCompute& cmd, const ncnn::VkMat& in0, const ncnn::VkMat& in1, const ncnn::VkMat& timestep,
                         ncnn::VkMat& out, std::string& error);
+    // Image RIFE au temps t : réseau ncnn enregistré dans cmd, ou plugin TensorRT (cmd soumis et réinitialisé,
+    // sortie dans un tampon partagé). Échec du plugin : avertissement puis ncnn pour la suite.
+    bool infer_rife(ncnn::VkCompute& cmd, const ncnn::VkMat& in0, const ncnn::VkMat& in1, float t, ncnn::VkMat& out,
+                    std::string& error);
     bool record_flip(ncnn::VkCompute& cmd, const ncnn::VkMat& src, int flip, ncnn::VkMat& dst, std::string& error);
     bool interpolate_tta(const GpuFrame& a, const GpuFrame& b, float t, uint8_t* dst, std::string& error);
     bool rife_tta_rgb(const GpuFrame& a, const GpuFrame& b, float t, ncnn::VkMat& merged, std::string& error);
@@ -160,6 +172,8 @@ private:
     ncnn::Pipeline* pipeline_mc_filter;
     ncnn::Pipeline* pipeline_mc_region;
     ncnn::Pipeline* pipeline_mc_blend;
+    ncnn::Pipeline* pipeline_trt_pack;
+    TrtBackend* trt = nullptr;
     InterpEngine engine_mode;
     int lw[4];   // dimensions des niveaux de la pyramide
     int lh[4];

@@ -1,0 +1,30 @@
+// Muxiveo — copie d'une image RGB planaire (pas de plan `src_cstep`) vers un tampon partagé avec CUDA
+// (plans contigus, pas `dst_cstep`), entrée du plugin TensorRT.
+
+#version 450
+
+#if NCNN_fp16_storage
+#extension GL_EXT_shader_16bit_storage: require
+#endif
+
+layout (binding = 0) readonly buffer src_blob { sfp src_data[]; };
+layout (binding = 1) writeonly buffer dst_blob { sfp dst_data[]; };
+
+layout (push_constant) uniform parameter
+{
+    int w;
+    int h;
+    int src_cstep;
+    int dst_cstep;
+} p;
+
+void main()
+{
+    int gx = int(gl_GlobalInvocationID.x);
+    int gy = int(gl_GlobalInvocationID.y);
+    int gz = int(gl_GlobalInvocationID.z);
+    if (gx >= p.w || gy >= p.h || gz >= 3)
+        return;
+    int i = gy * p.w + gx;
+    dst_data[gz * p.dst_cstep + i] = src_data[gz * p.src_cstep + i];
+}

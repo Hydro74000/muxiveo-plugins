@@ -55,6 +55,30 @@ Mesures (4K, RTX 4070 Ti SUPER, PSNR-Y en dB image entière / zone des barreaux)
 Vrai 24 → 59,94 en 4K : hybride ≈ 1,35 × le temps de RIFE avec `rife-v4.6`, ≈ 2 × avec `rife-v4.15`.
 `--engine mc` (compensation seule) sert au diagnostic.
 
+## Accélération NVIDIA (TensorRT, 1.4.0)
+
+Avec le plugin facultatif `mvo-rife-trt` ([dépôt muxiveo-plugins](https://github.com/Hydro74000/muxiveo-plugins)),
+l'inférence RIFE passe par NVIDIA TensorRT for RTX sur les GPU Turing ou plus récents (Linux et Windows x86-64) ;
+la compensation de mouvement, la conversion des couleurs et le reste du traitement restent en Vulkan.
+
+```
+muxiveo-rife --trt-plugin <dossier du plugin> [--trt-cache <dossier>] [--backend auto|vulkan|tensorrt] ...
+```
+
+- Les images passent de Vulkan à CUDA par des tampons partagés (`VK_KHR_external_memory_fd` / `_win32`,
+  activées par un correctif de ncnn : voir UPSTREAM.md), sans copie par le processeur.
+- Le moteur TensorRT d'un modèle est construit au premier usage puis mis en cache (`--trt-cache`, défaut :
+  `~/.cache/muxiveo/trt-engines` ou `%LOCALAPPDATA%\Muxiveo\cache\trt-engines`), de même que les noyaux
+  spécialisés pour chaque résolution. Le cache est validé par TensorRT (version, GPU, pilote).
+- `auto` (défaut) : TensorRT si le plugin est présent et le GPU compatible, sinon Vulkan ; la ligne
+  `info: inférence RIFE : …` donne le moteur retenu ou la raison du repli. Une erreur du plugin en cours de
+  traitement bascule sur Vulkan pour la suite (une ligne `warning`) : le traitement n'échoue jamais à cause de lui.
+  `tensorrt` : erreur (code 3) si TensorRT est indisponible.
+- Modèles fournis par le plugin : `rife-v4.6`, `rife-v4.15`, `rife-v4.15-lite` et leurs variantes `--uhd` ;
+  calcul fp16 (avec `--fp32`, inférence Vulkan).
+- `--list-gpus` indique `trt_compatible` (Turing ou plus récent, pilote NVIDIA 575 ou plus récent), et avec
+  `--trt-plugin`, `trt` et `trt_status` (plugin réellement utilisable).
+
 ## TTA (`--tta 2|4|8`)
 
 Moyenne de plusieurs inférences de la même trame intermédiaire : `2` ajoute le sens temporel inverse
@@ -66,6 +90,7 @@ les erreurs d'appariement de motifs répétitifs (barreaux en panoramique), comm
 ## Sortie stderr (lue par Muxiveo)
 
 ```
+info: inférence RIFE : TensorRT, plugin 1.0.0 (TensorRT-RTX 1.6.1)
 info: moteur hybrid | flux optique NVIDIA : actif
 info: 3832x1592 10 bits … | 24/1 -> 48/1 fps | modèle rife-v4.26 (uhd) | GPU … (fp16)
 progress in=120 out=240 interpolated=119 scenes=1 static=0 fps=28.4
