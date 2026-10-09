@@ -173,6 +173,7 @@ class Net425(nn.Module):
 ARCHS = {
     "rife-v4.6": Net46,
     "rife-v4.15": Net415,
+    "rife-v4.15-mvo1": Net415,              # RIFE v4.15 affiné par Muxiveo (même architecture)
     "rife-v4.15-lite": lambda scales: Net415(scales, lite=True),
     "rife-v4.25": Net425,
     "rife-v4.25-heavy": lambda scales: Net425(scales, heavy=True),
