@@ -1,0 +1,17 @@
+{
+  "schema": 1,
+  "models": {
+    "rife-v4.15-mvo1": {
+      "base": "rife-v4.15",
+      "description": "RIFE v4.15 affiné par Muxiveo (même architecture et même coût que v4.15)",
+      "release": "models-rife-v4.15-mvo1",
+      "ncnn": {
+        "flownet.param": {"size": 28659, "sha256": "13b6407289b9888d65f2da2ad58b40c1db93a0e53cb3add26288f95f36241168"},
+        "flownet.bin": {"size": 10793232, "sha256": "b34d42adf09ef84ea651e976500a3d305bcb34aad7ff6cd179e823e7534b1e08"}
+      },
+      "pytorch": {
+        "flownet_v4.15-mvo1.pkl": {"size": 21499201, "sha256": "1de78fedd13737cd9454bc5cba0e7db9cd35d5f3694690db962cbc3c7b103fcb"}
+      }
+    }
+  }
+}
