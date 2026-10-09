@@ -9,7 +9,7 @@ elles.
 | Plugin | Rôle | Plates-formes | État |
 |---|---|---|---|
 | [`mvo-rife-models`](mvo-rife-models/README.md) — Modèles d'interpolation | Modèles RIFE affinés par Muxiveo (ncnn pour muxiveo-rife, PyTorch pour l'export ONNX) | toutes | 1.0.0 |
-| [`mvo-rife-trt`](mvo-rife-trt/README.md) — Accélération NVIDIA (TensorRT) | Inférence RIFE de MVO-RIFE sur les Tensor Cores (TensorRT for RTX) ; repli automatique sur Vulkan | Linux x86_64, Windows x64 ; GPU NVIDIA Turing ou plus récent | 1.0.0 |
+| [`mvo-rife-trt`](mvo-rife-trt/README.md) — Accélération NVIDIA (TensorRT) | Inférence RIFE de MVO-RIFE sur les Tensor Cores (TensorRT for RTX) ; repli automatique sur Vulkan | Linux x86_64, Windows x64 ; GPU NVIDIA Turing ou plus récent | 1.1.0 |
 
 ## Organisation
 
