@@ -9,7 +9,7 @@
       "sha256": "bf969affb3f6e9a09eea8c1da6c51bb22d6da45e92cafb9273689d05e2360dd2"
     },
     "rife-v4.15-mvo1": {
-      "url": "https://github.com/Hydro74000/muxiveo-plugins/releases/download/models-rife-v4.15-mvo1/flownet_v4.15-mvo1.pkl",
+      "url": "https://github.com/Hydro74000/muxiveo-plugins/releases/download/mvo-rife-models-v1.0.0/rife-v4.15-mvo1.pkl",
       "sha256": "1de78fedd13737cd9454bc5cba0e7db9cd35d5f3694690db962cbc3c7b103fcb"
     },
     "rife-v4.15-lite": {
