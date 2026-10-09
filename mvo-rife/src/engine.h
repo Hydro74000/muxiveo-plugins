@@ -11,6 +11,7 @@
 #include <string>
 #include <vector>
 
+#include "selector_weights.h"
 #include "y4m.h"
 
 class TrtBackend;
@@ -108,10 +109,16 @@ public:
     // Seuil bas des grands mouvements (px entre les sources) ; remplacement complet à 3x.
     void set_large_motion_threshold(float px) { lm_lo = px; }
     // Moteur hybride : sélecteur appris (choix par bloc entre les candidats RIFE, RIFE demi-résolution, MC,
-    // RIFE inversé, NV) ; désactivé = ancienne règle fixe (diagnostic). family : jeu de poids (« v415 », « v46 »).
-    void set_selector(bool on, const std::string& family) { selector_on = on; sel_family = family; }
+    // RIFE inversé, NV) ; désactivé = ancienne règle fixe (diagnostic). family : jeu de poids (« v415 », « v46 »),
+    // weights : modèles lus par load_selector_weights (vide = sélecteur désactivé).
+    void set_selector(bool on, const std::string& family, std::vector<SelectorModel> weights)
+    {
+        selector_on = on && !weights.empty();
+        sel_family = family;
+        sel_weights = std::move(weights);
+    }
     bool selector() const { return selector_on && engine_mode == InterpEngine::Hybrid; }
-    // Jeu de poids réellement utilisé : sel_family s'il est embarqué, sinon « v415 » (repli).
+    // Jeu de poids réellement utilisé : sel_family s'il figure dans le fichier, sinon « v415 » (repli).
     std::string selector_weights_family() const;
     // Mode Ultra : candidat supplémentaire RIFE inversé (sources échangées, 1 - t).
     void set_ultra(bool on) { ultra = on; }
@@ -223,6 +230,7 @@ private:
     bool selector_on = true;
     bool ultra = false;
     std::string sel_family = "v415";
+    std::vector<SelectorModel> sel_weights;
     ncnn::VkMat sel_models;          // paramètres des modèles (128 flottants chacun)
     std::vector<float> dense_f, dense_b;
     int dense_gw = 0;

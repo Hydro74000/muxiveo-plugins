@@ -1,8 +1,12 @@
-# muxiveo-rife
+# mvo-rife — interpolation d'images (moteur muxiveo-rife)
 
 Interpolation d'images **RIFE v4** sur GPU (Vulkan via [ncnn](https://github.com/Tencent/ncnn)),
 en flux **y4m** : `stdin → stdout`. Utilisé par le workflow d'encodage de Muxiveo pour
 multiplier la cadence (ex. 29,97 → 59,94 fps).
+
+Extension de Muxiveo : installée, mise à jour et supprimée par l'application (page Extensions), dans le dossier
+utilisateur. Le moteur, ses modèles, les poids de son sélecteur et ses préréglages évoluent sans release de
+Muxiveo : l'application retient la version la plus récente dont le contrat (`--capabilities`) lui est connu.
 
 ```
 ffmpeg -i src.mkv -map 0:v:0 -pix_fmt yuv420p10le -f yuv4mpegpipe -strict -1 - \
@@ -93,8 +97,11 @@ zone par zone, le mélange des candidats calculés pour chaque image :
 - Indices par bloc : désaccords de chaque candidat avec R1 (et maximum sur 3 × 3 blocs), texture, écart
   temporel, luminance, incohérence et amplitude du flux NVIDIA, proximité du bord, taille de bloc ; modèle
   linéaire suivi d'un softmax (`src/shaders/sel_*.comp`, coût négligeable).
-- Poids appris (`src/selector_weights.h`) par famille de modèle RIFE (`rife-v4.6`, `rife-v4.15`,
-  `rife-v4.15-mvo1`), avec et sans flux NVIDIA, et par bande de taille de bloc quand c'est utile.
+- Poids appris par famille de modèle RIFE (`rife-v4.6`, `rife-v4.15`, `rife-v4.15-mvo1`), avec et sans flux
+  NVIDIA, et par bande de taille de bloc quand c'est utile : fichier de données `selector/selector.txt`, livré
+  dans `rife-models/selector.txt` et lu au lancement (format : `src/selector_weights.h` ; autre fichier :
+  `--selector-weights`). Améliorer le sélecteur revient à remplacer ce fichier. Fichier absent ou invalide :
+  règle fixe, raison affichée sur la ligne `info: moteur` ; `--ultra` est alors refusé (code 3).
 - `--ultra` ajoute le candidat Rbwd (une inférence RIFE de plus, environ 1,5 × le temps du préréglage
   Qualité) ; exige le moteur hybride et le sélecteur, incompatible avec `--uhd` et `--tta`.
 - `--selector off` revient à la règle fixe de la 1.5 (diagnostic).
@@ -175,15 +182,29 @@ y compris à travers un lien symbolique ou un hardlink. Sinon, la commande est
 refusée avec le code `1` avant toute écriture. Le pipeline Muxiveo utilise
 `stdin → stdout` et conserve ce fonctionnement.
 
+## Contrat avec Muxiveo (`--capabilities`, 1.7.0)
+
+`muxiveo-rife --capabilities` écrit sur stdout, sans initialiser le GPU, un JSON : `contract` (flux y4m, règle du
+nombre de trames, lignes `info` / `progress` / `done` sur stderr, codes de sortie ; incrémenté seulement à une
+rupture), `version`, `options` reconnues, `engines`, `tta`, `backends`, `trt_abi`, `models` présents dans
+`rife-models/`, et `selector` (`format`, `status` = `ok` ou raison, `families`). Muxiveo valide les réglages
+d'après ces capacités.
+
+Les préréglages proposés par Muxiveo (Rapide, Équilibré, Qualité, Ultra, Light : identifiants fixes, libellés
+et règles d'interface dans l'application) prennent leur moteur, leur modèle et d'éventuels arguments
+supplémentaires dans `presets.json` : un nouveau modèle ou réglage ne demande pas de release de Muxiveo.
+
 ## Build
 
 Prérequis : CMake ≥ 3.20, compilateur C++17, Git (ncnn et glslang sont téléchargés au tag épinglé).
 Aucun SDK Vulkan requis : ncnn charge le pilote dynamiquement (`NCNN_SIMPLEVK`).
 
 ```
-cmake -S native/muxiveo-rife -B build/muxiveo-rife -G Ninja
-cmake --build build/muxiveo-rife
-python3 native/muxiveo-rife/scripts/fetch_models.py build/muxiveo-rife/rife-models
+cmake -S mvo-rife -B build/mvo-rife -G Ninja
+cmake --build build/mvo-rife                     # copie aussi rife-models/selector.txt
+python3 mvo-rife/scripts/fetch_models.py build/mvo-rife/rife-models
+MUXIVEO_RIFE_BIN=build/mvo-rife/muxiveo-rife pytest mvo-rife/tests     # GPU Vulkan (llvmpipe accepté)
+python3 mvo-rife/scripts/package.py linux-x86_64 build/mvo-rife/muxiveo-rife build/dist
 ```
 
 Option : `-DMUXIVEO_RIFE_NCNN_SOURCE_DIR=<checkout ncnn>` pour compiler hors ligne.
@@ -191,13 +212,13 @@ Option : `-DMUXIVEO_RIFE_NCNN_SOURCE_DIR=<checkout ncnn>` pour compiler hors lig
 Releases : Linux compilé dans `manylinux_2_28` (glibc ≥ 2.28, runtime C++ statique), macOS 12+ (arm64,
 MoltenVK livré à côté du binaire), Windows x64 (runtime MSVC statique).
 
-Publication automatique : incrémenter la version (`project()` du CMakeLists **et** `MUXIVEO_RIFE_VERSION`
-de `core/version.py`) puis pousser. Le workflow de release de Muxiveo (`release.yml`) compile et publie
-`muxiveo-rife-vX.Y.Z` si cette release n'existe pas, avant d'empaqueter l'application. Un code natif
-modifié sans changement de version fait échouer la release. Le tag manuel `muxiveo-rife-vX.Y.Z` reste possible.
+Publication : incrémenter `project()` du CMakeLists, pousser, puis le tag `mvo-rife-vX.Y.Z`. La CI
+(`.github/workflows/mvo-rife.yml`) publie les archives (`manifest.json` : SHA-256 de chaque fichier, contrat,
+modèles, préréglages) et ajoute la version au flux `mvo-rife.json` de la release `extensions-feed`. Une rupture
+du contrat (incrément de `MUXIVEO_RIFE_CONTRACT`) n'est proposée qu'aux versions de Muxiveo qui la connaissent.
 
 Les modèles (`models.json`, sha256 épinglés) sont cherchés dans `<dossier de l'exécutable>/rife-models/<nom>`
-ou passés avec `-m <dossier>`. Préréglages Muxiveo :
+ou passés avec `-m <dossier>`. Préréglages Muxiveo (`presets.json` ; Ultra et Light ajoutent `--ultra` / `--uhd`) :
 
 | Préréglage | Moteur | Modèle |
 |---|---|---|

@@ -6,7 +6,7 @@ cmake_policy(SET CMP0091 NEW)
 set(CMAKE_POLICY_DEFAULT_CMP0091 NEW)
 set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 
-project(muxiveo-rife VERSION 1.6.0 LANGUAGES C CXX)
+project(muxiveo-rife VERSION 1.7.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -117,6 +117,7 @@ add_executable(muxiveo-rife
     src/nvof.cpp
     src/cuda_driver.cpp
     src/trt_backend.cpp
+    src/selector_weights.cpp
     ${SHADER_HEADERS}
 )
 target_include_directories(muxiveo-rife PRIVATE ${CMAKE_CURRENT_BINARY_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/src)
@@ -143,4 +144,12 @@ elseif(NOT APPLE)
     endif()
 endif()
 
+# Poids du sélecteur (données, lus au lancement) à côté des modèles : build et installation.
+add_custom_command(TARGET muxiveo-rife POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E make_directory $<TARGET_FILE_DIR:muxiveo-rife>/rife-models
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different ${CMAKE_CURRENT_SOURCE_DIR}/selector/selector.txt
+            $<TARGET_FILE_DIR:muxiveo-rife>/rife-models/selector.txt
+    VERBATIM)
+
 install(TARGETS muxiveo-rife RUNTIME DESTINATION .)
+install(FILES selector/selector.txt DESTINATION rife-models)

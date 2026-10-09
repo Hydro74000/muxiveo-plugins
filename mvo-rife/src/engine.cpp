@@ -34,7 +34,6 @@
 #include "sel_blend.comp.hex.h"
 #include "sel_stats.comp.hex.h"
 #include "sel_weights.comp.hex.h"
-#include "selector_weights.h"
 #include "mc_recon.comp.hex.h"
 #include "mc_region.comp.hex.h"
 #include "mc_search.comp.hex.h"
@@ -347,7 +346,7 @@ bool RifeEngine::configure(const FrameFormat& _fmt, const ColorParams& _color, s
             error = "allocation mémoire GPU impossible (MC)";
             return false;
         }
-        if (engine_mode == InterpEngine::Hybrid && !upload_selector_models(error))
+        if (selector() && !upload_selector_models(error))
             return false;
     }
     return true;
@@ -1049,15 +1048,15 @@ bool RifeEngine::record_large_motion(ncnn::VkCompute& cmd, const GpuFrame& a, co
 // ---------------------------------------------------------------------------------------------------------------
 std::string RifeEngine::selector_weights_family() const
 {
-    for (int m = 0; m < kSelectorModelCount; m++)
-        if (sel_family == kSelectorModels[m].family)
+    for (const SelectorModel& sm : sel_weights)
+        if (sel_family == sm.family)
             return sel_family;
     return "v415";
 }
 
 // Sélecteur (moteur hybride) : choix appris, par bloc, entre les candidats R1 (RIFE), R05 (RIFE à flux
 // demi-résolution, paires à grands mouvements), MC (compensation par blocs), Rbwd (RIFE inversé, mode Ultra) et
-// NV (déformation par le flux NVIDIA dense). Poids : selector_weights.h (banc de scènes natives SD → 4K).
+// NV (déformation par le flux NVIDIA dense). Poids : rife-models/selector.txt (banc de scènes natives SD → 4K).
 // ---------------------------------------------------------------------------------------------------------------
 
 static ncnn::Option staging_option(const ncnn::Option& base, ncnn::VkAllocator* blob, ncnn::VkAllocator* staging)
@@ -1071,10 +1070,15 @@ static ncnn::Option staging_option(const ncnn::Option& base, ncnn::VkAllocator* 
 
 bool RifeEngine::upload_selector_models(std::string& error)
 {
-    std::vector<float> host((size_t)kSelectorModelCount * 128, 0.f);
-    for (int m = 0; m < kSelectorModelCount; m++)
+    if (sel_weights.empty())
     {
-        const SelectorModel& sm = kSelectorModels[m];
+        error = "poids du sélecteur absents";
+        return false;
+    }
+    std::vector<float> host(sel_weights.size() * 128, 0.f);
+    for (size_t m = 0; m < sel_weights.size(); m++)
+    {
+        const SelectorModel& sm = sel_weights[m];
         float* d = host.data() + (size_t)m * 128;
         for (int i = 0; i < 16; i++)
         {
@@ -1195,9 +1199,9 @@ bool RifeEngine::record_selector(ncnn::VkCompute& cmd, const GpuFrame& a, const 
     int mi = -1;
     const std::string families[2] = {sel_family, "v415"};
     for (int pass = 0; pass < 4 && mi < 0; pass++)
-        for (int m = 0; m < kSelectorModelCount && mi < 0; m++)
+        for (int m = 0; m < (int)sel_weights.size() && mi < 0; m++)
         {
-            const SelectorModel& sm = kSelectorModels[m];
+            const SelectorModel& sm = sel_weights[m];
             const bool band = pass % 2 == 0 ? sm.bmin > 0 && sm.bmin <= block && block <= sm.bmax : sm.bmin == 0;
             if (sm.candidates == bits && families[pass / 2] == sm.family && band)
                 mi = m;
@@ -1209,7 +1213,7 @@ bool RifeEngine::record_selector(ncnn::VkCompute& cmd, const GpuFrame& a, const 
     }
     const int nd = 1 + (cand[1] ? 1 : 0) + (cand[3] ? 1 : 0) + (cand[4] ? 1 : 0);
     const int nfeat = 2 * nd + 3 + (cand[4] ? 2 : 0) + 2;   // + bord, échelle
-    if (kSelectorModels[mi].nfeat != nfeat)
+    if (sel_weights[mi].nfeat != nfeat)
     {
         error = "poids du sélecteur incohérents avec les candidats";
         return false;

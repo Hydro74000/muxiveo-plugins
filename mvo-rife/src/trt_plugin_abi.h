@@ -1,8 +1,7 @@
 /*
  * Muxiveo — interface C entre muxiveo-rife et son plugin d'inférence RIFE TensorRT (mvo-rife-trt).
  *
- * Référence : native/muxiveo-rife/src/trt_plugin_abi.h du dépôt Muxiveo (MIT). Le dépôt muxiveo-plugins en
- * garde une copie identique, vérifiée par sa CI. Toute modification incompatible incrémente
+ * Référence unique, incluse telle quelle par mvo-rife-trt (même dépôt). Toute modification incompatible incrémente
  * MVO_TRT_ABI_VERSION ; muxiveo-rife refuse un plugin d'une autre version (repli Vulkan).
  *
  * Contrat :

@@ -49,6 +49,9 @@
 #ifndef MUXIVEO_RIFE_VERSION
 #define MUXIVEO_RIFE_VERSION "dev"
 #endif
+// Contrat avec Muxiveo (flux y4m, règle du nombre de trames, lignes info/progress/done sur stderr, codes de
+// sortie) : incrémenté à toute rupture ; les ajouts compatibles se lisent dans --capabilities.
+#define MUXIVEO_RIFE_CONTRACT 1
 #ifndef MUXIVEO_RIFE_NCNN_VERSION
 #define MUXIVEO_RIFE_NCNN_VERSION "?"
 #endif
@@ -347,6 +350,7 @@ struct Options
     std::string large_motion = "auto";  // auto | off | seuil (px) : moteur hybride, RIFE demi-résolution sur les grands mouvements
     double large_motion_px = 16.0;      // seuil bas (déplacement entre les sources) ; remplacement complet à 3x
     std::string selector = "auto";      // auto | off : moteur hybride, choix appris des candidats par bloc
+    std::string selector_weights;       // fichier de poids du sélecteur (défaut : <exe>/rife-models/selector.txt)
     bool ultra = false;                 // moteur hybride : candidat supplémentaire RIFE inversé
     std::string backend = "auto";  // auto | vulkan | tensorrt : inférence RIFE
     std::string trt_plugin;        // dossier du plugin TensorRT (mvo-rife-trt), vide = Vulkan
@@ -355,6 +359,7 @@ struct Options
     bool fp32 = false;
     bool uhd = false;
     bool list_gpus = false;
+    bool capabilities = false;
     bool version = false;
     bool quiet = false;
     bool verbose = false;
@@ -395,6 +400,7 @@ static void print_usage(FILE* fp)
             "  --selector <auto|off>   moteur hybride : choix appris, par bloc, entre RIFE, RIFE demi-résolution,\n"
             "                          compensation de mouvement, RIFE inversé (--ultra) et flux NVIDIA (défaut :\n"
             "                          auto ; off = ancienne règle fixe, diagnostic ; sans effet avec --uhd)\n"
+            "  --selector-weights <f>  poids du sélecteur (défaut : <exe>/rife-models/selector.txt)\n"
             "  --ultra                 moteur hybride : ajoute le candidat RIFE inversé (coût RIFE x2)\n"
             "  --padding <n>           padding du réseau (défaut : selon le modèle, x2 avec --uhd)\n"
             "  -j, --threads <n>       threads CPU ncnn (défaut : 2)\n"
@@ -403,6 +409,7 @@ static void print_usage(FILE* fp)
             "  --quiet                 pas de ligne de progression\n"
             "  --verbose               affiche les diagnostics Vulkan de ncnn\n"
             "  --list-gpus             liste les GPU Vulkan (JSON, disponibilité du flux NVIDIA) et quitte\n"
+            "  --capabilities          capacités (JSON : contrat, options, modèles, sélecteur) et quitte\n"
             "  --version               affiche la version et quitte\n",
             DEFAULT_MODEL);
 }
@@ -496,6 +503,7 @@ static bool parse_args(const std::vector<std::string>& args, Options& o, std::st
             }
             o.selector = v;
         }
+        else if (a == "--selector-weights") { if (!value(o.selector_weights)) return false; }
         else if (a == "--ultra") o.ultra = true;
         else if (a == "--large-motion")
         {
@@ -523,6 +531,7 @@ static bool parse_args(const std::vector<std::string>& args, Options& o, std::st
         else if (a == "--quiet") o.quiet = true;
         else if (a == "--verbose") o.verbose = true;
         else if (a == "--list-gpus") o.list_gpus = true;
+        else if (a == "--capabilities") o.capabilities = true;
         else if (a == "--version") o.version = true;
         else if (a == "-h" || a == "--help")
         {
@@ -670,6 +679,56 @@ static fs::path default_trt_cache()
     const fs::path base = xdg && *xdg ? fs::path(xdg) : (home && *home ? fs::path(home) / ".cache" : fs::temp_directory_path());
     return base / "muxiveo" / "trt-engines";
 #endif
+}
+
+// Fichier de poids du sélecteur : --selector-weights, sinon <exe>/rife-models/selector.txt.
+static fs::path selector_weights_path(const Options& o, const fs::path& exe_dir)
+{
+    return o.selector_weights.empty() ? exe_dir / "rife-models" / "selector.txt" : path_from_utf8(o.selector_weights);
+}
+
+// Capacités du binaire pour Muxiveo (sans initialiser le GPU) : contrat, options reconnues, modèles présents
+// (dossiers de <exe>/rife-models avec flownet.param et flownet.bin), familles de poids du sélecteur.
+static int print_capabilities(const Options& o, const fs::path& exe_dir)
+{
+    static const char* const OPTIONS[] = {
+        "input", "output", "factor", "fps", "model", "gpu", "matrix", "range", "chroma-loc", "scene-threshold", "uhd",
+        "fp32", "tta", "engine", "trt-plugin", "trt-cache", "backend", "nvof", "large-motion", "selector",
+        "selector-weights", "ultra", "padding", "threads", "allow-interlaced", "progress-interval", "quiet", "verbose",
+        "list-gpus", "capabilities", "version"};
+    std::vector<std::string> models;
+    std::error_code ec;
+    for (fs::directory_iterator it(exe_dir / "rife-models", ec), end; !ec && it != end; it.increment(ec))
+    {
+        std::error_code fe;
+        if (it->is_directory(fe) && fs::is_regular_file(it->path() / "flownet.param", fe)
+                && fs::is_regular_file(it->path() / "flownet.bin", fe))
+            models.push_back(path_to_utf8(it->path().filename()));
+    }
+    std::sort(models.begin(), models.end());
+    std::vector<SelectorModel> weights;
+    std::string weights_error;
+    const bool weights_ok = load_selector_weights(selector_weights_path(o, exe_dir), weights, weights_error);
+
+    std::string json = "{\"name\": \"muxiveo-rife\", \"version\": \"" MUXIVEO_RIFE_VERSION "\", \"contract\": "
+                       + std::to_string(MUXIVEO_RIFE_CONTRACT) + ", \"ncnn\": \"" + json_escape(MUXIVEO_RIFE_NCNN_VERSION)
+                       + "\", \"options\": [";
+    for (size_t i = 0; i < sizeof OPTIONS / sizeof OPTIONS[0]; i++)
+        json += std::string(i ? ", " : "") + "\"" + OPTIONS[i] + "\"";
+    json += "], \"engines\": [\"rife\", \"hybrid\", \"mc\"], \"tta\": [1, 2, 4, 8], \"backends\": [\"vulkan\"";
+    json += TRT_PLATFORM ? ", \"tensorrt\"]" : "]";
+    json += ", \"trt_abi\": " + std::to_string(MVO_TRT_ABI_VERSION) + ", \"default_model\": \"" + DEFAULT_MODEL
+            + "\", \"models\": [";
+    for (size_t i = 0; i < models.size(); i++)
+        json += std::string(i ? ", " : "") + "\"" + json_escape(models[i]) + "\"";
+    json += "], \"selector\": {\"format\": " + std::to_string(SELECTOR_WEIGHTS_FORMAT) + ", \"status\": \""
+            + (weights_ok ? std::string("ok") : json_escape(weights_error)) + "\", \"families\": [";
+    const std::vector<std::string> families = selector_families(weights);
+    for (size_t i = 0; i < families.size(); i++)
+        json += std::string(i ? ", " : "") + "\"" + json_escape(families[i]) + "\"";
+    json += "]}}\n";
+    fputs(json.c_str(), stdout);
+    return EXIT_OK;
 }
 
 static int list_gpus(const Options& o)
@@ -903,7 +962,20 @@ static int run(const Options& o, const fs::path& exe_dir)
     std::string sel_family = model_name.find("v4.6") != std::string::npos ? "v46" : "v415";
     if (model_name.find("-mvo") != std::string::npos)
         sel_family += "mvo";
-    engine.set_selector(o.selector == "auto" && !o.uhd, sel_family);
+    // poids lus seulement quand le sélecteur sert ; illisibles : règle fixe (Ultra, qui l'exige, est refusé)
+    std::vector<SelectorModel> sel_weights;
+    std::string sel_weights_status;
+    const bool want_selector = o.engine == "hybrid" && o.selector == "auto" && !o.uhd;
+    if (want_selector && !load_selector_weights(selector_weights_path(o, exe_dir), sel_weights, sel_weights_status))
+    {
+        sel_weights_status = "poids indisponibles : " + sel_weights_status;
+        if (o.ultra)
+        {
+            fprintf(stderr, "error: --ultra exige le sélecteur appris (%s)\n", sel_weights_status.c_str());
+            return EXIT_GPU;
+        }
+    }
+    engine.set_selector(want_selector, sel_family, std::move(sel_weights));
     engine.set_ultra(o.ultra);
     const bool needs_gpu = ra != rb || o.roundtrip;
     // moteur hybride : second réseau à flux demi-résolution (padding x2) pour les grands mouvements
@@ -998,7 +1070,8 @@ static int run(const Options& o, const fs::path& exe_dir)
             extra += engine.selector() ? std::string(" | sélecteur : appris (") + label
                                              + (weights != sel_family ? ", poids de repli" : "")
                                              + (o.ultra ? ", Ultra" : "") + ")"
-                                       : std::string(" | sélecteur : règle fixe");
+                                       : std::string(" | sélecteur : règle fixe")
+                                             + (sel_weights_status.empty() ? "" : " (" + sel_weights_status + ")");
         }
         fprintf(stderr, "info: moteur %s | flux optique NVIDIA : %s%s\n", o.engine.c_str(), nvof_status.c_str(), extra.c_str());
     }
@@ -1411,14 +1484,16 @@ int main(int argc, char** argv)
         return EXIT_OK;
     }
 
+    const fs::path exe_dir = executable_dir(argc > 0 ? argv[0] : 0);
+    if (o.capabilities)
+        return print_capabilities(o, exe_dir);
+
     // Refus avant toute ouverture en écriture et avant l'initialisation GPU.
     if (!o.list_gpus && !validate_file_paths(o, error))
     {
         fprintf(stderr, "error: %s\n", error.c_str());
         return EXIT_USAGE;
     }
-
-    const fs::path exe_dir = executable_dir(argc > 0 ? argv[0] : 0);
 
     // macOS : MoltenVK livré à côté de l'exécutable (sinon chargeur Vulkan système).
     const char* driver_path = nullptr;
