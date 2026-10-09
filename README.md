@@ -1,7 +1,7 @@
 # Plugins Muxiveo
 
 Extensions facultatives de [Muxiveo](https://github.com/Hydro74000/muxiveo), téléchargées à la demande par
-l'application (Paramètres > Extensions) sur les seules machines compatibles. Muxiveo fonctionne entièrement sans
+l'application (page Extensions) sur les seules machines compatibles. Muxiveo fonctionne entièrement sans
 elles.
 
 ## Plugins

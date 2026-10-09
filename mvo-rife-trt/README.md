@@ -6,7 +6,7 @@ cartes NVIDIA, au lieu du calcul Vulkan générique. Les images interpolées son
 est nettement plus rapide.
 
 Muxiveo propose ce plugin uniquement sur les machines compatibles et l'installe, le met à jour et le supprime
-lui-même (Paramètres > Extensions). Sans lui, ou au moindre problème, l'interpolation continue en Vulkan.
+lui-même (page Extensions). Sans lui, ou au moindre problème, l'interpolation continue en Vulkan.
 
 ## Compatibilité
 
