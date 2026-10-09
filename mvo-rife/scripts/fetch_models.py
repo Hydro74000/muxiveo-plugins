@@ -2,7 +2,7 @@
 """Télécharge les modèles RIFE épinglés dans models.json et vérifie leur sha256.
 
 Usage :
-    python3 native/muxiveo-rife/scripts/fetch_models.py <dossier-destination> [--model NOM ...]
+    python3 mvo-rife/scripts/fetch_models.py <dossier-destination> [--model NOM ...]
 
 Les modèles sont écrits sous ``<destination>/<nom>/flownet.{param,bin}``, disposition
 attendue par ``muxiveo-rife`` dans ``<dossier de l'exécutable>/rife-models``.

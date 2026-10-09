@@ -45,7 +45,7 @@ partie du code amont est reprise ; le reste est propre à Muxiveo.
 
 1. ncnn : changer `MUXIVEO_RIFE_NCNN_TAG` dans `CMakeLists.txt` (vérifier que l'ancre du correctif
    `cmake/patch_ncnn.cmake` existe toujours), recompiler, relancer
-   `tests/native/test_muxiveo_rife.py` (aller-retour de conversion + vérité terrain).
+   `tests/test_muxiveo_rife.py` (aller-retour de conversion + vérité terrain).
 2. Modèles : changer `commit` dans `models.json`, recalculer les `sha256`
    (`sha256sum`), vérifier le `padding` attendu dans `model_padding()` (`src/main.cpp`).
 3. Shaders `warp*` : comparer avec l'amont, reporter les correctifs.

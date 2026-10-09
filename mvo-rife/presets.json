@@ -1,0 +1,10 @@
+{
+  "schema": 1,
+  "presets": {
+    "fast": {"engine": "rife", "model": "rife-v4.6"},
+    "balanced": {"engine": "hybrid", "model": "rife-v4.6"},
+    "quality": {"engine": "hybrid", "model": "rife-v4.15-mvo1"},
+    "ultra": {"engine": "hybrid", "model": "rife-v4.15-mvo1"},
+    "light": {"engine": "rife", "model": "rife-v4.15-lite"}
+  }
+}

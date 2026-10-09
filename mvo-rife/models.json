@@ -5,21 +5,18 @@
   "default": "rife-v4.6",
   "models": {
     "rife-v4.6": {
-      "preset": "fast, balanced",
       "files": {
         "flownet.param": {"sha256": "724569596bcd1e7b9fa50455c604777ebed99746d2ef40aa86e31b5725f1053c", "size": 16532},
         "flownet.bin": {"sha256": "f334ed2260149ce0188a6dcf049844e8b0cdd912e01cbcfb63553157d2508958", "size": 10614320}
       }
     },
     "rife-v4.15": {
-      "preset": "(CLI)",
       "files": {
         "flownet.param": {"sha256": "13b6407289b9888d65f2da2ad58b40c1db93a0e53cb3add26288f95f36241168", "size": 28659},
         "flownet.bin": {"sha256": "d01f3b9098a999c1aa46607f4851ae728d78866c060f782743b3b80d9fef279a", "size": 10793232}
       }
     },
     "rife-v4.15-mvo1": {
-      "preset": "quality, ultra",
       "base": "rife-v4.15",
       "files": {
         "flownet.param": {"sha256": "13b6407289b9888d65f2da2ad58b40c1db93a0e53cb3add26288f95f36241168", "size": 28659,
@@ -29,7 +26,6 @@
       }
     },
     "rife-v4.15-lite": {
-      "preset": "light",
       "files": {
         "flownet.param": {"sha256": "18bc572aa0cd78ab7242e60840cdde0feae37dd319d2a7b108989d83cc6479f1", "size": 28630},
         "flownet.bin": {"sha256": "700f6d15fc365dfd99a8fb7b4f9986708d4e9fb89844f3ddc4b56e7f30d16cda", "size": 5257552}
