@@ -1,0 +1,34 @@
+// Muxiveo — TTA : moyenne finale (somme fp32 x 1/n) vers l'image RGB du pipeline.
+
+#version 450
+
+#if NCNN_fp16_storage
+#extension GL_EXT_shader_16bit_storage: require
+#endif
+
+layout (binding = 0) readonly buffer acc_blob { float acc_data[]; };
+layout (binding = 1) writeonly buffer dst_blob { sfp dst_data[]; };
+
+layout (push_constant) uniform parameter
+{
+    int w;
+    int h;
+    int c;
+    int accw;
+    int acccstep;
+    int dstw;
+    int dstcstep;
+    float scale;
+} p;
+
+void main()
+{
+    int gx = int(gl_GlobalInvocationID.x);
+    int gy = int(gl_GlobalInvocationID.y);
+    int gz = int(gl_GlobalInvocationID.z);
+
+    if (gx >= p.w || gy >= p.h || gz >= p.c)
+        return;
+
+    dst_data[gz * p.dstcstep + gy * p.dstw + gx] = sfp(acc_data[gz * p.acccstep + gy * p.accw + gx] * p.scale);
+}

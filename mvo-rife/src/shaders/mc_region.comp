@@ -1,0 +1,22 @@
+// Muxiveo — MC : carte « RIFE » avant adoucissement : densité de pixels non fiables au-delà
+// du seuil, ou bord de cadre (dilaté).  u = max(clamp((dens − d0) / 0,1), bord).
+
+#version 450
+
+layout (binding = 0) readonly buffer dens_blob { float dens[]; };
+layout (binding = 1) readonly buffer edge_blob { float edge[]; };
+layout (binding = 2) writeonly buffer u_blob { float u[]; };
+
+layout (push_constant) uniform parameter
+{
+    int n;
+    float d0;
+} p;
+
+void main()
+{
+    int i = int(gl_GlobalInvocationID.x);
+    if (i >= p.n)
+        return;
+    u[i] = max(clamp((dens[i] - p.d0) / 0.1f, 0.f, 1.f), edge[i]);
+}

@@ -1,0 +1,105 @@
+// Muxiveo — sélecteur : poids des candidats par bloc (modèle linéaire, softmax), ordre des indices identique à
+// l'apprentissage : désaccords des candidats présents (R05, MC, Rbwd, NV), texture, écart temporel, luminance,
+// désaccords dilatés (maximum 3 × 3 blocs), [incohérence, amplitude NVOF], bord, échelle log2(bloc / 16).
+// x = (log(f + 1e-3) - mu) / sd (bord et échelle : valeur brute). Sortie : 5 poids par bloc (R1, R05, MC,
+// Rbwd, NV). Bord : 1 si le bloc est à moins de B/2 px d'un bord de l'image (MC et NV y échantillonnent hors cadre).
+
+#version 450
+
+layout (binding = 0) readonly buffer stat_blob { float stats[]; };
+layout (binding = 1) readonly buffer model_blob { float model[]; };   // 128 flottants par modèle
+layout (binding = 2) writeonly buffer w_blob { float weights[]; };    // (nby, nbx, 5)
+
+layout (push_constant) uniform parameter
+{
+    int nbx;
+    int nby;
+    int offset;      // début du modèle (flottants)
+    int nfeat;
+    int cands;       // bits : 1 R1, 2 R05, 4 MC, 8 Rbwd, 16 NV
+    float scale;
+    int w;           // image utile
+    int h;
+    int block;
+} p;
+
+float stat(int bx, int by, int k)
+{
+    return stats[(clamp(by, 0, p.nby - 1) * p.nbx + clamp(bx, 0, p.nbx - 1)) * 9 + k];
+}
+
+void main()
+{
+    int bx = int(gl_GlobalInvocationID.x);
+    int by = int(gl_GlobalInvocationID.y);
+    if (bx >= p.nbx || by >= p.nby)
+        return;
+    // désaccords présents (indices de stats : 0 R05, 1 MC, 2 Rbwd, 3 NV) et emplacements de sortie
+    int dk[4];
+    int nd = 0;
+    if ((p.cands & 2) != 0) dk[nd++] = 0;
+    dk[nd++] = 1;
+    if ((p.cands & 8) != 0) dk[nd++] = 2;
+    if ((p.cands & 16) != 0) dk[nd++] = 3;
+    float f[16];
+    int n = 0;
+    for (int j = 0; j < nd; j++)
+        f[n++] = log(stat(bx, by, dk[j]) + 1e-3f);
+    f[n++] = log(stat(bx, by, 4) + 1e-3f);
+    f[n++] = log(stat(bx, by, 5) + 1e-3f);
+    f[n++] = log(stat(bx, by, 6) + 1e-3f);
+    for (int j = 0; j < nd; j++)
+    {
+        float m = 0.f;
+        for (int dy = -1; dy <= 1; dy++)
+            for (int dx = -1; dx <= 1; dx++)
+            {
+                int x = bx + dx;
+                int y = by + dy;
+                if (x >= 0 && y >= 0 && x < p.nbx && y < p.nby)
+                    m = max(m, stat(x, y, dk[j]));
+            }
+        f[n++] = log(m + 1e-3f);
+    }
+    if ((p.cands & 16) != 0)
+    {
+        f[n++] = log(stat(bx, by, 7) + 1e-3f);
+        f[n++] = log(stat(bx, by, 8) + 1e-3f);
+    }
+    int x0 = bx * p.block;
+    int y0 = by * p.block;
+    int x1 = min(x0 + p.block, p.w);
+    int y1 = min(y0 + p.block, p.h);
+    int hblk = p.block / 2;
+    f[n++] = (x0 < hblk || y0 < hblk || p.w - x1 < hblk || p.h - y1 < hblk) ? 1.f : 0.f;
+    f[n++] = p.scale;
+    // emplacements des candidats du modèle (R1 puis présents dans l'ordre R05, MC, Rbwd, NV)
+    int slot[5];
+    int k = 0;
+    slot[k++] = 0;
+    if ((p.cands & 2) != 0) slot[k++] = 1;
+    slot[k++] = 2;
+    if ((p.cands & 8) != 0) slot[k++] = 3;
+    if ((p.cands & 16) != 0) slot[k++] = 4;
+    float logit[5];
+    float mx = -3.4e38f;
+    for (int c = 0; c < k; c++)
+    {
+        float z = model[p.offset + 112 + c];
+        for (int i = 0; i < p.nfeat; i++)
+            z += model[p.offset + 32 + c * p.nfeat + i] * ((f[i] - model[p.offset + i]) / model[p.offset + 16 + i]);
+        logit[c] = z;
+        mx = max(mx, z);
+    }
+    float sum = 0.f;
+    for (int c = 0; c < k; c++)
+    {
+        logit[c] = exp(logit[c] - mx);
+        sum += logit[c];
+    }
+    int o = (by * p.nbx + bx) * 5;
+    for (int s = 0; s < 5; s++)
+        weights[o + s] = 0.f;
+    for (int c = 0; c < k; c++)
+        weights[o + slot[c]] = logit[c] / sum;
+}

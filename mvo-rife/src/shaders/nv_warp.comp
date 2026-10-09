@@ -1,0 +1,130 @@
+// Muxiveo — candidat NV (flux NVIDIA dense), passe 2 : image au temps t et cartes du sélecteur.
+// Flux vers t (approximation quadratique) : ft0 = -(1-t)t f01 + t² f10, ft1 = (1-t)² f01 - t(1-t) f10 ;
+// visibilité v = exp(-incohérence déformée / 2) ; NV = ((1-t) v0 A(x+ft0) + t v1 B(x+ft1)) / ((1-t) v0 + t v1).
+// Cartes (px pleine résolution) : nvinc = (inc0(x) + inc1(x + f01)) / 2, nvmag = |f01|.
+
+#version 450
+
+#if NCNN_fp16_storage
+#extension GL_EXT_shader_16bit_storage: require
+#endif
+
+layout (binding = 0) readonly buffer fwd_blob { float fwd[]; };
+layout (binding = 1) readonly buffer bwd_blob { float bwd[]; };
+layout (binding = 2) readonly buffer inc_blob { float inc[]; };
+layout (binding = 3) readonly buffer a_blob { sfp a_data[]; };
+layout (binding = 4) readonly buffer b_blob { sfp b_data[]; };
+layout (binding = 5) writeonly buffer nv_blob { sfp nv_data[]; };
+layout (binding = 6) writeonly buffer map_blob { float map_data[]; };   // 2 plans w × h : nvinc, nvmag
+
+layout (push_constant) uniform parameter
+{
+    int w;          // image utile
+    int h;
+    int pw;         // tampons paddés (RGB)
+    int ph;
+    int cstep;
+    int nv_cstep;
+    int gw;
+    int gh;
+    float t;
+} p;
+
+vec2 grid_at(int which, int gx, int gy)
+{
+    int i = (clamp(gy, 0, p.gh - 1) * p.gw + clamp(gx, 0, p.gw - 1)) * 2;
+    return which == 0 ? vec2(fwd[i], fwd[i + 1]) : vec2(bwd[i], bwd[i + 1]);
+}
+
+vec2 flow_at(int which, float px, float py)
+{
+    float sx = max((px + 0.5f) * float(p.gw) / float(p.w) - 0.5f, 0.f);
+    float sy = max((py + 0.5f) * float(p.gh) / float(p.h) - 0.5f, 0.f);
+    int x0 = int(floor(sx));
+    int y0 = int(floor(sy));
+    float fx = sx - float(x0);
+    float fy = sy - float(y0);
+    return mix(mix(grid_at(which, x0, y0), grid_at(which, x0 + 1, y0), fx),
+               mix(grid_at(which, x0, y0 + 1), grid_at(which, x0 + 1, y0 + 1), fx), fy);
+}
+
+vec2 clamp_px(vec2 q)
+{
+    return clamp(q, vec2(0.f), vec2(float(p.w - 1), float(p.h - 1)));
+}
+
+float inc_at(int plane, vec2 q)
+{
+    q = clamp_px(q);
+    int x0 = int(floor(q.x));
+    int y0 = int(floor(q.y));
+    int x1 = min(x0 + 1, p.w - 1);
+    int y1 = min(y0 + 1, p.h - 1);
+    float fx = q.x - float(x0);
+    float fy = q.y - float(y0);
+    int base = plane * p.w * p.h;
+    return mix(mix(inc[base + y0 * p.w + x0], inc[base + y0 * p.w + x1], fx),
+               mix(inc[base + y1 * p.w + x0], inc[base + y1 * p.w + x1], fx), fy);
+}
+
+vec3 rgb_at(int which, vec2 q)
+{
+    q = clamp_px(q);
+    int x0 = int(floor(q.x));
+    int y0 = int(floor(q.y));
+    int x1 = min(x0 + 1, p.w - 1);
+    int y1 = min(y0 + 1, p.h - 1);
+    float fx = q.x - float(x0);
+    float fy = q.y - float(y0);
+    vec3 r;
+    for (int c = 0; c < 3; c++)
+    {
+        int base = c * p.cstep;
+        float v00, v01, v10, v11;
+        if (which == 0)
+        {
+            v00 = float(a_data[base + y0 * p.pw + x0]); v01 = float(a_data[base + y0 * p.pw + x1]);
+            v10 = float(a_data[base + y1 * p.pw + x0]); v11 = float(a_data[base + y1 * p.pw + x1]);
+        }
+        else
+        {
+            v00 = float(b_data[base + y0 * p.pw + x0]); v01 = float(b_data[base + y0 * p.pw + x1]);
+            v10 = float(b_data[base + y1 * p.pw + x0]); v11 = float(b_data[base + y1 * p.pw + x1]);
+        }
+        r[c] = mix(mix(v00, v01, fx), mix(v10, v11, fx), fy);
+    }
+    return r;
+}
+
+void main()
+{
+    int gx = int(gl_GlobalInvocationID.x);
+    int gy = int(gl_GlobalInvocationID.y);
+    if (gx >= p.pw || gy >= p.ph)
+        return;
+    int o = gy * p.pw + gx;
+    if (gx >= p.w || gy >= p.h)
+    {
+        nv_data[o] = sfp(0.f);
+        nv_data[p.nv_cstep + o] = sfp(0.f);
+        nv_data[2 * p.nv_cstep + o] = sfp(0.f);
+        return;
+    }
+    vec2 x = vec2(float(gx), float(gy));
+    float t = p.t;
+    vec2 f01 = flow_at(0, x.x, x.y);
+    vec2 f10 = flow_at(1, x.x, x.y);
+    vec2 ft0 = -(1.f - t) * t * f01 + t * t * f10;
+    vec2 ft1 = (1.f - t) * (1.f - t) * f01 - t * (1.f - t) * f10;
+    float v0 = exp(-inc_at(0, x + ft0) / 2.f) + 1e-3f;
+    float v1 = exp(-inc_at(1, x + ft1) / 2.f) + 1e-3f;
+    vec3 A = rgb_at(0, x + ft0);
+    vec3 B = rgb_at(1, x + ft1);
+    vec3 nv = ((1.f - t) * v0 * A + t * v1 * B) / ((1.f - t) * v0 + t * v1);
+    nv_data[o] = sfp(nv.r);
+    nv_data[p.nv_cstep + o] = sfp(nv.g);
+    nv_data[2 * p.nv_cstep + o] = sfp(nv.b);
+    int i = gy * p.w + gx;
+    map_data[i] = (inc[i] + inc_at(1, x + f01)) / 2.f;
+    map_data[p.w * p.h + i] = length(f01);
+}

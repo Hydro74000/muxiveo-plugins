@@ -1,0 +1,220 @@
+// Muxiveo — MC : recherche bilatérale par blocs de 16 (un groupe de 16×16 threads par bloc).
+// Coût d'un vecteur v (image 0 → 1) : moyenne de |L0(x − t·v) − L1(x + (1−t)·v)| sur la
+// fenêtre centrée sur le bloc (marge `margin` de chaque côté), pixels dont les deux
+// échantillons sont dans l'image (sinon coût neutre), + λ·|v − prédicteur|.
+// mode 0 : niveau grossier, recherche exhaustive entière ±radius (prédicteur nul).
+// mode 1 : raffinement autour du parent (×2), de ses 4 voisins, de 24 décalages et des
+//          candidats externes (flux matériel, niveau final).
+// mode 2 : propagation, voisins 3×3 du même niveau et leur médiane comme prédicteur.
+// 8 candidats évalués en parallèle (8 équipes de 32 threads) ; premier minimum strict retenu.
+
+#version 450
+
+layout (binding = 0) readonly buffer l0_blob { float l0[]; };
+layout (binding = 1) readonly buffer l1_blob { float l1[]; };
+layout (binding = 2) readonly buffer parent_blob { vec2 parent[]; };
+layout (binding = 3) writeonly buffer field_blob { vec2 field[]; };
+layout (binding = 4) readonly buffer hint_blob { vec2 hints[]; };
+
+layout (push_constant) uniform parameter
+{
+    int w;        // largeur de ligne du tampon du niveau
+    int h;
+    int iw;       // dimensions utiles de l'image au niveau
+    int ih;
+    int bw;
+    int bh;
+    int pbw;
+    int pbh;
+    int mode;
+    int radius;
+    int full_res;
+    int nhints;    // candidats externes par bloc (flux matériel), 0 si absent
+    float lambda_;
+    float t;
+    int margin;   // marge de la fenêtre autour du bloc (8 = fenêtre 32×32, 16 = 48×48)
+} p;
+
+shared float s_diff[256];
+shared float s_cnt[256];
+shared float s_cost[8];
+shared vec2 s_best;
+shared float s_best_cost;
+
+float bilinear(int which, float x, float y)
+{
+    int x0 = int(floor(x));
+    int y0 = int(floor(y));
+    float ax = x - float(x0);
+    float ay = y - float(y0);
+    int x1 = min(x0 + 1, p.iw - 1);
+    int y1 = min(y0 + 1, p.ih - 1);
+    x0 = clamp(x0, 0, p.iw - 1);
+    y0 = clamp(y0, 0, p.ih - 1);
+    float v00, v01, v10, v11;
+    if (which == 0)
+    {
+        v00 = l0[y0 * p.w + x0]; v01 = l0[y0 * p.w + x1];
+        v10 = l0[y1 * p.w + x0]; v11 = l0[y1 * p.w + x1];
+    }
+    else
+    {
+        v00 = l1[y0 * p.w + x0]; v01 = l1[y0 * p.w + x1];
+        v10 = l1[y1 * p.w + x0]; v11 = l1[y1 * p.w + x1];
+    }
+    return mix(mix(v00, v01, ax), mix(v10, v11, ax), ay);
+}
+
+vec2 parent_at(int bx, int by)
+{
+    int px = clamp(bx / 2, 0, p.pbw - 1);
+    int py = clamp(by / 2, 0, p.pbh - 1);
+    return 2.f * parent[py * p.pbw + px];
+}
+
+
+vec2 candidate(int k, int bx, int by, vec2 pred)
+{
+    if (p.mode == 0)
+    {
+        int side = 2 * p.radius + 1;
+        return vec2(float(k % side - p.radius), float(k / side - p.radius));
+    }
+    if (p.mode == 2)
+    {
+        if (k == 9)
+            return pred;
+        int j = k / 3 - 1;
+        int i = k % 3 - 1;
+        // k = 4 : bloc courant
+        return parent[clamp(by + j, 0, p.pbh - 1) * p.pbw + clamp(bx + i, 0, p.pbw - 1)];
+    }
+    if (k == 0)
+        return pred;
+    if (k < 5)
+    {
+        int dy = k == 1 ? 1 : (k == 2 ? -1 : 0);
+        int dx = k == 3 ? 1 : (k == 4 ? -1 : 0);
+        return parent_at(bx - dx, by - dy);
+    }
+    if (k < 29)
+    {
+        int s = k - 5;
+        int idx = s < 12 ? s : s + 1;
+        float steps_coarse[5] = float[5](-2.f, -1.f, 0.f, 1.f, 2.f);
+        float steps_fine[5] = float[5](-1.f, -0.5f, 0.f, 0.5f, 1.f);
+        vec2 off = p.full_res != 0 ? vec2(steps_fine[idx % 5], steps_fine[idx / 5]) : vec2(steps_coarse[idx % 5], steps_coarse[idx / 5]);
+        return pred + off;
+    }
+    return hints[(by * p.bw + bx) * p.nhints + (k - 29)];
+}
+
+vec2 median_pred(int bx, int by)
+{
+    float xs[9];
+    float ys[9];
+    int n = 0;
+    for (int j = -1; j <= 1; j++)
+        for (int i = -1; i <= 1; i++)
+        {
+            vec2 v = parent[clamp(by + j, 0, p.pbh - 1) * p.pbw + clamp(bx + i, 0, p.pbw - 1)];
+            xs[n] = v.x;
+            ys[n] = v.y;
+            n++;
+        }
+    for (int a = 0; a < 5; a++)
+        for (int b2 = a + 1; b2 < 9; b2++)
+        {
+            if (xs[b2] < xs[a]) { float tt = xs[a]; xs[a] = xs[b2]; xs[b2] = tt; }
+            if (ys[b2] < ys[a]) { float tt = ys[a]; ys[a] = ys[b2]; ys[b2] = tt; }
+        }
+    return vec2(xs[4], ys[4]);
+}
+
+void main()
+{
+    int bx = int(gl_WorkGroupID.x);
+    int by = int(gl_WorkGroupID.y);
+    int lid = int(gl_LocalInvocationID.y) * 16 + int(gl_LocalInvocationID.x);
+    int team = lid >> 5;
+    int lane = lid & 31;
+
+    vec2 pred = p.mode == 0 ? vec2(0.f) : (p.mode == 2 ? median_pred(bx, by) : parent_at(bx, by));
+    int total;
+    if (p.mode == 0)
+        total = (2 * p.radius + 1) * (2 * p.radius + 1);
+    else if (p.mode == 2)
+        total = 10;
+    else
+        total = 29 + (p.full_res != 0 ? p.nhints : 0);
+
+    if (lid == 0)
+    {
+        s_best = vec2(0.f);
+        s_best_cost = 3.4e38f;
+    }
+    for (int base = 0; base < total; base += 8)
+    {
+        int k = base + team;
+        float diff = 0.f;
+        float cnt = 0.f;
+        vec2 v = vec2(0.f);
+        if (k < total)
+        {
+            // mode 2 : bloc courant évalué en premier
+            int kk = p.mode == 2 ? (k < 9 ? (k + 4) % 9 : 9) : k;
+            v = candidate(kk, bx, by, pred);
+            int wn = 16 + 2 * p.margin;
+            int wq = wn * wn;
+            for (int q = lane; q < wq; q += 32)
+            {
+                int x = bx * 16 - p.margin + q % wn;
+                int y = by * 16 - p.margin + q / wn;
+                if (x < 0 || y < 0 || x >= p.iw || y >= p.ih)
+                    continue;
+                float xa = float(x) - p.t * v.x;
+                float ya = float(y) - p.t * v.y;
+                float xb = float(x) + (1.f - p.t) * v.x;
+                float yb = float(y) + (1.f - p.t) * v.y;
+                if (xa < 0.f || ya < 0.f || xa > float(p.iw - 1) || ya > float(p.ih - 1)
+                        || xb < 0.f || yb < 0.f || xb > float(p.iw - 1) || yb > float(p.ih - 1))
+                    continue;
+                diff += abs(bilinear(0, xa, ya) - bilinear(1, xb, yb));
+                cnt += 1.f;
+            }
+        }
+        s_diff[lid] = diff;
+        s_cnt[lid] = cnt;
+        barrier();
+        if (lane == 0)
+        {
+            float d = 0.f;
+            float c = 0.f;
+            for (int i = 0; i < 32; i++)
+            {
+                d += s_diff[team * 32 + i];
+                c += s_cnt[team * 32 + i];
+            }
+            float wn = float(16 + 2 * p.margin);
+            float cost = c > 0.25f * wn * wn ? d / c : 0.f;
+            float lam = p.mode == 0 ? p.lambda_ * length(v) : p.lambda_ * length(v - pred);
+            s_cost[team] = k < total ? cost + lam : 3.4e38f;
+            s_diff[team * 32] = v.x;   // vecteur de l'équipe (réutilise la mémoire partagée)
+            s_cnt[team * 32] = v.y;
+        }
+        barrier();
+        if (lid == 0)
+        {
+            // ordre croissant des candidats : premier minimum strict retenu
+            for (int i = 0; i < 8; i++)
+                if (s_cost[i] < s_best_cost)
+                {
+                    s_best_cost = s_cost[i];
+                    s_best = vec2(s_diff[i * 32], s_cnt[i * 32]);
+                }
+        }
+        barrier();
+    }
+    if (lid == 0)
+        field[by * p.bw + bx] = s_best;
+}

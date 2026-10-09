@@ -1,0 +1,42 @@
+// Muxiveo — TTA : somme fp32 des sorties du réseau, remises à l'endroit (le
+// retournement est une involution : même opération qu'en entrée).
+//   first != 0 : acc = flip(src) ; sinon acc += flip(src)
+
+#version 450
+
+#if NCNN_fp16_storage
+#extension GL_EXT_shader_16bit_storage: require
+#endif
+
+layout (binding = 0) readonly buffer src_blob { sfp src_data[]; };
+layout (binding = 1) buffer acc_blob { float acc_data[]; };
+
+layout (push_constant) uniform parameter
+{
+    int w;
+    int h;
+    int c;
+    int srcw;
+    int srccstep;
+    int accw;
+    int acccstep;
+    int flip;     // bit 0 : horizontal, bit 1 : vertical
+    int first;
+} p;
+
+void main()
+{
+    int gx = int(gl_GlobalInvocationID.x);
+    int gy = int(gl_GlobalInvocationID.y);
+    int gz = int(gl_GlobalInvocationID.z);
+
+    if (gx >= p.w || gy >= p.h || gz >= p.c)
+        return;
+
+    int sx = (p.flip & 1) != 0 ? p.w - 1 - gx : gx;
+    int sy = (p.flip & 2) != 0 ? p.h - 1 - gy : gy;
+    float v = float(src_data[gz * p.srccstep + sy * p.srcw + sx]);
+
+    int o = gz * p.acccstep + gy * p.accw + gx;
+    acc_data[o] = p.first != 0 ? v : acc_data[o] + v;
+}

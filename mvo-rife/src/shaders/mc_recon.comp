@@ -1,0 +1,131 @@
+// Muxiveo — MC : reconstruction au temps t par compensation recouvrante (OBMC) des
+// 4 blocs voisins. Chaque côté est écarté s'il échantillonne hors image. Sorties :
+// image RGB (fp32), erreur bilatérale minimale (luminance) et indicateur de bord de cadre.
+
+#version 450
+
+#if NCNN_fp16_storage
+#extension GL_EXT_shader_16bit_storage: require
+#endif
+
+layout (binding = 0) readonly buffer a_blob { sfp a_data[]; };
+layout (binding = 1) readonly buffer b_blob { sfp b_data[]; };
+layout (binding = 2) readonly buffer field_blob { vec2 field[]; };
+layout (binding = 3) writeonly buffer mc_blob { float mc_data[]; };
+layout (binding = 4) writeonly buffer q_blob { float q_data[]; };
+layout (binding = 5) writeonly buffer edge_blob { float edge_data[]; };
+
+layout (push_constant) uniform parameter
+{
+    int w;        // dimensions paddées (tampons)
+    int h;
+    int cstep;
+    int iw;       // dimensions utiles de l'image
+    int ih;
+    int bw;
+    int bh;
+    float t;
+    float kr;
+    float kb;
+    float lum_scale;
+} p;
+
+vec3 sample_rgb(int which, float x, float y)
+{
+    x = clamp(x, 0.f, float(p.iw - 1));
+    y = clamp(y, 0.f, float(p.ih - 1));
+    int x0 = int(floor(x));
+    int y0 = int(floor(y));
+    int x1 = min(x0 + 1, p.iw - 1);
+    int y1 = min(y0 + 1, p.ih - 1);
+    float ax = x - float(x0);
+    float ay = y - float(y0);
+    vec3 r;
+    for (int c = 0; c < 3; c++)
+    {
+        int base = c * p.cstep;
+        float v00, v01, v10, v11;
+        if (which == 0)
+        {
+            v00 = float(a_data[base + y0 * p.w + x0]); v01 = float(a_data[base + y0 * p.w + x1]);
+            v10 = float(a_data[base + y1 * p.w + x0]); v11 = float(a_data[base + y1 * p.w + x1]);
+        }
+        else
+        {
+            v00 = float(b_data[base + y0 * p.w + x0]); v01 = float(b_data[base + y0 * p.w + x1]);
+            v10 = float(b_data[base + y1 * p.w + x0]); v11 = float(b_data[base + y1 * p.w + x1]);
+        }
+        r[c] = mix(mix(v00, v01, ax), mix(v10, v11, ax), ay);
+    }
+    return r;
+}
+
+float inside(float x, float y)
+{
+    return (x >= 0.f && y >= 0.f && x <= float(p.iw - 1) && y <= float(p.ih - 1)) ? 1.f : 0.f;
+}
+
+float lum(vec3 c)
+{
+    return p.lum_scale * (p.kr * c.r + (1.f - p.kr - p.kb) * c.g + p.kb * c.b);
+}
+
+void main()
+{
+    int gx = int(gl_GlobalInvocationID.x);
+    int gy = int(gl_GlobalInvocationID.y);
+    if (gx >= p.w || gy >= p.h)
+        return;
+
+    float cy = (float(gy) - 7.5f) / 16.f;
+    float cx = (float(gx) - 7.5f) / 16.f;
+    int y0 = clamp(int(floor(cy)), 0, p.bh - 1);
+    int x0 = clamp(int(floor(cx)), 0, p.bw - 1);
+    float ay = clamp(cy - float(y0), 0.f, 1.f);
+    float ax = clamp(cx - float(x0), 0.f, 1.f);
+
+    vec3 acc = vec3(0.f);
+    float wsum = 0.f;
+    float qbest = 3.4e38f;
+    for (int k = 0; k < 4; k++)
+    {
+        int dy = k >> 1;
+        int dx = k & 1;
+        float wbl = (dy == 0 ? 1.f - ay : ay) * (dx == 0 ? 1.f - ax : ax);
+        vec2 v = field[clamp(y0 + dy, 0, p.bh - 1) * p.bw + clamp(x0 + dx, 0, p.bw - 1)];
+        float xa = float(gx) - p.t * v.x;
+        float ya = float(gy) - p.t * v.y;
+        float xb = float(gx) + (1.f - p.t) * v.x;
+        float yb = float(gy) + (1.f - p.t) * v.y;
+        vec3 A = sample_rgb(0, xa, ya);
+        vec3 B = sample_rgb(1, xb, yb);
+        float ia = inside(xa, ya);
+        float ib = inside(xb, yb);
+        float wa = (1.f - p.t) * ia + 1e-3f;
+        float wb = p.t * ib + 1e-3f;
+        vec3 pk = (wa * A + wb * B) / (wa + wb);
+        float q = ia * ib > 0.f ? abs(lum(A) - lum(B)) : 0.f;
+        qbest = min(qbest, q);
+        acc += wbl * pk;
+        wsum += wbl;
+    }
+    int i = gy * p.w + gx;
+    vec3 o = acc / max(wsum, 1e-12f);
+    mc_data[i] = o.r;
+    mc_data[p.w * p.h + i] = o.g;
+    mc_data[2 * p.w * p.h + i] = o.b;
+    q_data[i] = qbest;
+
+    // bord de cadre : le vecteur du bloc courant échantillonne à moins de 16 px du bord
+    vec2 vb = field[clamp(gy / 16, 0, p.bh - 1) * p.bw + clamp(gx / 16, 0, p.bw - 1)];
+    float e = 0.f;
+    for (int s = 0; s < 2; s++)
+    {
+        float k = s == 0 ? -p.t : 1.f - p.t;
+        float x = float(gx) + k * vb.x;
+        float y = float(gy) + k * vb.y;
+        if (x < 16.f || y < 16.f || x > float(p.iw - 17) || y > float(p.ih - 17))
+            e = 1.f;
+    }
+    edge_data[i] = e;
+}

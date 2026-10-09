@@ -1,0 +1,121 @@
+// Muxiveo — conversion trame YUV brute (y4m) -> RGB planaire normalisé
+// paddé pour le réseau RIFE. Échantillons 8 bits ou 16 bits little-endian,
+// empaquetés dans des mots 32 bits. Suréchantillonnage chroma par axe :
+// co-situé -> linéaire entre échantillons, centré -> réplication ; avec
+// rgb_to_yuv (échantillonnage ponctuel / moyenne 2 taps), l'aller-retour est
+// exact sur les zones statiques. Aucun écrêtage : RIFE v4 ne fait que déformer
+// et mélanger les trames, les valeurs hors gamut sont conservées.
+
+#version 450
+
+#if NCNN_fp16_storage
+#extension GL_EXT_shader_16bit_storage: require
+#endif
+
+layout (binding = 0) readonly buffer src_blob { uint src_data[]; };
+layout (binding = 1) writeonly buffer dst_blob { sfp dst_data[]; };
+
+layout (push_constant) uniform parameter
+{
+    int w;
+    int h;
+    int cw;
+    int ch;
+    int u_offset;
+    int v_offset;
+    int bytes_per_sample;
+    int outw;
+    int outh;
+    int outcstep;
+    int cx_mode;
+    int cy_mode;
+
+    float y_off;
+    float y_scale;
+    float c_off;
+    float c_scale;
+    float kr;
+    float kb;
+} p;
+
+float fetch(int idx)
+{
+    if (p.bytes_per_sample == 2)
+    {
+        uint word = src_data[idx >> 1];
+        return float((idx & 1) == 0 ? (word & 0xffffu) : (word >> 16));
+    }
+    uint word = src_data[idx >> 2];
+    return float((word >> (8 * (idx & 3))) & 0xffu);
+}
+
+// mode 0 : pas de sous-échantillonnage ; 1 : co-situé ; 2 : centré
+void chroma_axis(int x, int mode, int size, out int i0, out int i1, out float f)
+{
+    if (mode == 0)
+    {
+        i0 = min(x, size - 1);
+        i1 = i0;
+        f = 0.0;
+        return;
+    }
+    i0 = min(x / 2, size - 1);
+    if (mode == 2)
+    {
+        i1 = i0;
+        f = 0.0;
+        return;
+    }
+    i1 = min(i0 + 1, size - 1);
+    f = (x & 1) == 1 ? 0.5 : 0.0;
+}
+
+float chroma(int base, int x, int y)
+{
+    int u0;
+    int u1;
+    int v0;
+    int v1;
+    float fu;
+    float fv;
+    chroma_axis(x, p.cx_mode, p.cw, u0, u1, fu);
+    chroma_axis(y, p.cy_mode, p.ch, v0, v1, fv);
+
+    float a = fetch(base + v0 * p.cw + u0);
+    float b = fetch(base + v0 * p.cw + u1);
+    float c = fetch(base + v1 * p.cw + u0);
+    float d = fetch(base + v1 * p.cw + u1);
+    return mix(mix(a, b, fu), mix(c, d, fu), fv);
+}
+
+void main()
+{
+    int gx = int(gl_GlobalInvocationID.x);
+    int gy = int(gl_GlobalInvocationID.y);
+    int gz = int(gl_GlobalInvocationID.z);
+
+    if (gx >= p.outw || gy >= p.outh || gz >= 1)
+        return;
+
+    int o = gy * p.outw + gx;
+
+    if (gx >= p.w || gy >= p.h)
+    {
+        dst_data[o] = sfp(0.f);
+        dst_data[p.outcstep + o] = sfp(0.f);
+        dst_data[p.outcstep * 2 + o] = sfp(0.f);
+        return;
+    }
+
+    float Y = (fetch(gy * p.w + gx) - p.y_off) * p.y_scale;
+    float Cb = (chroma(p.u_offset, gx, gy) - p.c_off) * p.c_scale;
+    float Cr = (chroma(p.v_offset, gx, gy) - p.c_off) * p.c_scale;
+
+    float R = Y + 2.0 * (1.0 - p.kr) * Cr;
+    float B = Y + 2.0 * (1.0 - p.kb) * Cb;
+    float G = (Y - p.kr * R - p.kb * B) / (1.0 - p.kr - p.kb);
+
+    dst_data[o] = sfp(R);
+    dst_data[p.outcstep + o] = sfp(G);
+    dst_data[p.outcstep * 2 + o] = sfp(B);
+}

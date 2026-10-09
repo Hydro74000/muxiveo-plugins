@@ -1,0 +1,74 @@
+// Muxiveo — sélecteur : image finale = somme des candidats pondérée par les poids des blocs, interpolés
+// bilinéairement entre les centres de blocs (pas de couture). Hors image utile : R1.
+
+#version 450
+
+#if NCNN_fp16_storage
+#extension GL_EXT_shader_16bit_storage: require
+#endif
+
+layout (binding = 0) readonly buffer r1_blob { sfp r1[]; };
+layout (binding = 1) readonly buffer r05_blob { sfp r05[]; };
+layout (binding = 2) readonly buffer mc_blob { sfp mc[]; };
+layout (binding = 3) readonly buffer rb_blob { sfp rb[]; };
+layout (binding = 4) readonly buffer nv_blob { sfp nv[]; };
+layout (binding = 5) readonly buffer w_blob { float weights[]; };
+layout (binding = 6) writeonly buffer out_blob { sfp out_data[]; };
+
+layout (push_constant) uniform parameter
+{
+    int w;
+    int h;
+    int pw;
+    int ph;
+    int nbx;
+    int nby;
+    int block;
+    int cands;
+    int cs_r1;
+    int cs_r05;
+    int cs_mc;
+    int cs_rb;
+    int cs_nv;
+    int cs_out;
+} p;
+
+float wt(int bx, int by, int s)
+{
+    return weights[(clamp(by, 0, p.nby - 1) * p.nbx + clamp(bx, 0, p.nbx - 1)) * 5 + s];
+}
+
+void main()
+{
+    int gx = int(gl_GlobalInvocationID.x);
+    int gy = int(gl_GlobalInvocationID.y);
+    if (gx >= p.pw || gy >= p.ph)
+        return;
+    int i = gy * p.pw + gx;
+    if (gx >= p.w || gy >= p.h)
+    {
+        for (int c = 0; c < 3; c++)
+            out_data[c * p.cs_out + i] = r1[c * p.cs_r1 + i];
+        return;
+    }
+    float cx = (float(gx) + 0.5f) / float(p.block) - 0.5f;
+    float cy = (float(gy) + 0.5f) / float(p.block) - 0.5f;
+    int x0 = int(floor(cx));
+    int y0 = int(floor(cy));
+    float fx = clamp(cx - float(x0), 0.f, 1.f);
+    float fy = clamp(cy - float(y0), 0.f, 1.f);
+    float w5[5];
+    for (int s = 0; s < 5; s++)
+        w5[s] = mix(mix(wt(x0, y0, s), wt(x0 + 1, y0, s), fx), mix(wt(x0, y0 + 1, s), wt(x0 + 1, y0 + 1, s), fx), fy);
+    for (int c = 0; c < 3; c++)
+    {
+        float v = w5[0] * float(r1[c * p.cs_r1 + i]) + w5[2] * float(mc[c * p.cs_mc + i]);
+        if ((p.cands & 2) != 0)
+            v += w5[1] * float(r05[c * p.cs_r05 + i]);
+        if ((p.cands & 8) != 0)
+            v += w5[3] * float(rb[c * p.cs_rb + i]);
+        if ((p.cands & 16) != 0)
+            v += w5[4] * float(nv[c * p.cs_nv + i]);
+        out_data[c * p.cs_out + i] = sfp(v);
+    }
+}

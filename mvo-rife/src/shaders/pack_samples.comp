@@ -1,0 +1,49 @@
+// Muxiveo — quantification (arrondi + saturation) des codes YUV flottants
+// et empaquetage en mots 32 bits (2 échantillons 16 bits ou 4 échantillons 8 bits),
+// directement au format d'une trame y4m.
+
+#version 450
+
+layout (binding = 0) readonly buffer src_blob { float src_data[]; };
+layout (binding = 1) writeonly buffer dst_blob { uint dst_data[]; };
+
+layout (push_constant) uniform parameter
+{
+    int total;
+    int words;
+    int bytes_per_sample;
+    int dispatch_w;
+    float maxcode;
+} p;
+
+uint quantize(int idx)
+{
+    if (idx >= p.total)
+        return 0u;
+    return uint(clamp(floor(src_data[idx] + 0.5), 0.0, p.maxcode));
+}
+
+void main()
+{
+    int gx = int(gl_GlobalInvocationID.x);
+    int gy = int(gl_GlobalInvocationID.y);
+    int gz = int(gl_GlobalInvocationID.z);
+
+    if (gx >= p.dispatch_w || gz >= 1)
+        return;
+
+    int k = gy * p.dispatch_w + gx;
+    if (k >= p.words)
+        return;
+
+    if (p.bytes_per_sample == 2)
+    {
+        int s = k * 2;
+        dst_data[k] = quantize(s) | (quantize(s + 1) << 16);
+    }
+    else
+    {
+        int s = k * 4;
+        dst_data[k] = quantize(s) | (quantize(s + 1) << 8) | (quantize(s + 2) << 16) | (quantize(s + 3) << 24);
+    }
+}

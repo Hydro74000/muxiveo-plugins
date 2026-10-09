@@ -1,0 +1,37 @@
+// Muxiveo — MC : filtre séparable (moyenne ou maximum) sur un axe, rayon r, bords répliqués.
+// En option, seuillage préalable de l'entrée (valeur > thr → 1, sinon 0).
+
+#version 450
+
+layout (binding = 0) readonly buffer src_blob { float src[]; };
+layout (binding = 1) writeonly buffer dst_blob { float dst[]; };
+
+layout (push_constant) uniform parameter
+{
+    int w;
+    int h;
+    int r;
+    int axis;      // 0 : horizontal, 1 : vertical
+    int op;        // 0 : moyenne, 1 : maximum
+    int threshold; // 1 : entrée seuillée à thr
+    float thr;
+} p;
+
+void main()
+{
+    int gx = int(gl_GlobalInvocationID.x);
+    int gy = int(gl_GlobalInvocationID.y);
+    if (gx >= p.w || gy >= p.h)
+        return;
+    float acc = p.op == 0 ? 0.f : -3.4e38f;
+    for (int k = -p.r; k <= p.r; k++)
+    {
+        int x = p.axis == 0 ? clamp(gx + k, 0, p.w - 1) : gx;
+        int y = p.axis == 1 ? clamp(gy + k, 0, p.h - 1) : gy;
+        float v = src[y * p.w + x];
+        if (p.threshold != 0)
+            v = v > p.thr ? 1.f : 0.f;
+        acc = p.op == 0 ? acc + v : max(acc, v);
+    }
+    dst[gy * p.w + gx] = p.op == 0 ? acc / float(2 * p.r + 1) : acc;
+}

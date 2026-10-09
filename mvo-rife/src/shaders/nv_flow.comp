@@ -1,0 +1,54 @@
+// Muxiveo — candidat NV (flux NVIDIA dense), passe 1 : incohérence aller / retour par pixel.
+// Flux sur la grille NVOF (gw × gh cellules, px pleine résolution), interpolés bilinéairement comme
+// un agrandissement « align_corners=False » de la grille à la taille de l'image.
+// inc0(x) = |f01(x) + f10(x + f01(x))| (repère de la source 0), inc1(x) = |f10(x) + f01(x + f10(x))|.
+
+#version 450
+
+layout (binding = 0) readonly buffer fwd_blob { float fwd[]; };   // (gh, gw, 2)
+layout (binding = 1) readonly buffer bwd_blob { float bwd[]; };
+layout (binding = 2) writeonly buffer inc_blob { float inc[]; };  // 2 plans w × h : inc0, inc1
+
+layout (push_constant) uniform parameter
+{
+    int w;
+    int h;
+    int gw;
+    int gh;
+} p;
+
+vec2 grid_at(int which, int gx, int gy)
+{
+    int i = (clamp(gy, 0, p.gh - 1) * p.gw + clamp(gx, 0, p.gw - 1)) * 2;
+    return which == 0 ? vec2(fwd[i], fwd[i + 1]) : vec2(bwd[i], bwd[i + 1]);
+}
+
+// flux au point (px, py) en pixels de l'image
+vec2 flow_at(int which, float px, float py)
+{
+    float sx = max((px + 0.5f) * float(p.gw) / float(p.w) - 0.5f, 0.f);
+    float sy = max((py + 0.5f) * float(p.gh) / float(p.h) - 0.5f, 0.f);
+    int x0 = int(floor(sx));
+    int y0 = int(floor(sy));
+    float fx = sx - float(x0);
+    float fy = sy - float(y0);
+    return mix(mix(grid_at(which, x0, y0), grid_at(which, x0 + 1, y0), fx),
+               mix(grid_at(which, x0, y0 + 1), grid_at(which, x0 + 1, y0 + 1), fx), fy);
+}
+
+void main()
+{
+    int gx = int(gl_GlobalInvocationID.x);
+    int gy = int(gl_GlobalInvocationID.y);
+    if (gx >= p.w || gy >= p.h)
+        return;
+    float x = float(gx);
+    float y = float(gy);
+    vec2 f01 = flow_at(0, x, y);
+    vec2 f10 = flow_at(1, x, y);
+    vec2 q0 = clamp(vec2(x, y) + f01, vec2(0.f), vec2(float(p.w - 1), float(p.h - 1)));
+    vec2 q1 = clamp(vec2(x, y) + f10, vec2(0.f), vec2(float(p.w - 1), float(p.h - 1)));
+    int i = gy * p.w + gx;
+    inc[i] = length(f01 + flow_at(1, q0.x, q0.y));
+    inc[p.w * p.h + i] = length(f10 + flow_at(0, q1.x, q1.y));
+}

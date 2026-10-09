@@ -1,0 +1,1452 @@
+// Muxiveo — muxiveo-rife : interpolation d'images RIFE v4 (Vulkan/ncnn) en flux y4m.
+//
+//   ffmpeg -i src.mkv -f yuv4mpegpipe -strict -1 - | muxiveo-rife --factor 2 | encodeur
+//
+// Les trames d'origine sont recopiées octet pour octet ; seules les trames
+// intermédiaires sont générées. Les changements de scène (et les trames
+// identiques) produisent une duplication au lieu d'une interpolation.
+
+#include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <cmath>
+#include <condition_variable>
+#include <csignal>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <deque>
+#include <filesystem>
+#include <future>
+#include <memory>
+#include <mutex>
+#include <numeric>
+#include <string>
+#include <thread>
+#include <vector>
+
+#if _WIN32
+#include <fcntl.h>
+#include <io.h>
+#include <windows.h>
+#include <shellapi.h>
+#elif __APPLE__
+#include <mach-o/dyld.h>
+#include <unistd.h>
+#else
+#include <unistd.h>
+#endif
+
+#include "engine.h"
+#include "nvof.h"
+#include "cuda_driver.h"
+#include "trt_backend.h"
+#include "numparse.h"
+#include <limits>
+#include "y4m.h"
+
+#ifndef MUXIVEO_RIFE_VERSION
+#define MUXIVEO_RIFE_VERSION "dev"
+#endif
+#ifndef MUXIVEO_RIFE_NCNN_VERSION
+#define MUXIVEO_RIFE_NCNN_VERSION "?"
+#endif
+
+enum ExitCode
+{
+    EXIT_OK = 0,
+    EXIT_USAGE = 1,
+    EXIT_INPUT = 2,
+    EXIT_GPU = 3,
+    EXIT_IO = 4,
+    EXIT_VRAM = 5,
+};
+
+static const char* DEFAULT_MODEL = "rife-v4.6";
+
+// ---------------------------------------------------------------------------
+// Utilitaires
+// ---------------------------------------------------------------------------
+
+namespace fs = std::filesystem;
+
+static fs::path path_from_utf8(const std::string& s)
+{
+#if _WIN32
+    int n = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, 0, 0);
+    std::wstring w(n > 0 ? n - 1 : 0, L'\0');
+    if (n > 1)
+        MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, &w[0], n);
+    return fs::path(w);
+#else
+    return fs::path(s);
+#endif
+}
+
+static std::string path_to_utf8(const fs::path& p)
+{
+#if _WIN32
+    const std::wstring& w = p.native();
+    int n = WideCharToMultiByte(CP_UTF8, 0, w.c_str(), -1, 0, 0, 0, 0);
+    std::string s(n > 0 ? n - 1 : 0, '\0');
+    if (n > 1)
+        WideCharToMultiByte(CP_UTF8, 0, w.c_str(), -1, &s[0], n, 0, 0);
+    return s;
+#else
+    return p.string();
+#endif
+}
+
+static fs::path executable_dir(const char* argv0)
+{
+#if _WIN32
+    wchar_t buf[32768];
+    DWORD n = GetModuleFileNameW(0, buf, 32768);
+    if (n > 0 && n < 32768)
+        return fs::path(std::wstring(buf, n)).parent_path();
+#elif __APPLE__
+    char buf[4096];
+    uint32_t size = sizeof(buf);
+    if (_NSGetExecutablePath(buf, &size) == 0)
+        return fs::weakly_canonical(fs::path(buf)).parent_path();
+#else
+    std::error_code ec;
+    const fs::path executable = fs::read_symlink("/proc/self/exe", ec);
+    if (!ec)
+        return executable.parent_path();
+#endif
+    return fs::absolute(fs::path(argv0 ? argv0 : ".")).parent_path();
+}
+
+static FILE* open_file(const fs::path& path, bool write)
+{
+#if _WIN32
+    return _wfopen(path.c_str(), write ? L"wb" : L"rb");
+#else
+    return fopen(path.c_str(), write ? "wb" : "rb");
+#endif
+}
+
+static bool parse_ratio(const std::string& s, int64_t& num, int64_t& den)
+{
+    int64_t n = 0, d = 1;
+    const size_t sep = s.find_first_of("/:");
+    if (sep != std::string::npos)
+    {
+        // « a/b » ou « a:b » : deux entiers stricts, chacun sur 31 bits.
+        if (!parse_int64_strict(s.substr(0, sep), 1, Y4M_MAX_RATE_TERM, n)
+                || !parse_int64_strict(s.substr(sep + 1), 1, Y4M_MAX_RATE_TERM, d))
+            return false;
+    }
+    else
+    {
+        // décimal toléré (ex. 59.94) : converti en fraction /1000 ; NaN, infini
+        // et suffixes refusés.
+        double v = 0.0;
+        if (!parse_double_strict(s, 0.0, (double)Y4M_MAX_RATE_TERM, v))
+            return false;
+        if (std::floor(v) == v)
+        {
+            n = (int64_t)v;
+            d = 1;
+        }
+        else
+        {
+            n = (int64_t)std::llround(v * 1000.0);
+            d = 1000;
+        }
+    }
+    if (n <= 0 || d <= 0)
+        return false;
+    int64_t g = std::gcd(n, d);
+    num = n / g;
+    den = d / g;
+    return true;
+}
+
+// Option entière stricte : message d'erreur explicite si la valeur est invalide.
+static bool parse_int_option(const std::string& name, const std::string& text, int64_t min_value,
+                             int64_t max_value, int& out, std::string& error)
+{
+    int64_t value = 0;
+    if (!parse_int64_strict(text, min_value, max_value, value))
+    {
+        error = name + " : entier attendu entre " + std::to_string(min_value) + " et "
+                + std::to_string(max_value) + " (reçu : " + text + ")";
+        return false;
+    }
+    out = (int)value;
+    return true;
+}
+
+static bool parse_double_option(const std::string& name, const std::string& text, double min_value,
+                                double max_value, double& out, std::string& error)
+{
+    if (!parse_double_strict(text, min_value, max_value, out))
+    {
+        error = name + " : nombre fini attendu (reçu : " + text + ")";
+        return false;
+    }
+    return true;
+}
+
+static void reduce(int64_t& num, int64_t& den)
+{
+    int64_t g = std::gcd(num, den);
+    if (g > 1)
+    {
+        num /= g;
+        den /= g;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tampons et files bornées
+// ---------------------------------------------------------------------------
+
+typedef std::vector<uint32_t> Words;
+typedef std::shared_ptr<Words> FrameBuffer;
+
+class BufferPool
+{
+public:
+    explicit BufferPool(size_t _words) : words(_words) {}
+
+    ~BufferPool()
+    {
+        for (Words* w : free_list)
+            delete w;
+    }
+
+    FrameBuffer acquire()
+    {
+        Words* buf = 0;
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            if (!free_list.empty())
+            {
+                buf = free_list.back();
+                free_list.pop_back();
+            }
+        }
+        if (!buf)
+            buf = new Words(words, 0u);
+        return FrameBuffer(buf, [this](Words* p) {
+            std::lock_guard<std::mutex> lock(mutex);
+            free_list.push_back(p);
+        });
+    }
+
+private:
+    size_t words;
+    std::mutex mutex;
+    std::vector<Words*> free_list;
+};
+
+template <typename T>
+class BoundedQueue
+{
+public:
+    explicit BoundedQueue(size_t _capacity) : capacity(_capacity), closed(false) {}
+
+    bool push(T item)
+    {
+        std::unique_lock<std::mutex> lock(mutex);
+        cond_not_full.wait(lock, [this] { return closed || items.size() < capacity; });
+        if (closed)
+            return false;
+        items.push_back(std::move(item));
+        cond_not_empty.notify_one();
+        return true;
+    }
+
+    // Retourne false quand la file est fermée et vide.
+    bool pop(T& item)
+    {
+        std::unique_lock<std::mutex> lock(mutex);
+        cond_not_empty.wait(lock, [this] { return closed || !items.empty(); });
+        if (items.empty())
+            return false;
+        item = std::move(items.front());
+        items.pop_front();
+        cond_not_full.notify_one();
+        return true;
+    }
+
+    void close()
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        closed = true;
+        cond_not_empty.notify_all();
+        cond_not_full.notify_all();
+    }
+
+private:
+    size_t capacity;
+    bool closed;
+    std::deque<T> items;
+    std::mutex mutex;
+    std::condition_variable cond_not_empty;
+    std::condition_variable cond_not_full;
+};
+
+// ---------------------------------------------------------------------------
+// Détection de changement de scène (score façon ffmpeg scdet, luma seule)
+// ---------------------------------------------------------------------------
+
+static inline uint32_t sample_at(const uint8_t* data, int64_t idx, int bps)
+{
+    if (bps == 2)
+        return (uint32_t)data[idx * 2] | ((uint32_t)data[idx * 2 + 1] << 8);
+    return data[idx];
+}
+
+// Différence absolue moyenne de luma, en pourcentage de la pleine échelle.
+static double luma_mafd(const uint8_t* a, const uint8_t* b, const FrameFormat& fmt)
+{
+    const int step = std::max(1, std::min(fmt.width, fmt.height) / 540);
+    const int bps = fmt.bytes_per_sample;
+    uint64_t sad = 0;
+    uint64_t count = 0;
+    for (int y = 0; y < fmt.height; y += step)
+    {
+        const int64_t row = (int64_t)y * fmt.width;
+        for (int x = 0; x < fmt.width; x += step)
+        {
+            int32_t d = (int32_t)sample_at(a, row + x, bps) - (int32_t)sample_at(b, row + x, bps);
+            sad += (uint64_t)(d < 0 ? -d : d);
+            count++;
+        }
+    }
+    if (count == 0)
+        return 0.0;
+    return (double)sad * 100.0 / (double)count / (double)(1u << fmt.bit_depth);
+}
+
+// ---------------------------------------------------------------------------
+// Options
+// ---------------------------------------------------------------------------
+
+struct Options
+{
+    std::string input = "-";
+    std::string output = "-";
+    std::string model = DEFAULT_MODEL;
+    std::string factor;
+    std::string fps;
+    std::string matrix;
+    std::string range;
+    std::string chroma_loc;
+    int gpu = -1;
+    int threads = 2;
+    int padding = 0;
+    int tta = 1;
+    std::string engine = "rife";   // rife | hybrid | mc (diagnostic)
+    std::string nvof = "auto";     // auto | off : flux optique matériel NVIDIA si disponible
+    std::string large_motion = "auto";  // auto | off | seuil (px) : moteur hybride, RIFE demi-résolution sur les grands mouvements
+    double large_motion_px = 16.0;      // seuil bas (déplacement entre les sources) ; remplacement complet à 3x
+    std::string selector = "auto";      // auto | off : moteur hybride, choix appris des candidats par bloc
+    bool ultra = false;                 // moteur hybride : candidat supplémentaire RIFE inversé
+    std::string backend = "auto";  // auto | vulkan | tensorrt : inférence RIFE
+    std::string trt_plugin;        // dossier du plugin TensorRT (mvo-rife-trt), vide = Vulkan
+    std::string trt_cache;         // moteurs et caches TensorRT (défaut : cache utilisateur)
+    double scene_threshold = 10.0;
+    bool fp32 = false;
+    bool uhd = false;
+    bool list_gpus = false;
+    bool version = false;
+    bool quiet = false;
+    bool verbose = false;
+    bool allow_interlaced = false;
+    bool roundtrip = false;
+    double progress_interval = 1.0;
+};
+
+static void print_usage(FILE* fp)
+{
+    fprintf(fp,
+            "Usage : muxiveo-rife [options]\n"
+            "  -i <fichier|->          entrée y4m (défaut : stdin)\n"
+            "  -o <fichier|->          sortie y4m (défaut : stdout)\n"
+            "  --factor <n|p/q>        multiplicateur de cadence (défaut : 2)\n"
+            "  --fps <num/den>         cadence de sortie cible (exclusif avec --factor)\n"
+            "  -m, --model <nom|dir>   modèle RIFE v4 (défaut : %s, cherché dans <exe>/rife-models)\n"
+            "  -g, --gpu <index>       GPU Vulkan (défaut : automatique)\n"
+            "  --matrix <m>            bt709 | bt2020nc | bt601 | smpte240m | fcc\n"
+            "  --range <r>             limited | full (défaut : en-tête y4m, sinon limited)\n"
+            "  --chroma-loc <l>        left | center | topleft (défaut : en-tête y4m, sinon left)\n"
+            "  --scene-threshold <s>   seuil de changement de scène 0-100 (défaut : 10 ; 0 = désactivé)\n"
+            "  --uhd                   mode rapide : flux optique à demi-résolution (échelles x2)\n"
+            "  --fp32                  calcul en float32 (plus lent, précision maximale)\n"
+            "  --tta <n>               moyenne de n variantes : 2 = + sens temporel inverse, 4 = + miroir\n"
+            "                          horizontal, 8 = + miroirs vertical et double (coût x n ; défaut : 1)\n"
+            "  --engine <e>            rife (défaut) | hybrid : RIFE + compensation de mouvement par blocs,\n"
+            "                          robuste sur les motifs fins répétitifs | mc : compensation seule (diagnostic)\n"
+            "  --trt-plugin <dossier>  plugin TensorRT (mvo-rife-trt) : inférence RIFE sur les Tensor Cores\n"
+            "                          des GPU NVIDIA Turing ou plus récents ; repli Vulkan sinon\n"
+            "  --trt-cache <dossier>   moteurs et caches TensorRT (défaut : cache utilisateur)\n"
+            "  --backend <b>           auto (défaut) | vulkan | tensorrt (erreur si indisponible)\n"
+            "  --nvof <auto|off>       moteur hybride : flux optique matériel NVIDIA si le GPU Vulkan est une\n"
+            "                          carte NVIDIA compatible (défaut : auto ; sinon calcul Vulkan seul)\n"
+            "  --large-motion <auto|off|px> moteur hybride : RIFE à flux demi-résolution là où le déplacement\n"
+            "                          entre les sources dépasse le seuil (auto : 16 px, remplacement complet\n"
+            "                          à 3x le seuil ; sans effet avec --uhd)\n"
+            "  --selector <auto|off>   moteur hybride : choix appris, par bloc, entre RIFE, RIFE demi-résolution,\n"
+            "                          compensation de mouvement, RIFE inversé (--ultra) et flux NVIDIA (défaut :\n"
+            "                          auto ; off = ancienne règle fixe, diagnostic ; sans effet avec --uhd)\n"
+            "  --ultra                 moteur hybride : ajoute le candidat RIFE inversé (coût RIFE x2)\n"
+            "  --padding <n>           padding du réseau (défaut : selon le modèle, x2 avec --uhd)\n"
+            "  -j, --threads <n>       threads CPU ncnn (défaut : 2)\n"
+            "  --allow-interlaced      accepter une entrée entrelacée\n"
+            "  --progress-interval <s> intervalle des lignes de progression (défaut : 1)\n"
+            "  --quiet                 pas de ligne de progression\n"
+            "  --verbose               affiche les diagnostics Vulkan de ncnn\n"
+            "  --list-gpus             liste les GPU Vulkan (JSON, disponibilité du flux NVIDIA) et quitte\n"
+            "  --version               affiche la version et quitte\n",
+            DEFAULT_MODEL);
+}
+
+static bool parse_args(const std::vector<std::string>& args, Options& o, std::string& error)
+{
+    for (size_t i = 1; i < args.size(); i++)
+    {
+        const std::string& a = args[i];
+        auto value = [&](std::string& dst) -> bool {
+            if (i + 1 >= args.size())
+            {
+                error = "valeur manquante pour " + a;
+                return false;
+            }
+            dst = args[++i];
+            return true;
+        };
+        std::string v;
+
+        if (a == "-i" || a == "--input") { if (!value(o.input)) return false; }
+        else if (a == "-o" || a == "--output") { if (!value(o.output)) return false; }
+        else if (a == "-m" || a == "--model") { if (!value(o.model)) return false; }
+        else if (a == "--factor") { if (!value(o.factor)) return false; }
+        else if (a == "--fps") { if (!value(o.fps)) return false; }
+        else if (a == "--matrix") { if (!value(o.matrix)) return false; }
+        else if (a == "--range") { if (!value(o.range)) return false; }
+        else if (a == "--chroma-loc") { if (!value(o.chroma_loc)) return false; }
+        else if (a == "-g" || a == "--gpu")
+        {
+            if (!value(v) || !parse_int_option(a, v, -1, std::numeric_limits<int>::max(), o.gpu, error)) return false;
+        }
+        else if (a == "-j" || a == "--threads")
+        {
+            if (!value(v) || !parse_int_option(a, v, 0, std::numeric_limits<int>::max(), o.threads, error)) return false;
+        }
+        else if (a == "--padding")
+        {
+            if (!value(v) || !parse_int_option(a, v, 0, std::numeric_limits<int>::max(), o.padding, error)) return false;
+        }
+        else if (a == "--tta")
+        {
+            if (!value(v)) return false;
+            int64_t tta = 0;
+            if (!parse_int64_strict(v, 1, 8, tta) || (tta != 1 && tta != 2 && tta != 4 && tta != 8))
+            {
+                error = "--tta : 1, 2, 4 ou 8 attendu (reçu : " + v + ")";
+                return false;
+            }
+            o.tta = (int)tta;
+        }
+        else if (a == "--engine")
+        {
+            if (!value(v)) return false;
+            if (v != "rife" && v != "mc" && v != "hybrid")
+            {
+                error = "--engine : rife, mc ou hybrid attendu (reçu : " + v + ")";
+                return false;
+            }
+            o.engine = v;
+        }
+        else if (a == "--trt-plugin") { if (!value(o.trt_plugin)) return false; }
+        else if (a == "--trt-cache") { if (!value(o.trt_cache)) return false; }
+        else if (a == "--backend")
+        {
+            if (!value(v)) return false;
+            if (v != "auto" && v != "vulkan" && v != "tensorrt")
+            {
+                error = "--backend : auto, vulkan ou tensorrt attendu (reçu : " + v + ")";
+                return false;
+            }
+            o.backend = v;
+        }
+        else if (a == "--nvof")
+        {
+            if (!value(v)) return false;
+            if (v != "auto" && v != "off")
+            {
+                error = "--nvof : auto ou off attendu (reçu : " + v + ")";
+                return false;
+            }
+            o.nvof = v;
+        }
+        else if (a == "--selector")
+        {
+            if (!value(v)) return false;
+            if (v != "auto" && v != "off")
+            {
+                error = "--selector : auto ou off attendu (reçu : " + v + ")";
+                return false;
+            }
+            o.selector = v;
+        }
+        else if (a == "--ultra") o.ultra = true;
+        else if (a == "--large-motion")
+        {
+            if (!value(v)) return false;
+            if (v != "auto" && v != "off")
+            {
+                if (!parse_double_option(a, v, 1.0, 4096.0, o.large_motion_px, error))
+                    return false;
+                v = "auto";
+            }
+            o.large_motion = v;
+        }
+        else if (a == "--scene-threshold")
+        {
+            if (!value(v) || !parse_double_option(a, v, 0.0, std::numeric_limits<double>::max(), o.scene_threshold, error)) return false;
+        }
+        else if (a == "--progress-interval")
+        {
+            if (!value(v) || !parse_double_option(a, v, 0.0, std::numeric_limits<double>::max(), o.progress_interval, error)) return false;
+        }
+        else if (a == "--fp32") o.fp32 = true;
+        else if (a == "--uhd") o.uhd = true;
+        else if (a == "--allow-interlaced") o.allow_interlaced = true;
+        else if (a == "--debug-roundtrip") o.roundtrip = true;
+        else if (a == "--quiet") o.quiet = true;
+        else if (a == "--verbose") o.verbose = true;
+        else if (a == "--list-gpus") o.list_gpus = true;
+        else if (a == "--version") o.version = true;
+        else if (a == "-h" || a == "--help")
+        {
+            print_usage(stdout);
+            exit(EXIT_OK);
+        }
+        else
+        {
+            error = "option inconnue : " + a;
+            return false;
+        }
+    }
+    if (!o.factor.empty() && !o.fps.empty())
+    {
+        error = "--factor et --fps sont exclusifs";
+        return false;
+    }
+    return true;
+}
+
+static bool validate_file_paths(const Options& o, std::string& error)
+{
+    // Les pipes n'ont pas de chemin de fichier à comparer. equivalent()
+    // reconnaît aussi les chemins relatifs, liens symboliques et hardlinks.
+    if (o.input == "-" || o.output == "-")
+        return true;
+    std::error_code ec;
+    if (fs::equivalent(path_from_utf8(o.input), path_from_utf8(o.output), ec))
+    {
+        error = "l'entrée et la sortie désignent le même fichier ; choisissez une sortie distincte";
+        return false;
+    }
+    // Une sortie inexistante est normale ; les autres erreurs d'ouverture
+    // restent diagnostiquées par run(), avant le traitement des trames.
+    return true;
+}
+
+static bool resolve_color(const Options& o, const FrameFormat& fmt, ColorParams& color, std::string& error)
+{
+    std::string m = o.matrix;
+    if (m.empty())
+    {
+        m = fmt.height > 576 ? "bt709" : "bt601";
+        fprintf(stderr, "warning: matrice non précisée, %s supposée\n", m.c_str());
+    }
+    if (m == "bt709") { color.kr = 0.2126f; color.kb = 0.0722f; }
+    else if (m == "bt2020nc" || m == "bt2020") { color.kr = 0.2627f; color.kb = 0.0593f; }
+    else if (m == "bt601" || m == "smpte170m" || m == "bt470bg") { color.kr = 0.299f; color.kb = 0.114f; }
+    else if (m == "smpte240m") { color.kr = 0.212f; color.kb = 0.087f; }
+    else if (m == "fcc") { color.kr = 0.30f; color.kb = 0.11f; }
+    else
+    {
+        error = "matrice non supportée : " + m;
+        return false;
+    }
+
+    if (o.range == "full" || o.range == "pc" || o.range == "jpeg")
+        color.full_range = true;
+    else if (o.range == "limited" || o.range == "tv" || o.range == "mpeg")
+        color.full_range = false;
+    else if (o.range.empty())
+        color.full_range = fmt.range == ColorRange::Full;
+    else
+    {
+        error = "plage non supportée : " + o.range;
+        return false;
+    }
+
+    if (o.chroma_loc == "left")
+        color.siting = ChromaSiting::Left;
+    else if (o.chroma_loc == "center")
+        color.siting = ChromaSiting::Center;
+    else if (o.chroma_loc == "topleft")
+        color.siting = ChromaSiting::TopLeft;
+    else if (o.chroma_loc.empty() || o.chroma_loc == "unspecified" || o.chroma_loc == "auto")
+        color.siting = fmt.siting == ChromaSiting::Unknown ? ChromaSiting::Left : fmt.siting;
+    else
+    {
+        error = "position chroma non supportée : " + o.chroma_loc;
+        return false;
+    }
+    return true;
+}
+
+static fs::path resolve_model_dir(const std::string& model, const fs::path& exe_dir)
+{
+    fs::path p = path_from_utf8(model);
+    std::error_code ec;
+    if (fs::is_directory(p, ec))
+        return p;
+    return exe_dir / "rife-models" / p;
+}
+
+static int model_padding(const std::string& name)
+{
+    if (name.find("rife-v4.25-lite") != std::string::npos)
+        return 128;
+    if (name.find("rife-v4.25") != std::string::npos || name.find("rife-v4.26") != std::string::npos)
+        return 64;
+    return 32;
+}
+
+static const uint32_t NVIDIA_VENDOR_ID = 0x10de;
+
+// Rang du GPU Vulkan parmi ceux de même nom (appariement avec l'énumération CUDA).
+static int same_name_rank(int gpu_index)
+{
+    const std::string name = ncnn::get_gpu_info(gpu_index).device_name();
+    int rank = 0;
+    for (int i = 0; i < gpu_index; i++)
+        if (name == ncnn::get_gpu_info(i).device_name())
+            rank++;
+    return rank;
+}
+
+static std::string json_escape(const std::string& s)
+{
+    std::string out;
+    for (char c : s)
+    {
+        if (c == '"' || c == '\\')
+            out.push_back('\\');
+        if ((unsigned char)c >= 0x20)
+            out.push_back(c);
+    }
+    return out;
+}
+
+// Plates-formes du plugin TensorRT (TensorRT for RTX) : Linux et Windows x86-64.
+#if (defined(__x86_64__) || defined(_M_X64)) && !defined(__APPLE__)
+static const bool TRT_PLATFORM = true;
+#else
+static const bool TRT_PLATFORM = false;
+#endif
+
+// Cache des moteurs TensorRT par défaut (Muxiveo passe le sien avec --trt-cache).
+static fs::path default_trt_cache()
+{
+#if _WIN32
+    const char* base = getenv("LOCALAPPDATA");
+    return (base && *base ? fs::path(base) : fs::temp_directory_path()) / "Muxiveo" / "cache" / "trt-engines";
+#else
+    const char* xdg = getenv("XDG_CACHE_HOME");
+    const char* home = getenv("HOME");
+    const fs::path base = xdg && *xdg ? fs::path(xdg) : (home && *home ? fs::path(home) / ".cache" : fs::temp_directory_path());
+    return base / "muxiveo" / "trt-engines";
+#endif
+}
+
+static int list_gpus(const Options& o)
+{
+    const int count = ncnn::get_gpu_count();
+    // Plugin TensorRT éventuel : interface vérifiée une fois pour tous les GPU.
+    const MvoTrtApi* trt_api = nullptr;
+    std::string trt_plugin_error;
+    if (!o.trt_plugin.empty())
+    {
+        void* handle = nullptr;
+        trt_api = TrtBackend::load_api(path_from_utf8(o.trt_plugin), handle, trt_plugin_error);
+    }
+    const int cuda_version = CudaDriver::get().driver_version();
+    const int def = count > 0 ? ncnn::get_default_gpu_index() : -1;
+    printf("{\"version\": \"%s\", \"default\": %d, \"gpus\": [", MUXIVEO_RIFE_VERSION, def);
+    for (int i = 0; i < count; i++)
+    {
+        const ncnn::GpuInfo& info = ncnn::get_gpu_info(i);
+        const char* type = "other";
+        switch (info.type())
+        {
+        case 0: type = "discrete"; break;
+        case 1: type = "integrated"; break;
+        case 2: type = "virtual"; break;
+        case 3: type = "cpu"; break;
+        }
+        // flux optique matériel (moteur hybride) : session d'essai sur ce GPU
+        bool nvof_ok = false;
+        std::string nvof_status = "GPU non NVIDIA";
+        if (info.vendor_id() == NVIDIA_VENDOR_ID)
+        {
+            NvofFlow probe;
+            std::string err;
+            nvof_ok = probe.init(1920, 1080, info.device_name(), same_name_rank(i), err);
+            nvof_status = nvof_ok ? "disponible" : err;
+        }
+        // inférence TensorRT : GPU compatible (Turing+, pilote récent), puis plugin réellement utilisable
+        std::string trt_reason;
+        int ordinal = -1;
+        if (!TRT_PLATFORM)
+            trt_reason = "plate-forme non prise en charge";
+        else
+            ordinal = TrtBackend::cuda_ordinal(info, trt_reason);
+        std::string trt_fields = std::string(", \"trt_compatible\": ") + (ordinal >= 0 ? "true" : "false");
+        if (!o.trt_plugin.empty())
+        {
+            bool trt_ok = false;
+            if (ordinal >= 0 && !trt_api)
+                trt_reason = trt_plugin_error;
+            else if (ordinal >= 0)
+            {
+                char err[512] = {0};
+                trt_ok = trt_api->device_supported(ordinal, err, sizeof err) != 0;
+                trt_reason = trt_ok ? std::string("prêt (") + trt_api->version() + ")" : err;
+            }
+            trt_fields += std::string(", \"trt\": ") + (trt_ok ? "true" : "false");
+        }
+        else if (ordinal >= 0)
+            trt_reason = "compatible";
+        trt_fields += ", \"trt_status\": \"" + json_escape(trt_reason) + "\"";
+        if (info.vendor_id() == NVIDIA_VENDOR_ID && cuda_version > 0)
+            trt_fields += ", \"cuda_driver\": \"" + std::to_string(cuda_version / 1000) + "." + std::to_string((cuda_version % 1000) / 10) + "\"";
+        printf("%s{\"index\": %d, \"name\": \"%s\", \"type\": \"%s\", \"fp16\": %s, \"nvof\": %s, \"nvof_status\": \"%s\"%s}",
+               i ? ", " : "", i, json_escape(info.device_name()).c_str(), type,
+               info.support_fp16_storage() ? "true" : "false", nvof_ok ? "true" : "false",
+               json_escape(nvof_status).c_str(), trt_fields.c_str());
+    }
+    printf("]}\n");
+    return EXIT_OK;
+}
+
+// ---------------------------------------------------------------------------
+// Traitement
+// ---------------------------------------------------------------------------
+
+// Luma 8 bits (entrée du flux optique matériel) depuis une trame y4m brute.
+static void to_luma8(const uint8_t* frame, const FrameFormat& fmt, std::vector<uint8_t>& out, int scale = 1)
+{
+    // scale 2 : moyenne 2×2 (flux calculé à demi-résolution)
+    const int w = fmt.width;
+    const int h = fmt.height;
+    const int ow = (w + scale - 1) / scale;
+    const int oh = (h + scale - 1) / scale;
+    out.resize((size_t)ow * oh);
+    const int shift = fmt.bit_depth - 8;
+    auto at = [&](int x, int y) -> unsigned {
+        const size_t i = (size_t)y * w + x;
+        if (fmt.bytes_per_sample == 1)
+            return frame[i];
+        return ((unsigned)frame[2 * i] | ((unsigned)frame[2 * i + 1] << 8)) >> shift;
+    };
+    for (int y = 0; y < oh; y++)
+    {
+        for (int x = 0; x < ow; x++)
+        {
+            unsigned v;
+            if (scale == 1)
+                v = at(x, y);
+            else
+            {
+                const int x1 = std::min(2 * x + 1, w - 1);
+                const int y1 = std::min(2 * y + 1, h - 1);
+                v = (at(2 * x, 2 * y) + at(x1, 2 * y) + at(2 * x, y1) + at(x1, y1) + 2) / 4;
+            }
+            out[(size_t)y * ow + x] = (uint8_t)std::min(255u, v);
+        }
+    }
+}
+
+struct SourceFrame
+{
+    FrameBuffer data;
+    GpuFrame gpu;
+    int64_t index = -1;
+};
+
+static int run(const Options& o, const fs::path& exe_dir)
+{
+    FILE* in = stdin;
+    FILE* out = stdout;
+    if (o.input != "-")
+    {
+        in = open_file(path_from_utf8(o.input), false);
+        if (!in)
+        {
+            fprintf(stderr, "error: ouverture impossible : %s\n", o.input.c_str());
+            return EXIT_IO;
+        }
+    }
+    if (o.output != "-")
+    {
+        out = open_file(path_from_utf8(o.output), true);
+        if (!out)
+        {
+            fprintf(stderr, "error: création impossible : %s\n", o.output.c_str());
+            return EXIT_IO;
+        }
+    }
+    setvbuf(in, 0, _IOFBF, 1 << 20);
+    setvbuf(out, 0, _IOFBF, 1 << 20);
+
+    std::string error;
+    Y4mReader reader(in);
+    if (!reader.read_header(error))
+    {
+        fprintf(stderr, "error: %s\n", error.c_str());
+        return EXIT_INPUT;
+    }
+    const FrameFormat fmt = reader.format();
+
+    if (!o.allow_interlaced && (fmt.interlace == 't' || fmt.interlace == 'b' || fmt.interlace == 'm'))
+    {
+        fprintf(stderr, "error: entrée entrelacée (I%c) : désentrelacer avant l'interpolation\n", fmt.interlace);
+        return EXIT_INPUT;
+    }
+
+    // rapport de cadence A/B (sortie / entrée)
+    int64_t ra = 2, rb = 1;
+    if (!o.factor.empty() && !parse_ratio(o.factor, ra, rb))
+    {
+        fprintf(stderr, "error: --factor invalide : %s\n", o.factor.c_str());
+        return EXIT_USAGE;
+    }
+    if (!o.fps.empty())
+    {
+        int64_t fn, fd;
+        if (!parse_ratio(o.fps, fn, fd))
+        {
+            fprintf(stderr, "error: --fps invalide : %s\n", o.fps.c_str());
+            return EXIT_USAGE;
+        }
+        if (!mul_int64_checked(fn, fmt.fps_den, ra) || !mul_int64_checked(fd, fmt.fps_num, rb))
+        {
+            fprintf(stderr, "error: --fps hors limites : %s\n", o.fps.c_str());
+            return EXIT_USAGE;
+        }
+        reduce(ra, rb);
+    }
+    // Rapport sur 31 bits : les calculs de planification (indice × rapport)
+    // et de cadence de sortie restent sans dépassement.
+    if (ra > Y4M_MAX_RATE_TERM || rb > Y4M_MAX_RATE_TERM)
+    {
+        fprintf(stderr, "error: rapport de cadence hors limites (%lld/%lld)\n", (long long)ra, (long long)rb);
+        return EXIT_USAGE;
+    }
+    if (o.roundtrip)
+    {
+        ra = 1;
+        rb = 1;
+    }
+    if (ra < rb)
+    {
+        fprintf(stderr, "error: la cadence de sortie doit être supérieure ou égale à la cadence d'entrée\n");
+        return EXIT_USAGE;
+    }
+
+    ColorParams color;
+    if (!resolve_color(o, fmt, color, error))
+    {
+        fprintf(stderr, "error: %s\n", error.c_str());
+        return EXIT_USAGE;
+    }
+
+    FrameFormat out_fmt = fmt;
+    if (!mul_int64_checked(fmt.fps_num, ra, out_fmt.fps_num) || !mul_int64_checked(fmt.fps_den, rb, out_fmt.fps_den))
+    {
+        fprintf(stderr, "error: cadence de sortie hors limites\n");
+        return EXIT_USAGE;
+    }
+    reduce(out_fmt.fps_num, out_fmt.fps_den);
+
+    // moteur GPU
+    const fs::path model_dir = resolve_model_dir(o.model, exe_dir);
+    const std::string model_name = path_to_utf8(model_dir.filename());
+    if (o.ultra && (o.engine != "hybrid" || o.selector != "auto" || o.uhd))
+    {
+        fprintf(stderr, "error: --ultra exige --engine hybrid avec le sélecteur (sans --uhd)\n");
+        return EXIT_USAGE;
+    }
+    if (o.ultra && o.tta > 1)
+    {
+        fprintf(stderr, "error: --ultra et --tta sont incompatibles (le candidat RIFE inversé remplace la moyenne TTA)\n");
+        return EXIT_USAGE;
+    }
+    RifeEngine engine;
+    engine.set_tta(o.tta);
+    engine.set_engine(o.engine == "mc" ? InterpEngine::Mc : (o.engine == "hybrid" ? InterpEngine::Hybrid : InterpEngine::Rife));
+    // jeu de poids du sélecteur selon le modèle RIFE (v4.6 ou v4.15 ; autres modèles : poids v4.15)
+    // poids du sélecteur : famille du modèle RIFE (v4.6, v4.15), variante affinée Muxiveo (« -mvo ») à part
+    std::string sel_family = model_name.find("v4.6") != std::string::npos ? "v46" : "v415";
+    if (model_name.find("-mvo") != std::string::npos)
+        sel_family += "mvo";
+    engine.set_selector(o.selector == "auto" && !o.uhd, sel_family);
+    engine.set_ultra(o.ultra);
+    const bool needs_gpu = ra != rb || o.roundtrip;
+    // moteur hybride : second réseau à flux demi-résolution (padding x2) pour les grands mouvements
+    const bool large_motion = needs_gpu && !o.roundtrip && o.engine == "hybrid" && !o.uhd && o.large_motion == "auto";
+    std::string large_motion_status = o.uhd ? "flux demi-résolution partout (--uhd)" : "désactivé";
+    if (needs_gpu)
+    {
+        if (!engine.init(o.gpu, o.fp32, o.threads, error)
+                || !engine.load_model(model_dir,
+                                      o.padding > 0 ? o.padding : model_padding(model_name) * (o.uhd || large_motion ? 2 : 1),
+                                      o.uhd, error)
+                || !engine.configure(fmt, color, error))
+        {
+            fprintf(stderr, "error: %s\n", error.c_str());
+            return EXIT_GPU;
+        }
+        if (large_motion)
+        {
+            std::string lm_error;
+            engine.set_large_motion_threshold((float)o.large_motion_px);
+            char seuil[64];
+            snprintf(seuil, sizeof seuil, "RIFE flux demi-résolution au-delà de %g px", o.large_motion_px);
+            large_motion_status = engine.load_large_motion_model(model_dir, lm_error)
+                                      ? std::string(seuil)
+                                      : "indisponible (" + lm_error + ")";
+        }
+    }
+
+    // Inférence RIFE par le plugin TensorRT (GPU NVIDIA) si fourni ; repli Vulkan au moindre obstacle.
+    TrtBackend trt;
+    std::string backend_status;
+    if (needs_gpu && !o.roundtrip && o.backend != "vulkan" && !o.trt_plugin.empty())
+    {
+        std::string reason;
+        if (!engine.uses_fp16())
+            reason = "calcul fp32 demandé";
+        else if (trt.load(path_from_utf8(o.trt_plugin), engine.device(), o.quiet, reason)
+                 && trt.open(model_name + (o.uhd ? "-uhd" : ""), engine.padded_width(), engine.padded_height(),
+                             o.trt_cache.empty() ? default_trt_cache() : path_from_utf8(o.trt_cache), reason))
+            engine.set_trt(&trt);
+        backend_status = engine.uses_trt() ? trt.description() : "Vulkan (TensorRT indisponible : " + reason + ")";
+    }
+    // réseau des grands mouvements : modèle « -uhd » du plugin, sinon ncnn Vulkan
+    TrtBackend trt_large;
+    if (engine.uses_trt() && engine.large_motion())
+    {
+        std::string reason;
+        if (trt_large.load(path_from_utf8(o.trt_plugin), engine.device(), o.quiet, reason)
+                && trt_large.open(model_name + "-uhd", engine.padded_width(), engine.padded_height(),
+                                  o.trt_cache.empty() ? default_trt_cache() : path_from_utf8(o.trt_cache), reason))
+        {
+            engine.set_trt_large(&trt_large);
+            large_motion_status += " (TensorRT)";
+        }
+        else
+            large_motion_status += " (Vulkan : " + reason + ")";
+    }
+    if (needs_gpu && !o.roundtrip && o.backend == "tensorrt" && !engine.uses_trt())
+    {
+        fprintf(stderr, "error: inférence TensorRT indisponible : %s\n",
+                o.trt_plugin.empty() ? "aucun plugin (--trt-plugin)" : backend_status.c_str());
+        return EXIT_GPU;
+    }
+    if (!o.quiet && !backend_status.empty())
+        fprintf(stderr, "info: inférence RIFE : %s\n", backend_status.c_str());
+
+    // Flux optique matériel : GPU Vulkan NVIDIA + pilote compatible, moteurs hybride / MC.
+    NvofFlow nvof;
+    std::string nvof_status = "désactivé";
+    if (needs_gpu && o.nvof == "auto" && engine.engine() != InterpEngine::Rife)
+    {
+        if (engine.vendor_id() != NVIDIA_VENDOR_ID)
+            nvof_status = "indisponible (GPU non NVIDIA)";
+        else
+        {
+            std::string nerr;
+            nvof_status = nvof.init(fmt.width, fmt.height, engine.device_name(), same_name_rank(engine.gpu_index()), nerr)
+                              ? "actif"
+                              : "indisponible (" + nerr + ")";
+        }
+    }
+
+    if (!o.quiet && engine.engine() != InterpEngine::Rife)
+    {
+        std::string extra;
+        if (engine.engine() == InterpEngine::Hybrid)
+        {
+            extra = " | grands mouvements : " + large_motion_status;
+            const std::string weights = engine.selector_weights_family();
+            const std::string label = std::string(weights.rfind("v46", 0) == 0 ? "v4.6" : "v4.15")
+                                      + (weights.size() > 3 && weights.compare(weights.size() - 3, 3, "mvo") == 0 ? " MVO" : "");
+            extra += engine.selector() ? std::string(" | sélecteur : appris (") + label
+                                             + (weights != sel_family ? ", poids de repli" : "")
+                                             + (o.ultra ? ", Ultra" : "") + ")"
+                                       : std::string(" | sélecteur : règle fixe");
+        }
+        fprintf(stderr, "info: moteur %s | flux optique NVIDIA : %s%s\n", o.engine.c_str(), nvof_status.c_str(), extra.c_str());
+    }
+    int64_t nvof_pair = -1;
+    bool nvof_failed = false;
+    std::vector<uint8_t> luma_a, luma_b;
+    std::vector<int16_t> flow_f, flow_b;
+    bool nvof_pending = false;
+    std::string nvof_err;
+    // déclaré après les tampons qu'il utilise : détruit (donc attendu) avant eux
+    std::future<bool> nvof_job;
+
+    if (!o.quiet)
+    {
+        fprintf(stderr,
+                "info: %dx%d %d bits sous-échantillonnage %d:%d | %lld/%lld -> %lld/%lld fps | modèle %s%s%s | GPU %s (%s)\n",
+                fmt.width, fmt.height, fmt.bit_depth, fmt.sub_x, fmt.sub_y,
+                (long long)fmt.fps_num, (long long)fmt.fps_den,
+                (long long)out_fmt.fps_num, (long long)out_fmt.fps_den,
+                model_name.c_str(), o.uhd ? " (uhd)" : "",
+                o.tta > 1 ? (" (tta x" + std::to_string(o.tta) + ")").c_str() : "",
+                needs_gpu ? engine.device_name().c_str() : "-",
+                engine.uses_fp16() ? "fp16" : "fp32");
+    }
+
+    Y4mWriter writer(out);
+    if (!writer.write_header(out_fmt, reader.passthrough_tokens()))
+    {
+        fprintf(stderr, "error: écriture de l'en-tête impossible\n");
+        return EXIT_IO;
+    }
+
+    const size_t frame_bytes = fmt.frame_bytes();
+    const size_t frame_words = fmt.padded_frame_bytes() / 4;
+    BufferPool pool(frame_words);
+
+    BoundedQueue<FrameBuffer> read_queue(3);
+    BoundedQueue<FrameBuffer> write_queue(4);
+    std::atomic<bool> read_failed(false);
+    std::atomic<bool> write_failed(false);
+    std::string read_error;
+
+    std::thread reader_thread([&] {
+        for (;;)
+        {
+            FrameBuffer buf = pool.acquire();
+            std::string err;
+            int r = reader.read_frame((uint8_t*)buf->data(), err);
+            if (r <= 0)
+            {
+                if (r < 0)
+                {
+                    read_error = err;
+                    read_failed = true;
+                }
+                break;
+            }
+            if (!read_queue.push(buf))
+                break;
+        }
+        read_queue.close();
+    });
+
+    std::thread writer_thread([&] {
+        FrameBuffer buf;
+        while (write_queue.pop(buf))
+        {
+            if (!write_failed && !writer.write_frame((const uint8_t*)buf->data(), frame_bytes))
+            {
+                write_failed = true;
+                write_queue.close();
+            }
+            buf.reset();
+        }
+        if (!write_failed && !writer.flush())
+            write_failed = true;
+    });
+
+    int64_t frames_in = 0;
+    int64_t frames_out = 0;
+    int64_t interpolated = 0;
+    int64_t scene_cuts = 0;
+    int64_t static_pairs = 0;
+    int exit_code = EXIT_OK;
+
+    SourceFrame cur;
+    SourceFrame nxt;
+    bool has_next = false;
+    bool pair_cut = false;
+    bool pair_static = false;
+    double prev_mafd = 0.0;
+
+    auto fetch_next = [&]() -> bool {
+        FrameBuffer buf;
+        if (!read_queue.pop(buf))
+            return false;
+        nxt.data = buf;
+        nxt.gpu.reset();
+        nxt.index = frames_in++;
+        return true;
+    };
+
+    auto analyse_pair = [&]() {
+        const uint8_t* a = (const uint8_t*)cur.data->data();
+        const uint8_t* b = (const uint8_t*)nxt.data->data();
+        const double mafd = luma_mafd(a, b, fmt);
+        const double diff = std::fabs(mafd - prev_mafd);
+        const double score = std::min(100.0, std::min(mafd, diff));
+        prev_mafd = mafd;
+        pair_static = mafd == 0.0 && memcmp(a, b, frame_bytes) == 0;
+        pair_cut = !pair_static && o.scene_threshold > 0.0 && score >= o.scene_threshold;
+        if (pair_static)
+            static_pairs++;
+        if (pair_cut)
+            scene_cuts++;
+    };
+
+    auto emit = [&](const FrameBuffer& buf) -> bool {
+        if (write_failed || !write_queue.push(buf))
+            return false;
+        frames_out++;
+        return true;
+    };
+
+    // échec GPU : mémoire vidéo insuffisante (code dédié) ou erreur d'exécution
+    auto gpu_failure = [&](const std::string& err) {
+        if (engine.out_of_memory())
+        {
+            fprintf(stderr,
+                    "error: mémoire GPU insuffisante (VRAM) pour %dx%d avec le modèle %s : fermer les applications "
+                    "qui utilisent le GPU%s\n",
+                    fmt.width, fmt.height, model_name.c_str(),
+                    o.uhd ? ", ou choisir un modèle plus léger" : ", activer le mode rapide (--uhd) ou choisir un modèle plus léger");
+            exit_code = EXIT_VRAM;
+        }
+        else
+        {
+            fprintf(stderr, "error: %s\n", err.c_str());
+            exit_code = EXIT_GPU;
+        }
+    };
+
+    const auto t_start = std::chrono::steady_clock::now();
+    auto t_report = t_start;
+
+    if (fetch_next())
+    {
+        cur = std::move(nxt);
+        nxt = SourceFrame();
+        has_next = fetch_next();
+        if (has_next)
+            analyse_pair();
+
+        for (int64_t k = 0;; k++)
+        {
+            const int64_t num = k * rb;
+            const int64_t i = num / ra;
+            const int64_t rem = num % ra;
+
+            // avance la fenêtre [cur, nxt] jusqu'à la trame source i
+            bool finished = false;
+            while (cur.index < i)
+            {
+                if (!has_next)
+                {
+                    finished = true;
+                    break;
+                }
+                cur = std::move(nxt);
+                nxt = SourceFrame();
+                has_next = fetch_next();
+                if (has_next)
+                    analyse_pair();
+            }
+            if (finished)
+                break;
+
+            bool ok;
+            if (o.roundtrip)
+            {
+                std::string err;
+                FrameBuffer outbuf = pool.acquire();
+                if (!cur.gpu.ready && !engine.upload((const uint8_t*)cur.data->data(), cur.gpu, err))
+                {
+                    gpu_failure(err);
+                    break;
+                }
+                if (!engine.roundtrip(cur.gpu, (uint8_t*)outbuf->data(), err))
+                {
+                    gpu_failure(err);
+                    break;
+                }
+                ok = emit(outbuf);
+            }
+            else if (rem == 0 || !has_next || pair_cut || pair_static)
+            {
+                // trame d'origine, fin de flux, coupe ou trame figée : duplication exacte
+                ok = emit(cur.data);
+            }
+            else
+            {
+                std::string err;
+                if (!cur.gpu.ready && !engine.upload((const uint8_t*)cur.data->data(), cur.gpu, err))
+                {
+                    gpu_failure(err);
+                    break;
+                }
+                if (!nxt.gpu.ready && !engine.upload((const uint8_t*)nxt.data->data(), nxt.gpu, err))
+                {
+                    gpu_failure(err);
+                    break;
+                }
+                // flux NVOF de la nouvelle paire lancé en parallèle : recouvert par l'inférence RIFE
+                if (nvof.active() && !nvof_failed && cur.index != nvof_pair)
+                {
+                    const uint8_t* fa = (const uint8_t*)cur.data->data();
+                    const uint8_t* fb = (const uint8_t*)nxt.data->data();
+                    nvof_job = std::async(std::launch::async, [&, fa, fb]() {
+                        to_luma8(fa, fmt, luma_a, nvof.scale());
+                        to_luma8(fb, fmt, luma_b, nvof.scale());
+                        return nvof.compute(luma_a.data(), luma_b.data(), flow_f, flow_b, nvof_err);
+                    });
+                    nvof_pending = true;
+                    nvof_pair = cur.index;
+                }
+                auto before_mc = [&]() {
+                    if (!nvof_pending)
+                        return;
+                    nvof_pending = false;
+                    if (nvof_job.get())
+                    {
+                        engine.set_flow_hints(flow_f.data(), flow_b.data(), nvof.grid_w(), nvof.grid_h(), nvof.grid() * nvof.scale(), (float)nvof.scale());
+                        engine.set_dense_flow(flow_f.data(), flow_b.data(), nvof.grid_w(), nvof.grid_h(), (float)nvof.scale());
+                    }
+                    else
+                    {
+                        engine.clear_flow_hints();
+                        engine.clear_dense_flow();
+                        if (!o.quiet)
+                            fprintf(stderr, "warning: flux optique NVIDIA désactivé (%s)\n", nvof_err.c_str());
+                        nvof_failed = true;
+                    }
+                };
+                FrameBuffer outbuf = pool.acquire();
+                const float t = (float)((double)rem / (double)ra);
+                if (!engine.interpolate(cur.gpu, nxt.gpu, t, (uint8_t*)outbuf->data(), err, before_mc))
+                {
+                    gpu_failure(err);
+                    break;
+                }
+                interpolated++;
+                ok = emit(outbuf);
+            }
+            if (!ok)
+            {
+                exit_code = EXIT_IO;
+                break;
+            }
+
+            if (!o.quiet)
+            {
+                const auto now = std::chrono::steady_clock::now();
+                const double since = std::chrono::duration<double>(now - t_report).count();
+                if (since >= o.progress_interval)
+                {
+                    t_report = now;
+                    const double elapsed = std::chrono::duration<double>(now - t_start).count();
+                    fprintf(stderr, "progress in=%lld out=%lld interpolated=%lld scenes=%lld static=%lld fps=%.2f\n",
+                            (long long)frames_in, (long long)frames_out, (long long)interpolated,
+                            (long long)scene_cuts, (long long)static_pairs,
+                            elapsed > 0 ? frames_out / elapsed : 0.0);
+                    fflush(stderr);
+                }
+            }
+        }
+    }
+
+    // libère les trames GPU avant le moteur
+    if (nvof_job.valid())
+        nvof_job.wait();
+    cur.gpu.reset();
+    nxt.gpu.reset();
+
+    if (exit_code != EXIT_OK)
+    {
+        // le lecteur peut rester bloqué sur stdin : sortie immédiate
+        fprintf(stderr, "done in=%lld out=%lld interpolated=%lld scenes=%lld static=%lld exit=%d\n",
+                (long long)frames_in, (long long)frames_out, (long long)interpolated,
+                (long long)scene_cuts, (long long)static_pairs, exit_code);
+        fflush(stderr);
+        std::_Exit(exit_code);
+    }
+
+    read_queue.close();
+    write_queue.close();
+    reader_thread.join();
+    writer_thread.join();
+
+    if (read_failed)
+    {
+        fprintf(stderr, "error: %s\n", read_error.c_str());
+        exit_code = EXIT_INPUT;
+    }
+    if (exit_code == EXIT_OK && write_failed)
+    {
+        fprintf(stderr, "error: écriture de la sortie interrompue (pipe fermé ?)\n");
+        exit_code = EXIT_IO;
+    }
+
+    if (!o.quiet && engine.selector())
+        fprintf(stderr, "info: sélecteur : %lld image(s) avec le candidat flux NVIDIA\n", (long long)engine.selector_frames_nv());
+    if (!o.quiet && engine.large_motion())
+        fprintf(stderr, "info: grands mouvements : %lld paire(s) sur %lld\n", (long long)engine.large_motion_pairs_active(),
+                (long long)engine.large_motion_pairs_total());
+    const double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_start).count();
+    fprintf(stderr, "done in=%lld out=%lld interpolated=%lld scenes=%lld static=%lld seconds=%.2f exit=%d\n",
+            (long long)frames_in, (long long)frames_out, (long long)interpolated,
+            (long long)scene_cuts, (long long)static_pairs, elapsed, exit_code);
+
+    if (in != stdin)
+        fclose(in);
+    if (out != stdout)
+        fclose(out);
+    return exit_code;
+}
+
+// ncnn liste les GPU sur stderr à l'initialisation : masqué hors --verbose.
+static int create_gpu_instance_quiet(bool verbose, const char* driver_path)
+{
+    if (verbose)
+        return ncnn::create_gpu_instance(driver_path);
+
+    fflush(stderr);
+#if _WIN32
+    int saved = _dup(_fileno(stderr));
+    FILE* null_fp = _wfopen(L"NUL", L"w");
+    if (null_fp)
+        _dup2(_fileno(null_fp), _fileno(stderr));
+#else
+    int saved = dup(fileno(stderr));
+    FILE* null_fp = fopen("/dev/null", "w");
+    if (null_fp)
+        dup2(fileno(null_fp), fileno(stderr));
+#endif
+    const int ret = ncnn::create_gpu_instance(driver_path);
+    fflush(stderr);
+#if _WIN32
+    if (saved >= 0)
+    {
+        _dup2(saved, _fileno(stderr));
+        _close(saved);
+    }
+#else
+    if (saved >= 0)
+    {
+        dup2(saved, fileno(stderr));
+        close(saved);
+    }
+#endif
+    if (null_fp)
+        fclose(null_fp);
+    return ret;
+}
+
+static std::vector<std::string> utf8_args(int argc, char** argv)
+{
+    std::vector<std::string> args;
+#if _WIN32
+    (void)argc;
+    (void)argv;
+    int wargc = 0;
+    wchar_t** wargv = CommandLineToArgvW(GetCommandLineW(), &wargc);
+    for (int i = 0; i < wargc; i++)
+    {
+        int n = WideCharToMultiByte(CP_UTF8, 0, wargv[i], -1, 0, 0, 0, 0);
+        std::string s(n > 0 ? n - 1 : 0, '\0');
+        if (n > 1)
+            WideCharToMultiByte(CP_UTF8, 0, wargv[i], -1, &s[0], n, 0, 0);
+        args.push_back(s);
+    }
+    LocalFree(wargv);
+#else
+    for (int i = 0; i < argc; i++)
+        args.push_back(argv[i]);
+#endif
+    return args;
+}
+
+int main(int argc, char** argv)
+{
+#if _WIN32
+    _setmode(_fileno(stdin), _O_BINARY);
+    _setmode(_fileno(stdout), _O_BINARY);
+#else
+    signal(SIGPIPE, SIG_IGN);
+#endif
+
+    Options o;
+    std::string error;
+    if (!parse_args(utf8_args(argc, argv), o, error))
+    {
+        fprintf(stderr, "error: %s\n", error.c_str());
+        print_usage(stderr);
+        return EXIT_USAGE;
+    }
+
+    if (o.version)
+    {
+        printf("muxiveo-rife %s (ncnn %s)\n", MUXIVEO_RIFE_VERSION, MUXIVEO_RIFE_NCNN_VERSION);
+        return EXIT_OK;
+    }
+
+    // Refus avant toute ouverture en écriture et avant l'initialisation GPU.
+    if (!o.list_gpus && !validate_file_paths(o, error))
+    {
+        fprintf(stderr, "error: %s\n", error.c_str());
+        return EXIT_USAGE;
+    }
+
+    const fs::path exe_dir = executable_dir(argc > 0 ? argv[0] : 0);
+
+    // macOS : MoltenVK livré à côté de l'exécutable (sinon chargeur Vulkan système).
+    const char* driver_path = nullptr;
+#if __APPLE__
+    std::string driver_storage;
+    {
+        std::error_code ec;
+        const fs::path moltenvk = exe_dir / "libMoltenVK.dylib";
+        if (fs::is_regular_file(moltenvk, ec))
+        {
+            driver_storage = moltenvk.string();
+            driver_path = driver_storage.c_str();
+        }
+    }
+#endif
+
+    if (create_gpu_instance_quiet(o.verbose, driver_path) != 0 && !o.list_gpus)
+    {
+        fprintf(stderr, "error: Vulkan indisponible (pilote ou chargeur libvulkan absent)\n");
+        return EXIT_GPU;
+    }
+
+    int ret;
+    if (o.list_gpus)
+        ret = list_gpus(o);
+    else
+        ret = run(o, exe_dir);
+
+    ncnn::destroy_gpu_instance();
+    return ret;
+}

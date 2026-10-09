@@ -1,0 +1,40 @@
+// Muxiveo — MC : médiane 3×3 (par composante) d'un champ de vecteurs de blocs.
+
+#version 450
+
+layout (binding = 0) readonly buffer src_blob { vec2 src[]; };
+layout (binding = 1) writeonly buffer dst_blob { vec2 dst[]; };
+
+layout (push_constant) uniform parameter
+{
+    int bw;
+    int bh;
+} p;
+
+float median9(float a[9])
+{
+    for (int i = 0; i < 5; i++)
+        for (int j = i + 1; j < 9; j++)
+            if (a[j] < a[i]) { float t = a[i]; a[i] = a[j]; a[j] = t; }
+    return a[4];
+}
+
+void main()
+{
+    int bx = int(gl_GlobalInvocationID.x);
+    int by = int(gl_GlobalInvocationID.y);
+    if (bx >= p.bw || by >= p.bh)
+        return;
+    float xs[9];
+    float ys[9];
+    int k = 0;
+    for (int j = -1; j <= 1; j++)
+        for (int i = -1; i <= 1; i++)
+        {
+            vec2 v = src[clamp(by + j, 0, p.bh - 1) * p.bw + clamp(bx + i, 0, p.bw - 1)];
+            xs[k] = v.x;
+            ys[k] = v.y;
+            k++;
+        }
+    dst[by * p.bw + bx] = vec2(median9(xs), median9(ys));
+}

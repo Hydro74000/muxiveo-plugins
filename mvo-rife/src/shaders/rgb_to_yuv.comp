@@ -1,0 +1,90 @@
+// Muxiveo — conversion RGB planaire paddé (sortie réseau RIFE) -> codes YUV
+// flottants (non quantifiés), dans l'ordre des plans y4m (Y puis U puis V).
+// gz = 0 : luma ; gz = 1 : chroma, sous-échantillonnée par axe selon le chroma
+// siting : co-situé -> échantillon ponctuel, centré -> moyenne 2 taps
+// (inverses exacts du suréchantillonnage de yuv_to_rgb).
+
+#version 450
+
+#if NCNN_fp16_storage
+#extension GL_EXT_shader_16bit_storage: require
+#endif
+
+layout (binding = 0) readonly buffer src_blob { sfp src_data[]; };
+layout (binding = 1) writeonly buffer dst_blob { float dst_data[]; };
+
+layout (push_constant) uniform parameter
+{
+    int w;
+    int h;
+    int cw;
+    int ch;
+    int u_offset;
+    int v_offset;
+    int inw;
+    int incstep;
+    int cx_mode;
+    int cy_mode;
+
+    float y_off;
+    float y_mul;
+    float c_off;
+    float c_mul;
+    float kr;
+    float kb;
+} p;
+
+vec3 rgb_at(int x, int y)
+{
+    x = clamp(x, 0, p.w - 1);
+    y = clamp(y, 0, p.h - 1);
+    int i = y * p.inw + x;
+    return vec3(float(src_data[i]), float(src_data[p.incstep + i]), float(src_data[p.incstep * 2 + i]));
+}
+
+void main()
+{
+    int gx = int(gl_GlobalInvocationID.x);
+    int gy = int(gl_GlobalInvocationID.y);
+    int gz = int(gl_GlobalInvocationID.z);
+
+    float kg = 1.0 - p.kr - p.kb;
+
+    if (gz == 0)
+    {
+        if (gx >= p.w || gy >= p.h)
+            return;
+
+        vec3 c = rgb_at(gx, gy);
+        float Y = p.kr * c.r + kg * c.g + p.kb * c.b;
+        dst_data[gy * p.w + gx] = Y * p.y_mul + p.y_off;
+        return;
+    }
+
+    if (gz != 1 || gx >= p.cw || gy >= p.ch)
+        return;
+
+    // mode 0 : pas de sous-echantillonnage ; 1 : co-situe (ponctuel) ; 2 : centre (moyenne)
+    int x0 = p.cx_mode == 0 ? gx : gx * 2;
+    int nx = p.cx_mode == 2 ? 2 : 1;
+    int y0 = p.cy_mode == 0 ? gy : gy * 2;
+    int ny = p.cy_mode == 2 ? 2 : 1;
+    float weight = 1.0 / float(nx * ny);
+
+    vec3 acc = vec3(0.0);
+    for (int j = 0; j < ny; j++)
+    {
+        for (int i = 0; i < nx; i++)
+        {
+            acc += rgb_at(x0 + i, y0 + j) * weight;
+        }
+    }
+
+    float Y = p.kr * acc.r + kg * acc.g + p.kb * acc.b;
+    float Cb = (acc.b - Y) / (2.0 * (1.0 - p.kb));
+    float Cr = (acc.r - Y) / (2.0 * (1.0 - p.kr));
+
+    int ci = gy * p.cw + gx;
+    dst_data[p.u_offset + ci] = Cb * p.c_mul + p.c_off;
+    dst_data[p.v_offset + ci] = Cr * p.c_mul + p.c_off;
+}

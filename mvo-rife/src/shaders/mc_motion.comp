@@ -1,0 +1,81 @@
+// Muxiveo — grands mouvements (moteur hybride).
+// mode 0 (grille de blocs) : amplitude du vecteur, dilatée (maximum sur (2r+1)² blocs voisins) ;
+// mode 1 (pixels) : hyb = hyb + w·(r05 − hyb), w = max(rampe(amplitude interpolée, lo, hi), plancher),
+// r05 = RIFE à flux demi-résolution, plancher = mouvement d'ensemble de la paire.
+
+#version 450
+
+#if NCNN_fp16_storage
+#extension GL_EXT_shader_16bit_storage: require
+#endif
+
+layout (binding = 0) readonly buffer field_blob { vec2 field[]; };
+layout (binding = 1) buffer mag_blob { float mag[]; };
+layout (binding = 2) readonly buffer r05_blob { sfp r05_data[]; };
+layout (binding = 3) buffer hyb_blob { sfp hyb_data[]; };
+
+layout (push_constant) uniform parameter
+{
+    int mode;
+    int w;          // dimensions paddées (mode 1)
+    int h;
+    int bw;         // grille de blocs de 16
+    int bh;
+    int radius;     // dilatation, en blocs (mode 0)
+    int hyb_cstep;
+    int r05_cstep;
+    float lo;       // amplitude (px entre les deux sources) où RIFE demi-résolution commence
+    float hi;       // amplitude où il remplace entièrement l'hybride
+    float floor_w;  // poids minimal (mouvement d'ensemble de la paire)
+} p;
+
+float block_mag(int x, int y)
+{
+    return mag[clamp(y, 0, p.bh - 1) * p.bw + clamp(x, 0, p.bw - 1)];
+}
+
+void main()
+{
+    int gx = int(gl_GlobalInvocationID.x);
+    int gy = int(gl_GlobalInvocationID.y);
+
+    if (p.mode == 0)
+    {
+        if (gx >= p.bw || gy >= p.bh)
+            return;
+        float m = 0.f;
+        for (int dy = -p.radius; dy <= p.radius; dy++)
+        {
+            for (int dx = -p.radius; dx <= p.radius; dx++)
+            {
+                int x = clamp(gx + dx, 0, p.bw - 1);
+                int y = clamp(gy + dy, 0, p.bh - 1);
+                m = max(m, length(field[y * p.bw + x]));
+            }
+        }
+        mag[gy * p.bw + gx] = m;
+        return;
+    }
+
+    if (gx >= p.w || gy >= p.h)
+        return;
+    // amplitude interpolée entre les centres des blocs (même grille que la reconstruction MC)
+    float cy = (float(gy) - 7.5f) / 16.f;
+    float cx = (float(gx) - 7.5f) / 16.f;
+    int y0 = int(floor(cy));
+    int x0 = int(floor(cx));
+    float ay = clamp(cy - float(y0), 0.f, 1.f);
+    float ax = clamp(cx - float(x0), 0.f, 1.f);
+    float m = mix(mix(block_mag(x0, y0), block_mag(x0 + 1, y0), ax),
+                  mix(block_mag(x0, y0 + 1), block_mag(x0 + 1, y0 + 1), ax), ay);
+    float wgt = max(clamp((m - p.lo) / max(p.hi - p.lo, 1e-3f), 0.f, 1.f), p.floor_w);
+    if (wgt <= 0.f)
+        return;
+    int i = gy * p.w + gx;
+    for (int c = 0; c < 3; c++)
+    {
+        float hv = float(hyb_data[c * p.hyb_cstep + i]);
+        float rv = float(r05_data[c * p.r05_cstep + i]);
+        hyb_data[c * p.hyb_cstep + i] = sfp(hv + wgt * (rv - hv));
+    }
+}
