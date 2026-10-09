@@ -12,10 +12,20 @@
       }
     },
     "rife-v4.15": {
-      "preset": "quality",
+      "preset": "(CLI)",
       "files": {
         "flownet.param": {"sha256": "13b6407289b9888d65f2da2ad58b40c1db93a0e53cb3add26288f95f36241168", "size": 28659},
         "flownet.bin": {"sha256": "d01f3b9098a999c1aa46607f4851ae728d78866c060f782743b3b80d9fef279a", "size": 10793232}
+      }
+    },
+    "rife-v4.15-mvo1": {
+      "preset": "quality, ultra",
+      "base": "rife-v4.15",
+      "files": {
+        "flownet.param": {"sha256": "13b6407289b9888d65f2da2ad58b40c1db93a0e53cb3add26288f95f36241168", "size": 28659,
+                          "url": "https://github.com/Hydro74000/muxiveo-plugins/releases/download/mvo-rife-models-v1.0.0/rife-v4.15-mvo1-flownet.param"},
+        "flownet.bin": {"sha256": "b34d42adf09ef84ea651e976500a3d305bcb34aad7ff6cd179e823e7534b1e08", "size": 10793232,
+                        "url": "https://github.com/Hydro74000/muxiveo-plugins/releases/download/mvo-rife-models-v1.0.0/rife-v4.15-mvo1-flownet.bin"}
       }
     },
     "rife-v4.15-lite": {

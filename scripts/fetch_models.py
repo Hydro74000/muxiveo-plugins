@@ -50,7 +50,8 @@ def fetch(dest: Path, models: list[str] | None = None) -> int:
             target = model_dir / filename
             if target.is_file() and _sha256(target) == meta["sha256"]:
                 continue
-            url = _raw_url(manifest["source"], manifest["commit"], name, filename)
+            # modèle affiné par Muxiveo : URL de release propre au fichier ; sinon dépôt amont épinglé
+            url = meta.get("url") or _raw_url(manifest["source"], manifest["commit"], name, filename)
             print(f"téléchargement {name}/{filename}", file=sys.stderr)
             with tempfile.NamedTemporaryFile(dir=model_dir, delete=False) as tmp:
                 tmp_path = Path(tmp.name)

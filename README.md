@@ -75,6 +75,47 @@ Avec le plugin TensorRT, ce réseau utilise le modèle `<modèle>-uhd` du plugin
 entière / zone). Vrai 24 → 59,94 en 4K (Vulkan) : +20 % de temps sur une séquence de barreaux où la passe
 s'active pour 43 % des paires, rien sur un plan calme.
 
+## Sélecteur appris (`--selector auto|off`, `--ultra`, 1.6.0)
+
+Le moteur hybride ne combine plus RIFE et la compensation par une règle fixe : un **sélecteur appris** choisit,
+zone par zone, le mélange des candidats calculés pour chaque image :
+
+| Candidat | Origine | Présent |
+|---|---|---|
+| R1 | RIFE (modèle choisi) | toujours |
+| R05 | RIFE à flux demi-résolution | paires à grand mouvement (`--large-motion`) |
+| MC | compensation de mouvement par blocs | toujours |
+| Rbwd | RIFE dans le sens inverse (sources échangées, `1 - t`) | `--ultra` |
+| NV | déformation dense par le flux optique NVIDIA | carte NVIDIA avec NVOFA |
+
+- Blocs proportionnels à la largeur de l'image (`largeur / 120`, de 8 px en SD à 64 px en 8K) : même
+  comportement de la SD à la 8K. Poids des candidats interpolés entre centres de blocs (aucune couture).
+- Indices par bloc : désaccords de chaque candidat avec R1 (et maximum sur 3 × 3 blocs), texture, écart
+  temporel, luminance, incohérence et amplitude du flux NVIDIA, proximité du bord, taille de bloc ; modèle
+  linéaire suivi d'un softmax (`src/shaders/sel_*.comp`, coût négligeable).
+- Poids appris (`src/selector_weights.h`) par famille de modèle RIFE (`rife-v4.6`, `rife-v4.15`,
+  `rife-v4.15-mvo1`), avec et sans flux NVIDIA, et par bande de taille de bloc quand c'est utile.
+- `--ultra` ajoute le candidat Rbwd (une inférence RIFE de plus, environ 1,5 × le temps du préréglage
+  Qualité) ; exige le moteur hybride et le sélecteur, incompatible avec `--uhd` et `--tta`.
+- `--selector off` revient à la règle fixe de la 1.5 (diagnostic).
+
+**Modèle `rife-v4.15-mvo1`** : RIFE v4.15 affiné par Muxiveo, graphe ncnn identique au modèle d'origine
+(seuls les poids changent : même coût, `--uhd` et TensorRT inchangés) ; publié par l'extension
+`mvo-rife-models` du dépôt muxiveo-plugins (release `mvo-rife-models-v1.0.0`) et épinglé par sha256 dans
+`models.json`.
+
+Mesures (images paires interpolées ×2 comparées aux impaires, ΔPSNR-Y moyen par rapport à RIFE v4.15 seul ;
+scènes jamais vues à l'apprentissage : 30 scènes de 10 films en 4K, réduites en 1080p, 720p et SD, et 30
+scènes de 5 titres SD / 720p natifs) :
+
+| Configuration | 4K | 1080p | SD / 720p natifs | SD / 720p réduits |
+|---|---|---|---|---|
+| Hybride 1.5 (règle fixe) | +0,31 | +0,01 | −0,05 | −0,28 |
+| Hybride v4.15-mvo1 (Qualité) | +0,81 | +0,52 | +0,34 | +0,32 |
+| Hybride v4.15-mvo1 + `--ultra` (Ultra) | +0,86 | +0,60 | +0,43 | +0,41 |
+| Qualité sans flux NVIDIA | +0,77 | +0,51 | +0,35 | +0,32 |
+| Hybride v4.6 (Équilibré), par rapport à RIFE v4.6 | +0,73 | +0,60 | +0,43 | +0,55 |
+
 ## Accélération NVIDIA (TensorRT, 1.4.0)
 
 Avec le plugin facultatif `mvo-rife-trt` ([dépôt muxiveo-plugins](https://github.com/Hydro74000/muxiveo-plugins)),
@@ -111,10 +152,11 @@ les erreurs d'appariement de motifs répétitifs (barreaux en panoramique), comm
 
 ```
 info: inférence RIFE : TensorRT, plugin 1.0.0 (TensorRT-RTX 1.6.1)
-info: moteur hybrid | flux optique NVIDIA : actif | grands mouvements : RIFE flux demi-résolution au-delà de 16 px
-info: 3832x1592 10 bits … | 24/1 -> 48/1 fps | modèle rife-v4.26 (uhd) | GPU … (fp16)
+info: moteur hybrid | flux optique NVIDIA : actif | grands mouvements : RIFE flux demi-résolution au-delà de 16 px | sélecteur : appris (v4.15 MVO, Ultra)
+info: 3832x1592 10 bits … | 24/1 -> 48/1 fps | modèle rife-v4.15-mvo1 | GPU … (fp16)
 progress in=120 out=240 interpolated=119 scenes=1 static=0 fps=28.4
 info: grands mouvements : 57 paire(s) sur 238
+info: sélecteur : 238 image(s) avec le candidat flux NVIDIA
 done in=240 out=480 interpolated=238 scenes=1 static=0 seconds=16.89 exit=0
 ```
 
@@ -160,8 +202,9 @@ ou passés avec `-m <dossier>`. Préréglages Muxiveo :
 | Préréglage | Moteur | Modèle |
 |---|---|---|
 | Rapide | `rife` | `rife-v4.6` |
-| Normal (défaut) | `hybrid` | `rife-v4.6` |
-| Qualité | `hybrid` | `rife-v4.15` |
+| Équilibré (défaut) | `hybrid` | `rife-v4.6` |
+| Qualité | `hybrid` | `rife-v4.15-mvo1` |
+| Ultra | `hybrid` + `--ultra` | `rife-v4.15-mvo1` |
 | Light (petites cartes graphiques) | `rife` + `--uhd` | `rife-v4.15-lite` |
 
 Choix issus d'un banc de 17 modèles sur 4 contenus (v4.6 : meilleur VMAF moyen, débit le plus élevé, VRAM la

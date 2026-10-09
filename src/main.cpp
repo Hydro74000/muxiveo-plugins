@@ -346,6 +346,8 @@ struct Options
     std::string nvof = "auto";     // auto | off : flux optique matériel NVIDIA si disponible
     std::string large_motion = "auto";  // auto | off | seuil (px) : moteur hybride, RIFE demi-résolution sur les grands mouvements
     double large_motion_px = 16.0;      // seuil bas (déplacement entre les sources) ; remplacement complet à 3x
+    std::string selector = "auto";      // auto | off : moteur hybride, choix appris des candidats par bloc
+    bool ultra = false;                 // moteur hybride : candidat supplémentaire RIFE inversé
     std::string backend = "auto";  // auto | vulkan | tensorrt : inférence RIFE
     std::string trt_plugin;        // dossier du plugin TensorRT (mvo-rife-trt), vide = Vulkan
     std::string trt_cache;         // moteurs et caches TensorRT (défaut : cache utilisateur)
@@ -390,6 +392,10 @@ static void print_usage(FILE* fp)
             "  --large-motion <auto|off|px> moteur hybride : RIFE à flux demi-résolution là où le déplacement\n"
             "                          entre les sources dépasse le seuil (auto : 16 px, remplacement complet\n"
             "                          à 3x le seuil ; sans effet avec --uhd)\n"
+            "  --selector <auto|off>   moteur hybride : choix appris, par bloc, entre RIFE, RIFE demi-résolution,\n"
+            "                          compensation de mouvement, RIFE inversé (--ultra) et flux NVIDIA (défaut :\n"
+            "                          auto ; off = ancienne règle fixe, diagnostic ; sans effet avec --uhd)\n"
+            "  --ultra                 moteur hybride : ajoute le candidat RIFE inversé (coût RIFE x2)\n"
             "  --padding <n>           padding du réseau (défaut : selon le modèle, x2 avec --uhd)\n"
             "  -j, --threads <n>       threads CPU ncnn (défaut : 2)\n"
             "  --allow-interlaced      accepter une entrée entrelacée\n"
@@ -480,6 +486,17 @@ static bool parse_args(const std::vector<std::string>& args, Options& o, std::st
             }
             o.nvof = v;
         }
+        else if (a == "--selector")
+        {
+            if (!value(v)) return false;
+            if (v != "auto" && v != "off")
+            {
+                error = "--selector : auto ou off attendu (reçu : " + v + ")";
+                return false;
+            }
+            o.selector = v;
+        }
+        else if (a == "--ultra") o.ultra = true;
         else if (a == "--large-motion")
         {
             if (!value(v)) return false;
@@ -868,9 +885,26 @@ static int run(const Options& o, const fs::path& exe_dir)
     // moteur GPU
     const fs::path model_dir = resolve_model_dir(o.model, exe_dir);
     const std::string model_name = path_to_utf8(model_dir.filename());
+    if (o.ultra && (o.engine != "hybrid" || o.selector != "auto" || o.uhd))
+    {
+        fprintf(stderr, "error: --ultra exige --engine hybrid avec le sélecteur (sans --uhd)\n");
+        return EXIT_USAGE;
+    }
+    if (o.ultra && o.tta > 1)
+    {
+        fprintf(stderr, "error: --ultra et --tta sont incompatibles (le candidat RIFE inversé remplace la moyenne TTA)\n");
+        return EXIT_USAGE;
+    }
     RifeEngine engine;
     engine.set_tta(o.tta);
     engine.set_engine(o.engine == "mc" ? InterpEngine::Mc : (o.engine == "hybrid" ? InterpEngine::Hybrid : InterpEngine::Rife));
+    // jeu de poids du sélecteur selon le modèle RIFE (v4.6 ou v4.15 ; autres modèles : poids v4.15)
+    // poids du sélecteur : famille du modèle RIFE (v4.6, v4.15), variante affinée Muxiveo (« -mvo ») à part
+    std::string sel_family = model_name.find("v4.6") != std::string::npos ? "v46" : "v415";
+    if (model_name.find("-mvo") != std::string::npos)
+        sel_family += "mvo";
+    engine.set_selector(o.selector == "auto" && !o.uhd, sel_family);
+    engine.set_ultra(o.ultra);
     const bool needs_gpu = ra != rb || o.roundtrip;
     // moteur hybride : second réseau à flux demi-résolution (padding x2) pour les grands mouvements
     const bool large_motion = needs_gpu && !o.roundtrip && o.engine == "hybrid" && !o.uhd && o.large_motion == "auto";
@@ -953,8 +987,21 @@ static int run(const Options& o, const fs::path& exe_dir)
     }
 
     if (!o.quiet && engine.engine() != InterpEngine::Rife)
-        fprintf(stderr, "info: moteur %s | flux optique NVIDIA : %s%s\n", o.engine.c_str(), nvof_status.c_str(),
-                engine.engine() == InterpEngine::Hybrid ? (" | grands mouvements : " + large_motion_status).c_str() : "");
+    {
+        std::string extra;
+        if (engine.engine() == InterpEngine::Hybrid)
+        {
+            extra = " | grands mouvements : " + large_motion_status;
+            const std::string weights = engine.selector_weights_family();
+            const std::string label = std::string(weights.rfind("v46", 0) == 0 ? "v4.6" : "v4.15")
+                                      + (weights.size() > 3 && weights.compare(weights.size() - 3, 3, "mvo") == 0 ? " MVO" : "");
+            extra += engine.selector() ? std::string(" | sélecteur : appris (") + label
+                                             + (weights != sel_family ? ", poids de repli" : "")
+                                             + (o.ultra ? ", Ultra" : "") + ")"
+                                       : std::string(" | sélecteur : règle fixe");
+        }
+        fprintf(stderr, "info: moteur %s | flux optique NVIDIA : %s%s\n", o.engine.c_str(), nvof_status.c_str(), extra.c_str());
+    }
     int64_t nvof_pair = -1;
     bool nvof_failed = false;
     std::vector<uint8_t> luma_a, luma_b;
@@ -1182,10 +1229,14 @@ static int run(const Options& o, const fs::path& exe_dir)
                         return;
                     nvof_pending = false;
                     if (nvof_job.get())
+                    {
                         engine.set_flow_hints(flow_f.data(), flow_b.data(), nvof.grid_w(), nvof.grid_h(), nvof.grid() * nvof.scale(), (float)nvof.scale());
+                        engine.set_dense_flow(flow_f.data(), flow_b.data(), nvof.grid_w(), nvof.grid_h(), (float)nvof.scale());
+                    }
                     else
                     {
                         engine.clear_flow_hints();
+                        engine.clear_dense_flow();
                         if (!o.quiet)
                             fprintf(stderr, "warning: flux optique NVIDIA désactivé (%s)\n", nvof_err.c_str());
                         nvof_failed = true;
@@ -1257,6 +1308,8 @@ static int run(const Options& o, const fs::path& exe_dir)
         exit_code = EXIT_IO;
     }
 
+    if (!o.quiet && engine.selector())
+        fprintf(stderr, "info: sélecteur : %lld image(s) avec le candidat flux NVIDIA\n", (long long)engine.selector_frames_nv());
     if (!o.quiet && engine.large_motion())
         fprintf(stderr, "info: grands mouvements : %lld paire(s) sur %lld\n", (long long)engine.large_motion_pairs_active(),
                 (long long)engine.large_motion_pairs_total());

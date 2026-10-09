@@ -29,6 +29,12 @@
 #include "mc_luma.comp.hex.h"
 #include "mc_median.comp.hex.h"
 #include "mc_motion.comp.hex.h"
+#include "nv_flow.comp.hex.h"
+#include "nv_warp.comp.hex.h"
+#include "sel_blend.comp.hex.h"
+#include "sel_stats.comp.hex.h"
+#include "sel_weights.comp.hex.h"
+#include "selector_weights.h"
 #include "mc_recon.comp.hex.h"
 #include "mc_region.comp.hex.h"
 #include "mc_search.comp.hex.h"
@@ -99,10 +105,18 @@ RifeEngine::~RifeEngine()
     delete pipeline_mc_region;
     delete pipeline_mc_blend;
     delete pipeline_mc_motion;
+    delete pipeline_nv_flow;
+    delete pipeline_nv_warp;
+    delete pipeline_sel_stats;
+    delete pipeline_sel_weights;
+    delete pipeline_sel_blend;
     delete pipeline_trt_pack;
     dummy.release();
     hints_gpu.release();
     cached_field.release();
+    sel_models.release();
+    dense_f_gpu.release();
+    dense_b_gpu.release();
 
     flownet.clear();
     flownet_lm.clear();
@@ -307,9 +321,15 @@ bool RifeEngine::configure(const FrameFormat& _fmt, const ColorParams& _color, s
         pipeline_mc_region = make_pipeline(mc_region_comp_data, sizeof(mc_region_comp_data), 64, 1, 1);
         pipeline_mc_blend = make_pipeline(mc_blend_comp_data, sizeof(mc_blend_comp_data), 8, 8, 1);
         pipeline_mc_motion = make_pipeline(mc_motion_comp_data, sizeof(mc_motion_comp_data), 8, 8, 1);
+        pipeline_nv_flow = make_pipeline(nv_flow_comp_data, sizeof(nv_flow_comp_data), 8, 8, 1);
+        pipeline_nv_warp = make_pipeline(nv_warp_comp_data, sizeof(nv_warp_comp_data), 8, 8, 1);
+        pipeline_sel_stats = make_pipeline(sel_stats_comp_data, sizeof(sel_stats_comp_data), 8, 8, 1);
+        pipeline_sel_weights = make_pipeline(sel_weights_comp_data, sizeof(sel_weights_comp_data), 8, 8, 1);
+        pipeline_sel_blend = make_pipeline(sel_blend_comp_data, sizeof(sel_blend_comp_data), 8, 8, 1);
         if (!pipeline_mc_luma || !pipeline_mc_down || !pipeline_mc_search || !pipeline_mc_median
                 || !pipeline_mc_recon || !pipeline_mc_filter || !pipeline_mc_region || !pipeline_mc_blend
-                || !pipeline_mc_motion)
+                || !pipeline_mc_motion || !pipeline_nv_flow || !pipeline_nv_warp || !pipeline_sel_stats
+                || !pipeline_sel_weights || !pipeline_sel_blend)
         {
             error = "compilation des shaders de compensation de mouvement impossible";
             return false;
@@ -327,6 +347,8 @@ bool RifeEngine::configure(const FrameFormat& _fmt, const ColorParams& _color, s
             error = "allocation mémoire GPU impossible (MC)";
             return false;
         }
+        if (engine_mode == InterpEngine::Hybrid && !upload_selector_models(error))
+            return false;
     }
     return true;
 }
@@ -888,6 +910,8 @@ bool RifeEngine::infer_rife(ncnn::VkCompute& cmd, const ncnn::VkMat& in0, const 
 bool RifeEngine::interpolate(const GpuFrame& a, const GpuFrame& b, float t, uint8_t* dst, std::string& error,
                              const std::function<void()>& before_mc)
 {
+    if (selector())
+        return interpolate_selector(a, b, t, dst, error, before_mc);
     if (engine_mode != InterpEngine::Rife)
     {
         ncnn::VkMat rife_rgb;
@@ -931,43 +955,52 @@ bool RifeEngine::interpolate(const GpuFrame& a, const GpuFrame& b, float t, uint
 // lm_lo, RIFE à flux demi-résolution remplace progressivement l'image hybride (la
 // compensation par blocs déforme le flou et les occultations, RIFE pleine résolution suit mal les
 // grands déplacements). Décision par paire : sans grand mouvement, aucun calcul supplémentaire.
+// Décision « grands mouvements » une fois par paire : champ de vecteurs relu ; active si >= 1 % des blocs dépassent
+// 1,5 × le seuil ou si le mouvement médian dépasse 1,5 × le seuil (plancher de l'ancienne règle).
+bool RifeEngine::decide_large_motion(ncnn::VkCompute& cmd, const GpuFrame& a, const GpuFrame& b, std::string& error)
+{
+    if (a.id == lm_a && b.id == lm_b)
+        return true;
+    const int bw = (lw[0] + 15) / 16;
+    const int bh = (lh[0] + 15) / 16;
+    ncnn::Option o = opt;
+    o.blob_vkallocator = blob_vkallocator;
+    o.workspace_vkallocator = blob_vkallocator;
+    o.staging_vkallocator = staging_vkallocator;
+    ncnn::Mat field_host;
+    cmd.record_clone(cached_field, field_host, o);
+    if (cmd.submit_and_wait() != 0 || field_host.empty())
+    {
+        error = "échec d'exécution GPU (champ de vecteurs)";
+        return false;
+    }
+    cmd.reset();
+    const float* v = (const float*)field_host.data;
+    std::vector<float> mags(bw * bh);
+    for (int i = 0; i < bw * bh; i++)
+        mags[i] = std::hypot(v[2 * i], v[2 * i + 1]);
+    const float fast = LARGE_MOTION_TRIGGER * lm_lo;
+    const size_t fast_blocks = (size_t)std::count_if(mags.begin(), mags.end(), [fast](float m) { return m > fast; });
+    std::nth_element(mags.begin(), mags.begin() + mags.size() / 2, mags.end());
+    const float median = mags[mags.size() / 2];
+    lm_floor = std::clamp((median - LARGE_MOTION_GLOBAL_LO * lm_lo) / ((LARGE_MOTION_GLOBAL_HI - LARGE_MOTION_GLOBAL_LO) * lm_lo),
+                          0.f, 1.f);
+    lm_a = a.id;
+    lm_b = b.id;
+    lm_active = lm_floor > 0.f || fast_blocks * 100 >= mags.size();
+    lm_pairs_total++;
+    if (lm_active)
+        lm_pairs_active++;
+    return true;
+}
+
 bool RifeEngine::record_large_motion(ncnn::VkCompute& cmd, const GpuFrame& a, const GpuFrame& b, float t,
                                      ncnn::VkMat& out, std::string& error)
 {
     const int bw = (lw[0] + 15) / 16;
     const int bh = (lh[0] + 15) / 16;
-    if (a.id != lm_a || b.id != lm_b)
-    {
-        ncnn::Option o = opt;
-        o.blob_vkallocator = blob_vkallocator;
-        o.workspace_vkallocator = blob_vkallocator;
-        o.staging_vkallocator = staging_vkallocator;
-        ncnn::Mat field_host;
-        cmd.record_clone(cached_field, field_host, o);
-        if (cmd.submit_and_wait() != 0 || field_host.empty())
-        {
-            error = "échec d'exécution GPU (champ de vecteurs)";
-            return false;
-        }
-        cmd.reset();
-        const float* v = (const float*)field_host.data;
-        std::vector<float> mags(bw * bh);
-        for (int i = 0; i < bw * bh; i++)
-            mags[i] = std::hypot(v[2 * i], v[2 * i + 1]);
-        // passe déclenchée si une zone rapide notable existe (>= 1 % des blocs au-delà de 1,5x le seuil)
-        const float fast = LARGE_MOTION_TRIGGER * lm_lo;
-        const size_t fast_blocks = (size_t)std::count_if(mags.begin(), mags.end(), [fast](float m) { return m > fast; });
-        std::nth_element(mags.begin(), mags.begin() + mags.size() / 2, mags.end());
-        const float median = mags[mags.size() / 2];
-        lm_floor = std::clamp((median - LARGE_MOTION_GLOBAL_LO * lm_lo) / ((LARGE_MOTION_GLOBAL_HI - LARGE_MOTION_GLOBAL_LO) * lm_lo),
-                              0.f, 1.f);
-        lm_a = a.id;
-        lm_b = b.id;
-        lm_active = lm_floor > 0.f || fast_blocks * 100 >= mags.size();
-        lm_pairs_total++;
-        if (lm_active)
-            lm_pairs_active++;
-    }
+    if (!decide_large_motion(cmd, a, b, error))
+        return false;
     if (!lm_active)
         return true;
 
@@ -1011,6 +1044,328 @@ bool RifeEngine::record_large_motion(ncnn::VkCompute& cmd, const GpuFrame& a, co
         cmd.record_pipeline(pipeline_mc_motion, bindings, constants, dispatcher);
     }
     return true;
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+std::string RifeEngine::selector_weights_family() const
+{
+    for (int m = 0; m < kSelectorModelCount; m++)
+        if (sel_family == kSelectorModels[m].family)
+            return sel_family;
+    return "v415";
+}
+
+// Sélecteur (moteur hybride) : choix appris, par bloc, entre les candidats R1 (RIFE), R05 (RIFE à flux
+// demi-résolution, paires à grands mouvements), MC (compensation par blocs), Rbwd (RIFE inversé, mode Ultra) et
+// NV (déformation par le flux NVIDIA dense). Poids : selector_weights.h (banc de scènes natives SD → 4K).
+// ---------------------------------------------------------------------------------------------------------------
+
+static ncnn::Option staging_option(const ncnn::Option& base, ncnn::VkAllocator* blob, ncnn::VkAllocator* staging)
+{
+    ncnn::Option o = base;
+    o.blob_vkallocator = blob;
+    o.workspace_vkallocator = blob;
+    o.staging_vkallocator = staging;
+    return o;
+}
+
+bool RifeEngine::upload_selector_models(std::string& error)
+{
+    std::vector<float> host((size_t)kSelectorModelCount * 128, 0.f);
+    for (int m = 0; m < kSelectorModelCount; m++)
+    {
+        const SelectorModel& sm = kSelectorModels[m];
+        float* d = host.data() + (size_t)m * 128;
+        for (int i = 0; i < 16; i++)
+        {
+            d[i] = sm.mu[i];
+            d[16 + i] = sm.sd[i] != 0.f ? sm.sd[i] : 1.f;
+        }
+        for (int i = 0; i < 80; i++)
+            d[32 + i] = sm.weight[i];
+        for (int i = 0; i < 5; i++)
+            d[112 + i] = sm.bias[i];
+    }
+    ncnn::Mat m((int)host.size(), host.data(), (size_t)4u, 1);   // 128 flottants par modèle : multiple de 16 octets
+    ncnn::VkCompute cmd(vkdev);
+    cmd.record_clone(m, sel_models, staging_option(opt, blob_vkallocator, staging_vkallocator));
+    if (cmd.submit_and_wait() != 0 || sel_models.empty())
+    {
+        error = "chargement des poids du sélecteur impossible";
+        return false;
+    }
+    return true;
+}
+
+void RifeEngine::set_dense_flow(const int16_t* fwd, const int16_t* bwd, int gw, int gh, float vscale)
+{
+    const size_t n = (size_t)gw * gh * 2;
+    const size_t padded = (n + 3) / 4 * 4;   // copie hôte -> GPU alignée sur 16 octets (ncnn)
+    dense_f.assign(padded, 0.f);
+    dense_b.assign(padded, 0.f);
+    for (size_t i = 0; i < n; i++)
+    {
+        dense_f[i] = fwd[i] / 32.f * vscale;   // S10.5 à la résolution analysée -> px pleine résolution
+        dense_b[i] = bwd[i] / 32.f * vscale;
+    }
+    dense_gw = gw;
+    dense_gh = gh;
+    dense_valid = true;
+    dense_dirty = true;
+}
+
+bool RifeEngine::record_nv(ncnn::VkCompute& cmd, const GpuFrame& a, const GpuFrame& b, float t, ncnn::VkMat& nv,
+                           ncnn::VkMat& maps, std::string& error)
+{
+    const int w = fmt.width;
+    const int h = fmt.height;
+    if (dense_dirty)
+    {
+        const ncnn::Option o = staging_option(opt, blob_vkallocator, staging_vkallocator);
+        ncnn::Mat f((int)dense_f.size(), dense_f.data(), (size_t)4u, 1);
+        ncnn::Mat bk((int)dense_b.size(), dense_b.data(), (size_t)4u, 1);
+        cmd.record_clone(f, dense_f_gpu, o);
+        cmd.record_clone(bk, dense_b_gpu, o);
+        dense_dirty = false;
+    }
+    ncnn::VkMat inc = float_mat(2 * w * h);
+    maps = float_mat(2 * w * h);
+    nv.create(w_padded, h_padded, 3, a.rgb.elemsize, 1, blob_vkallocator);
+    if (inc.empty() || maps.empty() || nv.empty() || dense_f_gpu.empty() || dense_b_gpu.empty())
+    {
+        error = "allocation mémoire GPU impossible (candidat NV)";
+        return false;
+    }
+    {
+        std::vector<ncnn::VkMat> bindings(3);
+        bindings[0] = dense_f_gpu;
+        bindings[1] = dense_b_gpu;
+        bindings[2] = inc;
+        std::vector<ncnn::vk_constant_type> constants(4);
+        constants[0].i = w;
+        constants[1].i = h;
+        constants[2].i = dense_gw;
+        constants[3].i = dense_gh;
+        ncnn::VkMat dispatcher;
+        dispatcher.w = w;
+        dispatcher.h = h;
+        dispatcher.c = 1;
+        cmd.record_pipeline(pipeline_nv_flow, bindings, constants, dispatcher);
+    }
+    {
+        std::vector<ncnn::VkMat> bindings(7);
+        bindings[0] = dense_f_gpu;
+        bindings[1] = dense_b_gpu;
+        bindings[2] = inc;
+        bindings[3] = a.rgb;
+        bindings[4] = b.rgb;
+        bindings[5] = nv;
+        bindings[6] = maps;
+        std::vector<ncnn::vk_constant_type> constants(9);
+        constants[0].i = w;
+        constants[1].i = h;
+        constants[2].i = w_padded;
+        constants[3].i = h_padded;
+        constants[4].i = (int)a.rgb.cstep;
+        constants[5].i = (int)nv.cstep;
+        constants[6].i = dense_gw;
+        constants[7].i = dense_gh;
+        constants[8].f = t;
+        ncnn::VkMat dispatcher;
+        dispatcher.w = w_padded;
+        dispatcher.h = h_padded;
+        dispatcher.c = 1;
+        cmd.record_pipeline(pipeline_nv_warp, bindings, constants, dispatcher);
+    }
+    return true;
+}
+
+bool RifeEngine::record_selector(ncnn::VkCompute& cmd, const GpuFrame& a, const GpuFrame& b, const ncnn::VkMat* cand[5],
+                                 const ncnn::VkMat& maps, ncnn::VkMat& out, std::string& error)
+{
+    const int w = fmt.width;
+    const int h = fmt.height;
+    // bloc proportionnel à la largeur du contenu : 8 px en SD, 16 en 1080p, 32 en 4K, 64 en 8K
+    const int block = std::clamp((int)std::lround(w / 120.0 / 4.0) * 4, 8, 64);
+    const int nbx = (w + block - 1) / block;
+    const int nby = (h + block - 1) / block;
+    const uint32_t bits = 1u | 4u | (cand[1] ? 2u : 0u) | (cand[3] ? 8u : 0u) | (cand[4] ? 16u : 0u);
+    // poids de la famille du modèle RIFE (sinon v4.15, selector_weights_family) : modèle de la bande de taille de
+    // bloc (SD/720p, 1080p…) s'il existe, sinon modèle global de la famille (bmin = 0)
+    int mi = -1;
+    const std::string families[2] = {sel_family, "v415"};
+    for (int pass = 0; pass < 4 && mi < 0; pass++)
+        for (int m = 0; m < kSelectorModelCount && mi < 0; m++)
+        {
+            const SelectorModel& sm = kSelectorModels[m];
+            const bool band = pass % 2 == 0 ? sm.bmin > 0 && sm.bmin <= block && block <= sm.bmax : sm.bmin == 0;
+            if (sm.candidates == bits && families[pass / 2] == sm.family && band)
+                mi = m;
+        }
+    if (mi < 0)
+    {
+        error = "aucun poids de sélecteur pour ces candidats";
+        return false;
+    }
+    const int nd = 1 + (cand[1] ? 1 : 0) + (cand[3] ? 1 : 0) + (cand[4] ? 1 : 0);
+    const int nfeat = 2 * nd + 3 + (cand[4] ? 2 : 0) + 2;   // + bord, échelle
+    if (kSelectorModels[mi].nfeat != nfeat)
+    {
+        error = "poids du sélecteur incohérents avec les candidats";
+        return false;
+    }
+    ncnn::VkMat stats = float_mat(nbx * nby * 9);
+    ncnn::VkMat weights = float_mat(nbx * nby * 5);
+    out.create(w_padded, h_padded, 3, cand[0]->elemsize, 1, blob_vkallocator);
+    if (stats.empty() || weights.empty() || out.empty())
+    {
+        error = "allocation mémoire GPU impossible (sélecteur)";
+        return false;
+    }
+    auto cs = [](const ncnn::VkMat* m) { return m ? (int)m->cstep : 0; };
+    auto bind = [this](const ncnn::VkMat* m) { return m ? *m : dummy; };
+    {
+        std::vector<ncnn::VkMat> bindings(9);
+        bindings[0] = *cand[0];
+        bindings[1] = bind(cand[1]);
+        bindings[2] = *cand[2];
+        bindings[3] = bind(cand[3]);
+        bindings[4] = bind(cand[4]);
+        bindings[5] = a.rgb;
+        bindings[6] = b.rgb;
+        bindings[7] = cand[4] ? maps : dummy;
+        bindings[8] = stats;
+        std::vector<ncnn::vk_constant_type> constants(17);
+        constants[0].i = w;
+        constants[1].i = h;
+        constants[2].i = w_padded;
+        constants[3].i = nbx;
+        constants[4].i = nby;
+        constants[5].i = block;
+        constants[6].i = (int)bits;
+        constants[7].i = cs(cand[0]);
+        constants[8].i = cs(cand[1]);
+        constants[9].i = cs(cand[2]);
+        constants[10].i = cs(cand[3]);
+        constants[11].i = cs(cand[4]);
+        constants[12].i = (int)a.rgb.cstep;
+        constants[13].f = color.kr;
+        constants[14].f = color.kb;
+        constants[15].f = color.full_range ? 0.f : 64.f / 1023.f;   // luminance d'apprentissage : codes 10 bits / 1023
+        constants[16].f = color.full_range ? 1.f : 876.f / 1023.f;
+        ncnn::VkMat dispatcher;
+        dispatcher.w = nbx;
+        dispatcher.h = nby;
+        dispatcher.c = 1;
+        cmd.record_pipeline(pipeline_sel_stats, bindings, constants, dispatcher);
+    }
+    {
+        std::vector<ncnn::VkMat> bindings(3);
+        bindings[0] = stats;
+        bindings[1] = sel_models;
+        bindings[2] = weights;
+        std::vector<ncnn::vk_constant_type> constants(9);
+        constants[0].i = nbx;
+        constants[1].i = nby;
+        constants[2].i = mi * 128;
+        constants[3].i = nfeat;
+        constants[4].i = (int)bits;
+        constants[5].f = std::log2((float)block / 16.f);
+        constants[6].i = w;
+        constants[7].i = h;
+        constants[8].i = block;
+        ncnn::VkMat dispatcher;
+        dispatcher.w = nbx;
+        dispatcher.h = nby;
+        dispatcher.c = 1;
+        cmd.record_pipeline(pipeline_sel_weights, bindings, constants, dispatcher);
+    }
+    {
+        std::vector<ncnn::VkMat> bindings(7);
+        bindings[0] = *cand[0];
+        bindings[1] = bind(cand[1]);
+        bindings[2] = *cand[2];
+        bindings[3] = bind(cand[3]);
+        bindings[4] = bind(cand[4]);
+        bindings[5] = weights;
+        bindings[6] = out;
+        std::vector<ncnn::vk_constant_type> constants(14);
+        constants[0].i = w;
+        constants[1].i = h;
+        constants[2].i = w_padded;
+        constants[3].i = h_padded;
+        constants[4].i = nbx;
+        constants[5].i = nby;
+        constants[6].i = block;
+        constants[7].i = (int)bits;
+        constants[8].i = cs(cand[0]);
+        constants[9].i = cs(cand[1]);
+        constants[10].i = cs(cand[2]);
+        constants[11].i = cs(cand[3]);
+        constants[12].i = cs(cand[4]);
+        constants[13].i = (int)out.cstep;
+        ncnn::VkMat dispatcher;
+        dispatcher.w = w_padded;
+        dispatcher.h = h_padded;
+        dispatcher.c = 1;
+        cmd.record_pipeline(pipeline_sel_blend, bindings, constants, dispatcher);
+    }
+    return true;
+}
+
+bool RifeEngine::interpolate_selector(const GpuFrame& a, const GpuFrame& b, float t, uint8_t* dst, std::string& error,
+                                      const std::function<void()>& before_mc)
+{
+    ncnn::VkMat r1;
+    if (tta > 1 && !rife_tta_rgb(a, b, t, r1, error))
+        return false;
+    ncnn::VkCompute cmd(vkdev);
+    if (tta <= 1 && !infer_rife(cmd, a.rgb, b.rgb, t, r1, error))
+        return false;
+    if (trt && ultra)
+    {
+        // sortie TensorRT : tampon unique de l'instance, écrasé par l'inférence inversée
+        ncnn::VkMat own;
+        cmd.record_clone(r1, own, staging_option(opt, blob_vkallocator, staging_vkallocator));
+        r1 = own;
+    }
+    if (before_mc)
+    {
+        // RIFE exécuté pendant que l'appelant termine le flux NVOF (candidats MC et flux denses du candidat NV)
+        if (cmd.submit_and_wait() != 0)
+        {
+            error = "échec d'exécution GPU (RIFE)";
+            return false;
+        }
+        cmd.reset();
+        before_mc();
+    }
+    ncnn::VkMat mc;
+    if (!record_mc(cmd, a, b, t, ncnn::VkMat(), mc, error))
+        return false;
+    ncnn::VkMat r05;
+    if (lm_loaded)
+    {
+        if (!decide_large_motion(cmd, a, b, error))
+            return false;
+        if (lm_active && !infer_rife(cmd, a.rgb, b.rgb, t, r05, error, true))
+            return false;
+    }
+    ncnn::VkMat rb;
+    if (ultra && !infer_rife(cmd, b.rgb, a.rgb, 1.f - t, rb, error))
+        return false;
+    ncnn::VkMat nv;
+    ncnn::VkMat maps;
+    const bool use_nv = dense_valid;
+    if (use_nv)
+    {
+        if (!record_nv(cmd, a, b, t, nv, maps, error))
+            return false;
+        sel_frames_nv++;
+    }
+    const ncnn::VkMat* cand[5] = {&r1, r05.empty() ? nullptr : &r05, &mc, rb.empty() ? nullptr : &rb, use_nv ? &nv : nullptr};
+    ncnn::VkMat out;
+    return record_selector(cmd, a, b, cand, maps, out, error) && convert_and_download(cmd, out, dst, error);
 }
 
 bool RifeEngine::record_flip(ncnn::VkCompute& cmd, const ncnn::VkMat& src, int flip, ncnn::VkMat& dst, std::string& error)

@@ -107,6 +107,18 @@ public:
     void set_trt_large(TrtBackend* backend) { trt_lm = backend; }
     // Seuil bas des grands mouvements (px entre les sources) ; remplacement complet à 3x.
     void set_large_motion_threshold(float px) { lm_lo = px; }
+    // Moteur hybride : sélecteur appris (choix par bloc entre les candidats RIFE, RIFE demi-résolution, MC,
+    // RIFE inversé, NV) ; désactivé = ancienne règle fixe (diagnostic). family : jeu de poids (« v415 », « v46 »).
+    void set_selector(bool on, const std::string& family) { selector_on = on; sel_family = family; }
+    bool selector() const { return selector_on && engine_mode == InterpEngine::Hybrid; }
+    // Jeu de poids réellement utilisé : sel_family s'il est embarqué, sinon « v415 » (repli).
+    std::string selector_weights_family() const;
+    // Mode Ultra : candidat supplémentaire RIFE inversé (sources échangées, 1 - t).
+    void set_ultra(bool on) { ultra = on; }
+    // Flux NVIDIA denses de la paire courante (S10.5 à la résolution analysée, grille gw × gh) : candidat NV.
+    void set_dense_flow(const int16_t* fwd, const int16_t* bwd, int gw, int gh, float vscale);
+    void clear_dense_flow() { dense_valid = false; }
+    int64_t selector_frames_nv() const { return sel_frames_nv; }
     bool large_motion() const { return lm_loaded; }
     // Paires (trames source consécutives) traitées / avec grands mouvements.
     int64_t large_motion_pairs_total() const { return lm_pairs_total; }
@@ -158,6 +170,14 @@ private:
                    ncnn::VkMat& out, std::string& error);
     bool record_large_motion(ncnn::VkCompute& cmd, const GpuFrame& a, const GpuFrame& b, float t, ncnn::VkMat& out,
                              std::string& error);
+    bool decide_large_motion(ncnn::VkCompute& cmd, const GpuFrame& a, const GpuFrame& b, std::string& error);
+    bool interpolate_selector(const GpuFrame& a, const GpuFrame& b, float t, uint8_t* dst, std::string& error,
+                              const std::function<void()>& before_mc);
+    bool record_nv(ncnn::VkCompute& cmd, const GpuFrame& a, const GpuFrame& b, float t, ncnn::VkMat& nv,
+                   ncnn::VkMat& maps, std::string& error);
+    bool record_selector(ncnn::VkCompute& cmd, const GpuFrame& a, const GpuFrame& b, const ncnn::VkMat* cand[5],
+                         const ncnn::VkMat& maps, ncnn::VkMat& out, std::string& error);
+    bool upload_selector_models(std::string& error);
     void record_filter(ncnn::VkCompute& cmd, const ncnn::VkMat& src, ncnn::VkMat& dst, int r, int axis, int op,
                        int threshold, float thr);
     ncnn::VkMat float_mat(int n);
@@ -188,12 +208,29 @@ private:
     ncnn::Pipeline* pipeline_mc_region;
     ncnn::Pipeline* pipeline_mc_blend;
     ncnn::Pipeline* pipeline_mc_motion;
+    ncnn::Pipeline* pipeline_nv_flow = nullptr;
+    ncnn::Pipeline* pipeline_nv_warp = nullptr;
+    ncnn::Pipeline* pipeline_sel_stats = nullptr;
+    ncnn::Pipeline* pipeline_sel_weights = nullptr;
+    ncnn::Pipeline* pipeline_sel_blend = nullptr;
     ncnn::Pipeline* pipeline_trt_pack;
     TrtBackend* trt = nullptr;
     TrtBackend* trt_lm = nullptr;
     bool lm_loaded = false;
     float lm_lo = 16.f;
     float lm_floor = 0.f;   // poids minimal de la paire (mouvement d'ensemble)
+    // sélecteur
+    bool selector_on = true;
+    bool ultra = false;
+    std::string sel_family = "v415";
+    ncnn::VkMat sel_models;          // paramètres des modèles (128 flottants chacun)
+    std::vector<float> dense_f, dense_b;
+    int dense_gw = 0;
+    int dense_gh = 0;
+    bool dense_valid = false;
+    bool dense_dirty = false;
+    ncnn::VkMat dense_f_gpu, dense_b_gpu;
+    int64_t sel_frames_nv = 0;
     // décision « grands mouvements » prise une fois par paire (champ de vecteurs relu)
     bool lm_active = false;
     uint64_t lm_a = 0;
