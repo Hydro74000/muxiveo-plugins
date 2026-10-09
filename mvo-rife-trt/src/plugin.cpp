@@ -1,7 +1,7 @@
 // mvo-rife-trt — inférence RIFE de muxiveo-rife avec NVIDIA TensorRT for RTX.
 //
 // Le plugin reçoit des tampons CUDA déjà remplis par muxiveo-rife (mémoire partagée avec Vulkan) et écrit
-// l'image interpolée dans le tampon de sortie. Interface : include/trt_plugin_abi.h.
+// l'image interpolée dans le tampon de sortie. Interface : mvo-rife/src/trt_plugin_abi.h.
 // Le pilote CUDA est chargé à l'exécution ; TensorRT for RTX est livré à côté du plugin.
 
 #include "trt_plugin_abi.h"

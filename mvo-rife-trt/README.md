@@ -44,8 +44,8 @@ python3 scripts/package.py linux-x86_64 build/plugin/libmvo_rife_trt.so "$SDK" b
 python3 scripts/selftest.py build/dist/mvo-rife-trt-*-linux-x86_64 build/models/rife-v4.6.onnx build/cache   # GPU NVIDIA
 ```
 
-L'interface avec muxiveo-rife (`include/trt_plugin_abi.h`) est une copie de la référence du dépôt Muxiveo ;
-`scripts/check_abi.py` (CI) vérifie qu'elles sont identiques.
+L'interface avec muxiveo-rife est l'en-tête du moteur lui-même (`../mvo-rife/src/trt_plugin_abi.h`, même dépôt) :
+aucune copie à synchroniser.
 
 ## Publier
 

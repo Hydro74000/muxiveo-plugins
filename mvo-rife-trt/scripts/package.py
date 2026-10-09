@@ -29,7 +29,7 @@ def sha256(path: Path) -> str:
 def main() -> None:
     platform, plugin_lib, sdk_root, models_dir, out = sys.argv[1], Path(sys.argv[2]), Path(sys.argv[3]), Path(sys.argv[4]), Path(sys.argv[5])
     version = VERSION_RE.search((HERE / "CMakeLists.txt").read_text(encoding="utf-8")).group(1)
-    abi = int(ABI_RE.search((HERE / "include" / "trt_plugin_abi.h").read_text(encoding="utf-8")).group(1))
+    abi = int(ABI_RE.search((HERE.parent / "mvo-rife" / "src" / "trt_plugin_abi.h").read_text(encoding="utf-8")).group(1))
     sdk = json.loads((HERE / "sdk.json").read_text(encoding="utf-8"))
     name = f"mvo-rife-trt-{version}-{platform}"
     dest = out / name

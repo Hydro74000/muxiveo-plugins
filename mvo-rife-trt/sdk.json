@@ -10,9 +10,6 @@
     "sha256": "a688478af9e7b824f4918ef3b3038c3aca6f1ea84ff30a52d7ba8196c65a5a5a"
   },
   "abi": {
-    "repository": "Hydro74000/muxiveo",
-    "ref": "muxiveo-rife-v1.4.0",
-    "path": "native/muxiveo-rife/src/trt_plugin_abi.h",
     "min_muxiveo_rife": "1.4.0"
   }
 }

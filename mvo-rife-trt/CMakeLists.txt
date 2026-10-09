@@ -17,7 +17,8 @@ find_library(TRTRTX_ONNX_LIB NAMES tensorrt_onnxparser_rtx tensorrt_onnxparser_r
 
 add_library(mvo_rife_trt SHARED src/plugin.cpp)
 # compat/ : types CUDA minimaux requis par les en-têtes TensorRT (pas de CUDA Toolkit).
-target_include_directories(mvo_rife_trt PRIVATE include compat)
+# Interface avec muxiveo-rife : en-tête de référence du moteur (mvo-rife/src), jamais recopié.
+target_include_directories(mvo_rife_trt PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../mvo-rife/src compat)
 # en-têtes NVIDIA en « système » : leurs avertissements d'obsolescence ne concernent pas ce code
 target_include_directories(mvo_rife_trt SYSTEM PRIVATE "${TRTRTX_ROOT}/include")
 target_compile_definitions(mvo_rife_trt PRIVATE MVO_RIFE_TRT_VERSION="${PROJECT_VERSION}")

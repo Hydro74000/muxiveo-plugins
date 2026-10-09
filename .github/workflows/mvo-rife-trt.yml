@@ -1,7 +1,7 @@
 name: mvo-rife-trt
 
-# Plugin d'accélération NVIDIA (TensorRT for RTX) de muxiveo-rife : contrôle de l'interface, export des
-# modèles, builds Linux / Windows et release `mvo-rife-trt-vX.Y.Z` (jamais « latest ») sur tag.
+# Plugin d'accélération NVIDIA (TensorRT for RTX) de muxiveo-rife : export des modèles, builds Linux / Windows et
+# release `mvo-rife-trt-vX.Y.Z` (jamais « latest ») sur tag. Interface : mvo-rife/src/trt_plugin_abi.h (même dépôt).
 
 on:
   push:
@@ -9,12 +9,16 @@ on:
     paths:
       - "mvo-rife-trt/**"
       - ".github/workflows/mvo-rife-trt.yml"
+      - "mvo-rife/src/trt_plugin_abi.h"
+      - "scripts/update_feed.py"
     tags:
       - "mvo-rife-trt-v*"
   pull_request:
     paths:
       - "mvo-rife-trt/**"
       - ".github/workflows/mvo-rife-trt.yml"
+      - "mvo-rife/src/trt_plugin_abi.h"
+      - "scripts/update_feed.py"
   workflow_dispatch:
 
 permissions:
@@ -29,14 +33,6 @@ defaults:
     working-directory: mvo-rife-trt
 
 jobs:
-  abi:
-    name: Interface muxiveo-rife
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: En-tête identique à la référence
-        run: python3 scripts/check_abi.py
-
   models:
     name: Modèles ONNX
     runs-on: ubuntu-latest
@@ -60,7 +56,7 @@ jobs:
 
   build-linux:
     name: Build linux-x86_64
-    needs: [abi, models]
+    needs: [models]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -105,7 +101,7 @@ jobs:
 
   build-windows:
     name: Build windows-x86_64
-    needs: [abi, models]
+    needs: [models]
     runs-on: windows-2022
     steps:
       - uses: actions/checkout@v4
@@ -171,3 +167,18 @@ jobs:
             --title "mvo-rife-trt $VERSION — Accélération NVIDIA (TensorRT) pour Muxiveo" \
             --notes-file README.md \
             --latest=false
+      - name: Flux des extensions
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          if ! gh release view extensions-feed --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release create extensions-feed --repo "$GITHUB_REPOSITORY" --prerelease --latest=false \
+              --title "Flux des extensions" --notes "Versions publiées de chaque extension, lues par Muxiveo."
+          fi
+          mkdir -p ../feed
+          gh release download extensions-feed --repo "$GITHUB_REPOSITORY" -p mvo-rife-trt.json -D ../feed || true
+          python3 ../scripts/update_feed.py --name mvo-rife-trt --tag "$TAG" --assets ../assets \
+            --feed ../feed/mvo-rife-trt.json --out ../feed/mvo-rife-trt.json
+          gh release upload extensions-feed ../feed/mvo-rife-trt.json --repo "$GITHUB_REPOSITORY" --clobber
