@@ -11,11 +11,31 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 import tarfile
 import urllib.request
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def bash_executable() -> str:
+    """Python UCRT64 doit lancer le bash MSYS2, jamais le lanceur WSL."""
+    if os.name == "nt" and os.environ.get("MSYSTEM"):
+        candidate = Path(sys.executable).resolve().parents[2] / "usr/bin/bash.exe"
+        if not candidate.is_file():
+            raise RuntimeError("Bash MSYS2 absent à côté de Python UCRT64")
+        return str(candidate)
+    return "bash"
+
+
+def prepare_vulkan_headers(build: Path, source: Path, prefix: Path) -> None:
+    """En-têtes et registre Vulkan épinglés, indépendants des paquets système."""
+    deps = json.loads((ROOT / "dependencies.json").read_text())
+    headers = fetch("vulkan-headers", deps["vulkan_headers"], build / "sources")
+    vendored = source / "3rdparty/Vulkan-Headers"
+    shutil.copytree(headers, vendored, dirs_exist_ok=True)
+    shutil.copytree(headers / "include", prefix / "include", dirs_exist_ok=True)
 
 
 def run(argv: list[str], cwd: Path, env: dict[str, str]) -> None:
@@ -68,7 +88,7 @@ def main() -> None:
         "--enable-protocol=file", "--enable-demuxer=matroska,mov,mpegts,hevc", "--enable-muxer=nut",
         "--enable-decoder=hevc", "--enable-parser=hevc", "--enable-bsf=dovi_split,hevc_mp4toannexb",
         "--enable-encoder=rawvideo", "--extra-cflags=-fvisibility=hidden"]
-    run(["bash", *configure], ffbuild, env)
+    run([bash_executable(), *configure], ffbuild, env)
     run(["make", f"-j{max(1,args.jobs)}"], ffbuild, env)
     run(["make", "install"], ffbuild, env)
     # cargo doit connaître le type de sortie avant de résoudre les dépendances.

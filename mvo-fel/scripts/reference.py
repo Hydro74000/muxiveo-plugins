@@ -6,7 +6,7 @@ import json
 import os
 from pathlib import Path
 
-from build import ROOT, fetch, run
+from build import ROOT, fetch, prepare_vulkan_headers, run
 
 
 def main() -> None:
@@ -18,6 +18,7 @@ def main() -> None:
     spec = json.loads((ROOT / "dependencies.json").read_text())["libplacebo_reference"]
     source = fetch("libplacebo", spec, build / "sources")
     prefix = build / "reference-install"
+    prepare_vulkan_headers(build, source, prefix)
     reference = build / "reference"
     if not (reference / "build.ninja").exists():
         run(["meson", "setup", str(reference), str(source), f"--prefix={prefix}", "--libdir=lib",
@@ -25,6 +26,7 @@ def main() -> None:
              "-Dlibdovi=disabled", "-Dglslang=disabled", "-Dshaderc=enabled"], ROOT, env)
     run(["meson", "install", "-C", str(reference)], ROOT, env)
     env["PKG_CONFIG_PATH"] = os.pathsep.join((str(prefix / "lib/pkgconfig"), str(build / "private/lib/pkgconfig")))
+    env["CFLAGS"] = f"-I{prefix / 'include'} " + env.get("CFLAGS", "")
     run(["cmake", "-S", str(ROOT), "-B", str(build / "oracle"), "-G", "Ninja",
          "-DCMAKE_BUILD_TYPE=Release", "-DMVO_FEL_MATH_ONLY=ON", "-DMVO_FEL_REFERENCE_TESTS=ON"], ROOT, env)
     run(["cmake", "--build", str(build / "oracle")], ROOT, env)

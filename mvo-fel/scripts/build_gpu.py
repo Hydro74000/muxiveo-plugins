@@ -6,7 +6,7 @@ import json
 import os
 from pathlib import Path
 
-from build import ROOT, fetch, run
+from build import ROOT, fetch, prepare_vulkan_headers, run
 
 
 def build_gpu(build: Path, env: dict[str, str], jobs: int) -> Path:
@@ -16,6 +16,7 @@ def build_gpu(build: Path, env: dict[str, str], jobs: int) -> Path:
     glslang = fetch("glslang", deps["glslang"], cache)
     placebo = fetch("libplacebo", deps["libplacebo_reference"], cache)
     prefix = build / "gpu-private"
+    prepare_vulkan_headers(build, placebo, prefix)
     compiler = build / "glslang"
     run(["cmake", "-S", str(glslang), "-B", str(compiler), "-G", "Ninja",
          "-DCMAKE_BUILD_TYPE=Release", f"-DCMAKE_INSTALL_PREFIX={prefix}", "-DCMAKE_INSTALL_LIBDIR=lib",

@@ -17,6 +17,12 @@
     "sha256": "fd72d09e83a7776f4ec5f2c2f13712ee085a97c75473de2041d09801c49db621",
     "license": "LGPL-2.1-or-later"
   },
+  "vulkan_headers": {
+    "revision": "4c8aa84a61c12cab9780fa44298617666b491d71",
+    "url": "https://codeload.github.com/KhronosGroup/Vulkan-Headers/tar.gz/4c8aa84a61c12cab9780fa44298617666b491d71",
+    "sha256": "ada386ba78aa2682dca58e7cff4b959f63bab5d08ed1ec166cc5a8eeade108dd",
+    "license": "Apache-2.0 and MIT"
+  },
   "glslang": {
     "revision": "a57276bf558f5cf94d3a9854ebdf5a2236849a5a",
     "url": "https://codeload.github.com/KhronosGroup/glslang/tar.gz/a57276bf558f5cf94d3a9854ebdf5a2236849a5a",
