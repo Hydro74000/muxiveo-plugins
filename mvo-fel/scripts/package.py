@@ -77,17 +77,35 @@ def check_direct(binary: Path, validation: Path) -> None:
             raise RuntimeError("Pixels du filtre direct absents ou différents")
 
 
+def check_glibc(binary: Path, maximum: str) -> None:
+    """Refuse une archive Linux exigeant une libc plus récente que sa cible."""
+    if not re.fullmatch(r"\d+\.\d+", maximum):
+        raise ValueError("Version glibc cible invalide")
+    result = subprocess.run(["readelf", "--version-info", str(binary)],
+                            capture_output=True, text=True, check=True)
+    versions = re.findall(r"\bGLIBC_(\d+(?:\.\d+)+)\b", result.stdout)
+    if (not versions or "GLIBC_ABI_" in result.stdout or "GLIBC_PRIVATE" in result.stdout
+            or max(tuple(map(int, version.split('.'))) for version in versions) > tuple(map(int, maximum.split('.')))):
+        raise RuntimeError(f"{binary.name} exige une ABI glibc au-delà de {maximum}")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--library", type=Path, help="Bibliothèque à empaqueter, sinon build/plugin")
     parser.add_argument("--validation", type=Path, help="Attestation validate_gpu.py (prototype Linux)")
     parser.add_argument("--direct-ffmpeg", type=Path, help="Filtre direct privé, exige son attestation numérique")
+    parser.add_argument("--max-glibc", help="Version maximale requise pour le paquet Linux publié")
     parser.add_argument("platform", choices=LIBRARIES)
     parser.add_argument("build", type=Path)
     parser.add_argument("output", type=Path)
     args = parser.parse_args()
     library = args.library or args.build / "plugin" / LIBRARIES[args.platform]
     capabilities = load_capabilities(library, args.validation)
+    if args.max_glibc:
+        if args.platform != "linux-x86_64":
+            raise RuntimeError("La vérification glibc concerne uniquement Linux")
+        for binary in (library, *([args.direct_ffmpeg] if args.direct_ffmpeg else [])):
+            check_glibc(binary, args.max_glibc)
     if capabilities.get("experimental") and args.platform != "linux-x86_64":
         raise RuntimeError("Le prototype GPU empaqueté est actuellement validé sur Linux x86_64 uniquement")
     if args.direct_ffmpeg:

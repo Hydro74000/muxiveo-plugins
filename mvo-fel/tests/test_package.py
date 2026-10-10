@@ -86,6 +86,14 @@ class PackageValidationTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "incompatible"):
             package.check_direct(binary, self.validation)
 
+    def test_glibc_baseline_rejects_local_runtime(self):
+        with patch.object(package.subprocess, "run", return_value=Mock(stdout="Name: GLIBC_2.28\nName: GLIBC_2.2.5")):
+            package.check_glibc(self.library, "2.28")
+        for version in ("GLIBC_2.43", "GLIBC_ABI_GNU2_TLS", "GLIBC_PRIVATE"):
+            with patch.object(package.subprocess, "run", return_value=Mock(stdout="GLIBC_2.2.5\n"+version)):
+                with self.assertRaisesRegex(RuntimeError, "ABI glibc"):
+                    package.check_glibc(self.library, "2.28")
+
 
 if __name__ == "__main__":
     unittest.main()
