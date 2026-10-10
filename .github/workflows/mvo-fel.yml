@@ -1,0 +1,146 @@
+name: mvo-fel
+
+on:
+  push:
+    branches: ["**"]
+    paths: ["mvo-fel/**", ".github/workflows/mvo-fel.yml", "scripts/update_feed.py"]
+    tags: ["mvo-fel-v*"]
+  pull_request:
+    paths: ["mvo-fel/**", ".github/workflows/mvo-fel.yml", "scripts/update_feed.py"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mvo-fel-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Construire et tester sur glibc 2.28
+        run: |
+          docker run --rm -v "$PWD:/src" -w /src/mvo-fel quay.io/pypa/manylinux_2_28_x86_64 bash -euo pipefail -c '
+            dnf install -y -q nasm pkgconf-pkg-config
+            export PATH=/opt/python/cp312-cp312/bin:$PATH
+            python -m pip install cmake ninja
+            curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs -o /tmp/rustup.sh
+            bash /tmp/rustup.sh -y --profile minimal --default-toolchain 1.90.0
+            source "$HOME/.cargo/env"
+            python scripts/build.py build
+            python scripts/package.py linux-x86_64 build build/dist'
+          sudo chown -R "$(id -u):$(id -g)" mvo-fel/build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mvo-fel-linux-x86_64
+          path: mvo-fel/build/dist/*.tar.gz
+          if-no-files-found: error
+
+  desktop:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-2022
+            platform: windows-x86_64
+          - os: macos-14
+            platform: macos-arm64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        if: runner.os == 'macOS'
+        with:
+          python-version: "3.12"
+      - name: Dépendances macOS
+        if: runner.os == 'macOS'
+        run: brew install cmake ninja nasm pkg-config
+      - uses: msys2/setup-msys2@v2
+        if: runner.os == 'Windows'
+        with:
+          msystem: UCRT64
+          update: true
+          install: >-
+            make nasm diffutils
+            mingw-w64-ucrt-x86_64-gcc mingw-w64-ucrt-x86_64-cmake
+            mingw-w64-ucrt-x86_64-ninja mingw-w64-ucrt-x86_64-python
+            mingw-w64-ucrt-x86_64-pkgconf
+      - uses: dtolnay/rust-toolchain@1.90.0
+        with:
+          targets: x86_64-pc-windows-gnu
+      - name: Build macOS
+        if: runner.os == 'macOS'
+        working-directory: mvo-fel
+        run: |
+          python3 scripts/build.py build
+          python3 scripts/package.py macos-arm64 build build/dist
+      - name: Build Windows
+        if: runner.os == 'Windows'
+        shell: msys2 {0}
+        working-directory: mvo-fel
+        env:
+          CARGO_BUILD_TARGET: x86_64-pc-windows-gnu
+        run: |
+          export PATH="/c/Users/runneradmin/.cargo/bin:$PATH"
+          python scripts/build.py build
+          python scripts/package.py windows-x86_64 build build/dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mvo-fel-${{ matrix.platform }}
+          path: |
+            mvo-fel/build/dist/*.zip
+            mvo-fel/build/dist/*.tar.gz
+          if-no-files-found: error
+
+  reference:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: dtolnay/rust-toolchain@1.90.0
+      - name: Dépendances de la référence CPU Vulkan (Mesa)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y nasm pkg-config libvulkan-dev mesa-vulkan-drivers libshaderc-dev liblcms2-dev libunwind-dev
+          python -m pip install cmake ninja meson jinja2
+      - name: Comparaison numérique indépendante
+        working-directory: mvo-fel
+        run: |
+          python scripts/build.py build
+          export VK_ICD_FILENAMES=$(ls /usr/share/vulkan/icd.d/lvp*.json)
+          python scripts/reference.py build
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/mvo-fel-v')
+    needs: [linux, desktop, reference]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: mvo-fel-*
+          path: assets
+          merge-multiple: true
+      - name: Vérifier, publier et mettre à jour le flux
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          python scripts/update_feed.py --name mvo-fel --tag "$TAG" --assets assets --out mvo-fel.json
+          (cd assets && sha256sum * > SHA256SUMS)
+          gh release create "$TAG" assets/* --latest=false --title "$TAG" --notes-file mvo-fel/README.md
+          if ! gh release view extensions-feed >/dev/null 2>&1; then
+            gh release create extensions-feed --prerelease --latest=false --title "Flux des extensions" --notes "Versions des extensions Muxiveo"
+          fi
+          mkdir feed
+          gh release download extensions-feed -p mvo-fel.json -D feed || true
+          python scripts/update_feed.py --name mvo-fel --tag "$TAG" --assets assets --feed feed/mvo-fel.json --out feed/mvo-fel.json
+          gh release upload extensions-feed feed/mvo-fel.json --clobber

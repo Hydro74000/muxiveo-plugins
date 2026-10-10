@@ -1,0 +1,11 @@
+_mvo_fel_abi_version
+_mvo_fel_capabilities
+_mvo_fel_classify
+_mvo_fel_create
+_mvo_fel_run
+_mvo_fel_cancel
+_mvo_fel_error
+_mvo_fel_destroy
+_mvo_fel_devices
+_mvo_fel_set_device
+_mvo_fel_backend

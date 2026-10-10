@@ -11,6 +11,7 @@ elles.
 | [`mvo-rife`](mvo-rife/README.md) — Interpolation d'images | Moteur MVO-RIFE (muxiveo-rife : RIFE v4 Vulkan, moteur hybride, sélecteur appris), modèles et préréglages | Linux x86_64, Windows x64, macOS arm64 ; GPU Vulkan | 1.7.0 |
 | [`mvo-rife-models`](mvo-rife-models/README.md) — Modèles d'interpolation | Modèles RIFE affinés par Muxiveo (ncnn pour muxiveo-rife, PyTorch pour l'export ONNX) | toutes | 1.0.0 |
 | [`mvo-rife-trt`](mvo-rife-trt/README.md) — Accélération NVIDIA (TensorRT) | Inférence RIFE de MVO-RIFE sur les Tensor Cores (TensorRT for RTX) ; repli automatique sur Vulkan | Linux x86_64, Windows x64 ; GPU NVIDIA Turing ou plus récent | 1.1.0 |
+| [`mvo-fel`](mvo-fel/README.md) — Reconstruction Dolby Vision FEL | Reconstruction BL + EL + RPU avant encodage, bibliothèque CPU chargée par Muxiveo | Cibles : Linux x86_64, Windows x64, macOS arm64 | En développement, non publié |
 
 ## Organisation
 
@@ -26,6 +27,8 @@ elles.
 
 ## Licences
 
-Le code de ce dépôt est sous licence MIT (`LICENSE`). Les plugins peuvent embarquer des composants tiers sous
+Le code de ce dépôt est sous licence MIT (`LICENSE`), sauf indication contraire : le code C++ de
+[`mvo-fel`](mvo-fel/NOTICES.md), adapté de libplacebo, est sous LGPL-2.1-or-later.
+Les plugins peuvent embarquer des composants tiers sous
 leur propre licence (par exemple NVIDIA TensorRT for RTX) : leurs notices sont livrées dans chaque plugin et
 présentées à l'installation.

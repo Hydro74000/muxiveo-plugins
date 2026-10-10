@@ -1,0 +1,26 @@
+{
+  "ffmpeg": {
+    "revision": "f5d4fd186c68913240c4f6e9cda98443e1518b34",
+    "url": "https://codeload.github.com/FFmpeg/FFmpeg/tar.gz/f5d4fd186c68913240c4f6e9cda98443e1518b34",
+    "sha256": "e54be1a54717aae0a8be91d91552196abe7998ba8efd78e04662f9168344fe4a",
+    "license": "LGPL-2.1-or-later"
+  },
+  "libdovi": {
+    "revision": "614c816b6446dcd1dbaf433403d499a6026fbb5a",
+    "url": "https://codeload.github.com/quietvoid/dovi_tool/tar.gz/614c816b6446dcd1dbaf433403d499a6026fbb5a",
+    "sha256": "23e6e0b8262f03ed999d0170a304eac5ba544ea5a5497adf2db7b33026d957c1",
+    "license": "MIT"
+  },
+  "libplacebo_reference": {
+    "revision": "0d043c7f6f79cd3687c023454bdacbe615e4d96f",
+    "url": "https://codeload.github.com/haasn/libplacebo/tar.gz/0d043c7f6f79cd3687c023454bdacbe615e4d96f",
+    "sha256": "fd72d09e83a7776f4ec5f2c2f13712ee085a97c75473de2041d09801c49db621",
+    "license": "LGPL-2.1-or-later"
+  },
+  "glslang": {
+    "revision": "a57276bf558f5cf94d3a9854ebdf5a2236849a5a",
+    "url": "https://codeload.github.com/KhronosGroup/glslang/tar.gz/a57276bf558f5cf94d3a9854ebdf5a2236849a5a",
+    "sha256": "02f4321a3ed01b9a9a9874f76e2d8ad078825818fcc9aae12dbf2c01674fb8af",
+    "license": "BSD-3-Clause and MIT"
+  }
+}
