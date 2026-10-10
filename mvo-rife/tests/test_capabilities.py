@@ -33,7 +33,8 @@ def test_capabilities_describe_contract_and_options():
     caps = _capabilities()
     assert caps["name"] == "muxiveo-rife" and caps["version"] == _version()
     assert caps["contract"] == 1 and caps["trt_abi"] == 1
-    assert {"engine", "ultra", "tta", "uhd", "selector-weights", "large-motion", "trt-plugin"} <= set(caps["options"])
+    assert {"engine", "ultra", "tta", "uhd", "selector-weights", "large-motion", "trt-plugin",
+            "feature-cache", "feature-cache-reserve"} <= set(caps["options"])
     assert caps["engines"] == ["rife", "hybrid", "mc"] and caps["tta"] == [1, 2, 4, 8]
     models_dir = Path(RIFE_BIN).resolve().parent / "rife-models"
     expected = sorted(p.name for p in models_dir.glob("*") if (p / "flownet.param").is_file() and (p / "flownet.bin").is_file())

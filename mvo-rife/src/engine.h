@@ -101,11 +101,15 @@ public:
     // 4 = + retournement horizontal ; 8 = + retournements vertical et double.
     // Sorties moyennées (fp32) ; coût x n, VRAM d'une seule variante.
     void set_tta(int n) { tta = n; }
+    // Option ncnn : têtes indépendantes du temps, conservées avec une réserve de VRAM.
+    void set_feature_cache(bool on) { feature_cache_on = on; }
+    void set_feature_cache_reserve(int mib) { head_reserve = (uint64_t)mib << 20; }
+    int64_t feature_cache_hits() const { return head_hits; }
     void set_engine(InterpEngine e) { engine_mode = e; }
     // Inférence RIFE par le plugin TensorRT (nul = ncnn Vulkan). Le backend doit survivre aux interpolations.
-    void set_trt(TrtBackend* backend) { trt = backend; }
+    void set_trt(TrtBackend* backend) { trt = backend; trt_inputs[0] = {}; }
     // Plugin TensorRT du réseau à flux demi-résolution (nul = ncnn Vulkan pour ce réseau).
-    void set_trt_large(TrtBackend* backend) { trt_lm = backend; }
+    void set_trt_large(TrtBackend* backend) { trt_lm = backend; trt_inputs[1] = {}; }
     // Seuil bas des grands mouvements (px entre les sources) ; remplacement complet à 3x.
     void set_large_motion_threshold(float px) { lm_lo = px; }
     // Moteur hybride : sélecteur appris (choix par bloc entre les candidats RIFE, RIFE demi-résolution, MC,
@@ -124,7 +128,13 @@ public:
     void set_ultra(bool on) { ultra = on; }
     // Flux NVIDIA denses de la paire courante (S10.5 à la résolution analysée, grille gw × gh) : candidat NV.
     void set_dense_flow(const int16_t* fwd, const int16_t* bwd, int gw, int gh, float vscale);
-    void clear_dense_flow() { dense_valid = false; }
+    void clear_dense_flow()
+    {
+        dense_valid = false;
+        dense_inc_cache.release();
+        dense_maps_cache.release();
+        sel_source_stats.release();
+    }
     int64_t selector_frames_nv() const { return sel_frames_nv; }
     bool large_motion() const { return lm_loaded; }
     // Paires (trames source consécutives) traitées / avec grands mouvements.
@@ -164,12 +174,13 @@ private:
     bool convert_and_download(ncnn::VkCompute& cmd, const ncnn::VkMat& rgb, uint8_t* dst, std::string& error);
     bool record_timestep(ncnn::VkCompute& cmd, float t, ncnn::VkMat& timestep, std::string& error);
     bool record_network(ncnn::Net& net, ncnn::VkCompute& cmd, const ncnn::VkMat& in0, const ncnn::VkMat& in1,
-                        const ncnn::VkMat& timestep, ncnn::VkMat& out, std::string& error);
+                        const ncnn::VkMat& timestep, ncnn::VkMat& out, std::string& error,
+                        uint64_t a_id = 0, uint64_t b_id = 0, int flip = 0);
     // Image RIFE au temps t : réseau ncnn enregistré dans cmd, ou plugin TensorRT (cmd soumis et réinitialisé,
     // sortie dans un tampon partagé). Échec du plugin : avertissement puis ncnn pour la suite.
     // large : réseau à flux demi-résolution (grands mouvements).
     bool infer_rife(ncnn::VkCompute& cmd, const ncnn::VkMat& in0, const ncnn::VkMat& in1, float t, ncnn::VkMat& out,
-                    std::string& error, bool large = false);
+                    std::string& error, bool large = false, uint64_t a_id = 0, uint64_t b_id = 0, int flip = 0);
     bool record_flip(ncnn::VkCompute& cmd, const ncnn::VkMat& src, int flip, ncnn::VkMat& dst, std::string& error);
     bool interpolate_tta(const GpuFrame& a, const GpuFrame& b, float t, uint8_t* dst, std::string& error);
     bool rife_tta_rgb(const GpuFrame& a, const GpuFrame& b, float t, ncnn::VkMat& merged, std::string& error);
@@ -185,6 +196,9 @@ private:
     bool record_selector(ncnn::VkCompute& cmd, const GpuFrame& a, const GpuFrame& b, const ncnn::VkMat* cand[5],
                          const ncnn::VkMat& maps, ncnn::VkMat& out, std::string& error);
     bool upload_selector_models(std::string& error);
+    // Les cartes denses ne restent en cache que si le budget réel laisse une réserve.
+    bool cache_headroom(size_t extra = 0, uint64_t minimum_reserve = 1ull << 30) const;
+    void identify_head_blobs(ncnn::Net& net, int role);
     void record_filter(ncnn::VkCompute& cmd, const ncnn::VkMat& src, ncnn::VkMat& dst, int r, int axis, int op,
                        int threshold, float thr);
     ncnn::VkMat float_mat(int n);
@@ -221,6 +235,36 @@ private:
     ncnn::Pipeline* pipeline_sel_weights = nullptr;
     ncnn::Pipeline* pipeline_sel_blend = nullptr;
     ncnn::Pipeline* pipeline_trt_pack;
+    // Une identité nulle impose la copie (sources non identifiées). Les deux réseaux
+    // possèdent chacun leurs tampons ; une adresse Vulkan recyclée ne sert jamais de clé.
+    struct TrtInputs { uint64_t id[2] = {0, 0}; int flip = -1; };
+    TrtInputs trt_inputs[2];
+    struct HeadCache
+    {
+        struct Entry
+        {
+            ncnn::VkMat head;
+            uint64_t id = 0;
+            int flip = 0;
+            void release() { head.release(); id = 0; }
+        };
+        // Deux sources × quatre miroirs, séparés par côté : aucun partage de poids
+        // supposé entre les deux branches du graphe, même dans le sens inverse.
+        Entry entries[2][8];
+        int blob[2] = {-1, -1};
+        bool warmed = false;
+        void release() { for (auto& side : entries) for (Entry& e : side) e.release(); }
+        void keep_sources(uint64_t a, uint64_t b)
+        {
+            for (auto& side : entries)
+                for (Entry& e : side)
+                    if (e.id != a && e.id != b) e.release();
+        }
+    };
+    HeadCache head_cache[2]; // réseau normal et réseau à flux demi-résolution
+    bool feature_cache_on = false;
+    uint64_t head_reserve = 1ull << 30;
+    int64_t head_hits = 0;
     TrtBackend* trt = nullptr;
     TrtBackend* trt_lm = nullptr;
     bool lm_loaded = false;
@@ -238,6 +282,13 @@ private:
     bool dense_valid = false;
     bool dense_dirty = false;
     ncnn::VkMat dense_f_gpu, dense_b_gpu;
+    // Cohérence du flux et cartes du sélecteur : constantes pour toute la paire, quel que soit t.
+    ncnn::VkMat dense_inc_cache, dense_maps_cache;
+    // Canaux invariants du sélecteur (texture, écart des sources et cartes NVOF).
+    ncnn::VkMat sel_source_stats;
+    uint64_t sel_stats_a = 0;
+    uint64_t sel_stats_b = 0;
+    bool sel_stats_nv = false;
     int64_t sel_frames_nv = 0;
     // décision « grands mouvements » prise une fois par paire (champ de vecteurs relu)
     bool lm_active = false;

@@ -116,6 +116,11 @@ RifeEngine::~RifeEngine()
     sel_models.release();
     dense_f_gpu.release();
     dense_b_gpu.release();
+    dense_inc_cache.release();
+    dense_maps_cache.release();
+    sel_source_stats.release();
+    head_cache[0].release();
+    head_cache[1].release();
 
     flownet.clear();
     flownet_lm.clear();
@@ -234,7 +239,10 @@ static bool load_flownet(ncnn::Net& net, const ncnn::Option& opt, ncnn::VulkanDe
 bool RifeEngine::load_model(const std::filesystem::path& dir, int _padding, bool uhd, std::string& error)
 {
     padding = std::max(1, _padding);
-    return load_flownet(flownet, opt, vkdev, dir, uhd, error);
+    if (!load_flownet(flownet, opt, vkdev, dir, uhd, error))
+        return false;
+    identify_head_blobs(flownet, 0);
+    return true;
 }
 
 bool RifeEngine::load_large_motion_model(const std::filesystem::path& dir, std::string& error)
@@ -242,7 +250,65 @@ bool RifeEngine::load_large_motion_model(const std::filesystem::path& dir, std::
     lm_loaded = load_flownet(flownet_lm, opt, vkdev, dir, true, error);
     if (!lm_loaded)
         flownet_lm.clear();
+    else
+        identify_head_blobs(flownet_lm, 1);
     return lm_loaded;
+}
+
+void RifeEngine::identify_head_blobs(ncnn::Net& net, int role)
+{
+    HeadCache& cached = head_cache[role];
+    cached.release();
+    cached.blob[0] = cached.blob[1] = -1;
+    cached.warmed = false;
+    const auto& blobs = net.blobs();
+    const auto& layers = net.layers();
+    // Vérifier les dépendances du graphe, pas seulement le nom du modèle : ces deux
+    // sorties ne doivent dépendre que de leur source, jamais de in2 ou de l'autre image.
+    for (int side = 0; side < 2; side++)
+    {
+        const char* name = side == 0 ? "154" : "166";
+        const char* source = side == 0 ? "in0" : "in1";
+        int found = -1;
+        for (size_t i = 0; i < blobs.size(); i++)
+            if (blobs[i].name == name)
+                found = (int)i;
+        if (found < 0)
+            return;
+        std::vector<int> pending{found};
+        std::vector<bool> visited(blobs.size(), false);
+        int conv = 0, deconv = 0;
+        bool reached_source = false;
+        while (!pending.empty())
+        {
+            const int i = pending.back();
+            pending.pop_back();
+            if (i < 0 || i >= (int)blobs.size())
+                return;
+            if (visited[i])
+                continue;
+            visited[i] = true;
+            if (blobs[i].name == source)
+            {
+                reached_source = true;
+                continue;
+            }
+            const int producer = blobs[i].producer;
+            if (producer < 0 || producer >= (int)layers.size())
+                return;
+            const ncnn::Layer* layer = layers[producer];
+            if (layer->type == "Convolution")
+                conv++;
+            else if (layer->type == "Deconvolution")
+                deconv++;
+            else if (layer->type != "Crop" && layer->type != "Split")
+                return;
+            pending.insert(pending.end(), layer->bottoms.begin(), layer->bottoms.end());
+        }
+        if (!reached_source || conv != 3 || deconv != 1)
+            return;
+        cached.blob[side] = found;
+    }
 }
 
 ncnn::Pipeline* RifeEngine::make_pipeline(const char* comp_data, int comp_size, int lx, int ly, int lz)
@@ -265,6 +331,14 @@ bool RifeEngine::configure(const FrameFormat& _fmt, const ColorParams& _color, s
 {
     fmt = _fmt;
     color = _color;
+    head_cache[0].release();
+    head_cache[1].release();
+    head_cache[0].warmed = head_cache[1].warmed = false;
+    trt_inputs[0] = {};
+    trt_inputs[1] = {};
+    dense_inc_cache.release();
+    dense_maps_cache.release();
+    sel_source_stats.release();
 
     // Padding fourni par l'utilisateur : calcul en 64 bits avant conversion
     // vers les dimensions int de ncnn et les index des shaders.
@@ -550,9 +624,13 @@ bool RifeEngine::record_mc(ncnn::VkCompute& cmd, const GpuFrame& a, const GpuFra
         cache_a = a.id;
         cache_b = b.id;
     }
-    ncnn::VkMat mc = float_mat(plane * 3);
-    ncnn::VkMat q = float_mat(plane);
-    ncnn::VkMat edge = float_mat(plane);
+    const bool hybrid = !rife.empty();
+    // Le sélecteur demande le candidat MC seul : les cartes de l'ancienne règle hybride
+    // et le tampon RGB intermédiaire ne lui servent pas. Conserver le même calcul fp32,
+    // puis le même arrondi dans le format du réseau, directement dans sa sortie.
+    ncnn::VkMat mc = hybrid ? float_mat(plane * 3) : dummy;
+    ncnn::VkMat q = hybrid ? float_mat(plane) : dummy;
+    ncnn::VkMat edge = hybrid ? float_mat(plane) : dummy;
     out.create(w_padded, h_padded, 3, a.rgb.elemsize, 1, blob_vkallocator);
     if (mc.empty() || q.empty() || edge.empty() || out.empty() || out.cstep != a.rgb.cstep)
     {
@@ -560,14 +638,15 @@ bool RifeEngine::record_mc(ncnn::VkCompute& cmd, const GpuFrame& a, const GpuFra
         return false;
     }
     {
-        std::vector<ncnn::VkMat> bindings(6);
+        std::vector<ncnn::VkMat> bindings(7);
         bindings[0] = a.rgb;
         bindings[1] = b.rgb;
         bindings[2] = field[0];
         bindings[3] = mc;
         bindings[4] = q;
         bindings[5] = edge;
-        std::vector<ncnn::vk_constant_type> constants(11);
+        bindings[6] = hybrid ? dummy : out;
+        std::vector<ncnn::vk_constant_type> constants(12);
         constants[0].i = w_padded;
         constants[1].i = h_padded;
         constants[2].i = (int)a.rgb.cstep;
@@ -579,6 +658,7 @@ bool RifeEngine::record_mc(ncnn::VkCompute& cmd, const GpuFrame& a, const GpuFra
         constants[8].f = color.kr;
         constants[9].f = color.kb;
         constants[10].f = MC_LUM_SCALE;
+        constants[11].i = hybrid ? 0 : 1;
         ncnn::VkMat dispatcher;
         dispatcher.w = w_padded;
         dispatcher.h = h_padded;
@@ -586,7 +666,8 @@ bool RifeEngine::record_mc(ncnn::VkCompute& cmd, const GpuFrame& a, const GpuFra
         cmd.record_pipeline(pipeline_mc_recon, bindings, constants, dispatcher);
     }
 
-    const bool hybrid = !rife.empty();
+    if (!hybrid)
+        return true;
     ncnn::VkMat u = dummy;
     ncnn::VkMat diffs = dummy;
     if (hybrid)
@@ -843,7 +924,8 @@ bool RifeEngine::record_timestep(ncnn::VkCompute& cmd, float t, ncnn::VkMat& tim
 }
 
 bool RifeEngine::record_network(ncnn::Net& net, ncnn::VkCompute& cmd, const ncnn::VkMat& in0, const ncnn::VkMat& in1,
-                                const ncnn::VkMat& timestep, ncnn::VkMat& out, std::string& error)
+                                const ncnn::VkMat& timestep, ncnn::VkMat& out, std::string& error,
+                                uint64_t a_id, uint64_t b_id, int flip)
 {
     ncnn::Extractor ex = net.create_extractor();
     ex.set_blob_vkallocator(blob_vkallocator);
@@ -853,46 +935,125 @@ bool RifeEngine::record_network(ncnn::Net& net, ncnn::VkCompute& cmd, const ncnn
     ex.input("in0", in0);
     ex.input("in1", in1);
     ex.input("in2", timestep);
+    HeadCache& cached = head_cache[&net == &flownet_lm ? 1 : 0];
+    const uint64_t ids[2] = {a_id, b_id};
+    HeadCache::Entry* selected[2] = {nullptr, nullptr};
+    int missing = 0;
+    for (int side = 0; side < 2; side++)
+    {
+        for (HeadCache::Entry& e : cached.entries[side])
+            if (e.id == ids[side] && e.flip == flip && !e.head.empty())
+                selected[side] = &e;
+        if (!selected[side])
+        {
+            missing++;
+            for (HeadCache::Entry& e : cached.entries[side])
+                if (e.head.empty()) { selected[side] = &e; break; }
+        }
+    }
+    // Borne prudente pour v4.15 (8 canaux) et lite (4 canaux). Le budget tient déjà
+    // compte des têtes conservées ; ajouter seulement le coût de celles qui manquent.
+    const size_t head_bytes = (size_t)w_padded * h_padded * 8 * (opt.use_fp16_storage ? 2u : 4u);
+    const bool use_cache = feature_cache_on && a_id && b_id && flip >= 0 && flip < 4 && cached.warmed
+                           && cached.blob[0] >= 0 && cached.blob[1] >= 0
+                           && selected[0] && selected[1]
+                           && cache_headroom(head_bytes * missing, head_reserve);
+    if (!use_cache)
+        cached.release();
+    else
+    {
+        for (int side = 0; side < 2; side++)
+        {
+            HeadCache::Entry& entry = *selected[side];
+            if (!entry.head.empty())
+            {
+                ex.input(cached.blob[side], entry.head);
+                head_hits++;
+            }
+            else
+            {
+                if (ex.extract(cached.blob[side], entry.head, cmd) != 0 || entry.head.empty())
+                {
+                    error = "échec d'extraction des têtes RIFE";
+                    return false;
+                }
+                const int channels = entry.head.c * entry.head.elempack;
+                if (entry.head.w != w_padded || entry.head.h != h_padded
+                    || (channels != 4 && channels != 8))
+                {
+                    // Un autre graphe peut réemployer ces noms : ne pas retenir une
+                    // forme dont le coût mémoire n'est pas celui estimé ci-dessus.
+                    cached.release();
+                    cached.blob[0] = cached.blob[1] = -1;
+                    break;
+                }
+                entry.id = ids[side];
+                entry.flip = flip;
+            }
+        }
+    }
     if (ex.extract("out0", out, cmd) != 0 || out.empty())
     {
         error = "échec d'inférence RIFE";
         return false;
     }
+    cached.warmed = true; // le premier passage laisse l'allocateur atteindre son pic normal
     return true;
 }
 
 bool RifeEngine::infer_rife(ncnn::VkCompute& cmd, const ncnn::VkMat& in0, const ncnn::VkMat& in1, float t,
-                            ncnn::VkMat& out, std::string& error, bool large)
+                            ncnn::VkMat& out, std::string& error, bool large, uint64_t a_id, uint64_t b_id, int flip)
 {
     TrtBackend*& backend = large ? trt_lm : trt;
     if (backend)
     {
-        // Entrées copiées dans les tampons partagés (plans contigus), Vulkan terminé avant l'inférence CUDA.
+        // Les entrées d'une même paire ne changent pas avec t. Une variante transformée
+        // sans identité explicite invalide le cache avant toute réutilisation ultérieure.
+        TrtInputs& cached = trt_inputs[large ? 1 : 0];
+        const uint64_t ids[2] = {a_id, b_id};
+        // Ultra et TTA temporel : les mêmes deux tampons peuvent être reliés dans
+        // l'ordre inverse au plugin, sans recopier les sources ni changer son ABI.
+        auto matches = [&](int i, int slot) {
+            return ids[i] && cached.flip == flip && ids[i] == cached.id[slot];
+        };
+        // Préserver aussi l'image commune aux deux paires consécutives : retenir
+        // l'affectation des tampons qui demande le moins de copies.
+        const int direct_matches = (int)matches(0, 0) + (int)matches(1, 1);
+        const int reverse_matches = (int)matches(0, 1) + (int)matches(1, 0);
+        const bool reverse = reverse_matches > direct_matches;
         for (int i = 0; i < 2; i++)
         {
+            const int slot = reverse ? 1 - i : i;
+            if (matches(i, slot))
+                continue;
             const ncnn::VkMat& src = i == 0 ? in0 : in1;
             std::vector<ncnn::VkMat> bindings(2);
             bindings[0] = src;
-            bindings[1] = backend->input(i);
+            bindings[1] = backend->input(slot);
             std::vector<ncnn::vk_constant_type> constants(4);
             constants[0].i = w_padded;
             constants[1].i = h_padded;
             constants[2].i = (int)src.cstep;
-            constants[3].i = (int)backend->input(i).cstep;
+            constants[3].i = (int)backend->input(slot).cstep;
             ncnn::VkMat dispatcher;
             dispatcher.w = w_padded;
             dispatcher.h = h_padded;
             dispatcher.c = 3;
             cmd.record_pipeline(pipeline_trt_pack, bindings, constants, dispatcher);
         }
+        // Les commandes précédentes (MC, copie de sortie…) doivent aussi avoir terminé,
+        // même si aucune entrée n'a été recopiée, avant l'accès CUDA aux tampons partagés.
         if (cmd.submit_and_wait() != 0)
         {
             error = "échec d'exécution GPU (entrées TensorRT)";
             return false;
         }
         cmd.reset();
+        cached.id[reverse ? 1 : 0] = a_id;
+        cached.id[reverse ? 0 : 1] = b_id;
+        cached.flip = flip;
         std::string trt_error;
-        if (backend->infer(t, trt_error))
+        if (backend->infer(t, trt_error, reverse))
         {
             out = backend->output();
             return true;
@@ -903,12 +1064,21 @@ bool RifeEngine::infer_rife(ncnn::VkCompute& cmd, const ncnn::VkMat& in0, const 
     }
     ncnn::VkMat timestep;
     return record_timestep(cmd, t, timestep, error)
-           && record_network(large ? flownet_lm : flownet, cmd, in0, in1, timestep, out, error);
+           && record_network(large ? flownet_lm : flownet, cmd, in0, in1, timestep, out, error, a_id, b_id, flip);
 }
 
 bool RifeEngine::interpolate(const GpuFrame& a, const GpuFrame& b, float t, uint8_t* dst, std::string& error,
                              const std::function<void()>& before_mc)
 {
+    if (sel_stats_a != a.id || sel_stats_b != b.id)
+    {
+        // La paire précédente ne doit pas retenir ses grandes cartes pendant le réseau suivant.
+        dense_inc_cache.release();
+        dense_maps_cache.release();
+        sel_source_stats.release();
+    }
+    for (HeadCache& cached : head_cache)
+        cached.keep_sources(a.id, b.id);
     if (selector())
         return interpolate_selector(a, b, t, dst, error, before_mc);
     if (engine_mode != InterpEngine::Rife)
@@ -919,7 +1089,7 @@ bool RifeEngine::interpolate(const GpuFrame& a, const GpuFrame& b, float t, uint
         ncnn::VkCompute cmd(vkdev);
         if (engine_mode == InterpEngine::Hybrid && tta <= 1)
         {
-            if (!infer_rife(cmd, a.rgb, b.rgb, t, rife_rgb, error))
+            if (!infer_rife(cmd, a.rgb, b.rgb, t, rife_rgb, error, false, a.id, b.id))
                 return false;
         }
         if (before_mc)
@@ -945,7 +1115,7 @@ bool RifeEngine::interpolate(const GpuFrame& a, const GpuFrame& b, float t, uint
 
     ncnn::VkCompute cmd(vkdev);
     ncnn::VkMat out_rgb;
-    if (!infer_rife(cmd, a.rgb, b.rgb, t, out_rgb, error))
+    if (!infer_rife(cmd, a.rgb, b.rgb, t, out_rgb, error, false, a.id, b.id))
         return false;
     return convert_and_download(cmd, out_rgb, dst, error);
 }
@@ -1004,7 +1174,7 @@ bool RifeEngine::record_large_motion(ncnn::VkCompute& cmd, const GpuFrame& a, co
         return true;
 
     ncnn::VkMat r05;
-    if (!infer_rife(cmd, a.rgb, b.rgb, t, r05, error, true))
+    if (!infer_rife(cmd, a.rgb, b.rgb, t, r05, error, true, a.id, b.id))
         return false;
     if (r05.w != w_padded || r05.h != h_padded || r05.c != 3 || r05.elemsize != out.elemsize)
     {
@@ -1103,6 +1273,9 @@ bool RifeEngine::upload_selector_models(std::string& error)
 
 void RifeEngine::set_dense_flow(const int16_t* fwd, const int16_t* bwd, int gw, int gh, float vscale)
 {
+    dense_inc_cache.release();
+    dense_maps_cache.release();
+    sel_source_stats.release();
     const size_t n = (size_t)gw * gh * 2;
     const size_t padded = (n + 3) / 4 * 4;   // copie hôte -> GPU alignée sur 16 octets (ncnn)
     dense_f.assign(padded, 0.f);
@@ -1123,6 +1296,7 @@ bool RifeEngine::record_nv(ncnn::VkCompute& cmd, const GpuFrame& a, const GpuFra
 {
     const int w = fmt.width;
     const int h = fmt.height;
+    const bool refresh = dense_dirty || dense_inc_cache.empty() || dense_maps_cache.empty();
     if (dense_dirty)
     {
         const ncnn::Option o = staging_option(opt, blob_vkallocator, staging_vkallocator);
@@ -1132,19 +1306,24 @@ bool RifeEngine::record_nv(ncnn::VkCompute& cmd, const GpuFrame& a, const GpuFra
         cmd.record_clone(bk, dense_b_gpu, o);
         dense_dirty = false;
     }
-    ncnn::VkMat inc = float_mat(2 * w * h);
-    maps = float_mat(2 * w * h);
+    if (refresh)
+    {
+        dense_inc_cache = float_mat(2 * w * h);
+        dense_maps_cache = float_mat(2 * w * h);
+    }
+    maps = dense_maps_cache;
     nv.create(w_padded, h_padded, 3, a.rgb.elemsize, 1, blob_vkallocator);
-    if (inc.empty() || maps.empty() || nv.empty() || dense_f_gpu.empty() || dense_b_gpu.empty())
+    if (dense_inc_cache.empty() || maps.empty() || nv.empty() || dense_f_gpu.empty() || dense_b_gpu.empty())
     {
         error = "allocation mémoire GPU impossible (candidat NV)";
         return false;
     }
+    if (refresh)
     {
         std::vector<ncnn::VkMat> bindings(3);
         bindings[0] = dense_f_gpu;
         bindings[1] = dense_b_gpu;
-        bindings[2] = inc;
+        bindings[2] = dense_inc_cache;
         std::vector<ncnn::vk_constant_type> constants(4);
         constants[0].i = w;
         constants[1].i = h;
@@ -1160,12 +1339,12 @@ bool RifeEngine::record_nv(ncnn::VkCompute& cmd, const GpuFrame& a, const GpuFra
         std::vector<ncnn::VkMat> bindings(7);
         bindings[0] = dense_f_gpu;
         bindings[1] = dense_b_gpu;
-        bindings[2] = inc;
+        bindings[2] = dense_inc_cache;
         bindings[3] = a.rgb;
         bindings[4] = b.rgb;
         bindings[5] = nv;
         bindings[6] = maps;
-        std::vector<ncnn::vk_constant_type> constants(9);
+        std::vector<ncnn::vk_constant_type> constants(10);
         constants[0].i = w;
         constants[1].i = h;
         constants[2].i = w_padded;
@@ -1175,6 +1354,7 @@ bool RifeEngine::record_nv(ncnn::VkCompute& cmd, const GpuFrame& a, const GpuFra
         constants[6].i = dense_gw;
         constants[7].i = dense_gh;
         constants[8].f = t;
+        constants[9].i = refresh ? 1 : 0;
         ncnn::VkMat dispatcher;
         dispatcher.w = w_padded;
         dispatcher.h = h_padded;
@@ -1193,6 +1373,9 @@ bool RifeEngine::record_selector(ncnn::VkCompute& cmd, const GpuFrame& a, const 
     const int block = std::clamp((int)std::lround(w / 120.0 / 4.0) * 4, 8, 64);
     const int nbx = (w + block - 1) / block;
     const int nby = (h + block - 1) / block;
+    const bool use_nv = cand[4] != nullptr;
+    const bool reuse_sources = !sel_source_stats.empty() && sel_stats_a == a.id && sel_stats_b == b.id
+                               && sel_stats_nv == use_nv;
     const uint32_t bits = 1u | 4u | (cand[1] ? 2u : 0u) | (cand[3] ? 8u : 0u) | (cand[4] ? 16u : 0u);
     // poids de la famille du modèle RIFE (sinon v4.15, selector_weights_family) : modèle de la bande de taille de
     // bloc (SD/720p, 1080p…) s'il existe, sinon modèle global de la famille (bmin = 0)
@@ -1229,7 +1412,7 @@ bool RifeEngine::record_selector(ncnn::VkCompute& cmd, const GpuFrame& a, const 
     auto cs = [](const ncnn::VkMat* m) { return m ? (int)m->cstep : 0; };
     auto bind = [this](const ncnn::VkMat* m) { return m ? *m : dummy; };
     {
-        std::vector<ncnn::VkMat> bindings(9);
+        std::vector<ncnn::VkMat> bindings(10);
         bindings[0] = *cand[0];
         bindings[1] = bind(cand[1]);
         bindings[2] = *cand[2];
@@ -1239,7 +1422,8 @@ bool RifeEngine::record_selector(ncnn::VkCompute& cmd, const GpuFrame& a, const 
         bindings[6] = b.rgb;
         bindings[7] = cand[4] ? maps : dummy;
         bindings[8] = stats;
-        std::vector<ncnn::vk_constant_type> constants(17);
+        bindings[9] = reuse_sources ? sel_source_stats : dummy;
+        std::vector<ncnn::vk_constant_type> constants(18);
         constants[0].i = w;
         constants[1].i = h;
         constants[2].i = w_padded;
@@ -1257,12 +1441,17 @@ bool RifeEngine::record_selector(ncnn::VkCompute& cmd, const GpuFrame& a, const 
         constants[14].f = color.kb;
         constants[15].f = color.full_range ? 0.f : 64.f / 1023.f;   // luminance d'apprentissage : codes 10 bits / 1023
         constants[16].f = color.full_range ? 1.f : 876.f / 1023.f;
+        constants[17].i = reuse_sources ? 1 : 0;
         ncnn::VkMat dispatcher;
         dispatcher.w = nbx;
         dispatcher.h = nby;
         dispatcher.c = 1;
         cmd.record_pipeline(pipeline_sel_stats, bindings, constants, dispatcher);
     }
+    sel_source_stats = stats;
+    sel_stats_a = a.id;
+    sel_stats_b = b.id;
+    sel_stats_nv = use_nv;
     {
         std::vector<ncnn::VkMat> bindings(3);
         bindings[0] = stats;
@@ -1324,7 +1513,7 @@ bool RifeEngine::interpolate_selector(const GpuFrame& a, const GpuFrame& b, floa
     if (tta > 1 && !rife_tta_rgb(a, b, t, r1, error))
         return false;
     ncnn::VkCompute cmd(vkdev);
-    if (tta <= 1 && !infer_rife(cmd, a.rgb, b.rgb, t, r1, error))
+    if (tta <= 1 && !infer_rife(cmd, a.rgb, b.rgb, t, r1, error, false, a.id, b.id))
         return false;
     if (trt && ultra)
     {
@@ -1352,11 +1541,11 @@ bool RifeEngine::interpolate_selector(const GpuFrame& a, const GpuFrame& b, floa
     {
         if (!decide_large_motion(cmd, a, b, error))
             return false;
-        if (lm_active && !infer_rife(cmd, a.rgb, b.rgb, t, r05, error, true))
+        if (lm_active && !infer_rife(cmd, a.rgb, b.rgb, t, r05, error, true, a.id, b.id))
             return false;
     }
     ncnn::VkMat rb;
-    if (ultra && !infer_rife(cmd, b.rgb, a.rgb, 1.f - t, rb, error))
+    if (ultra && !infer_rife(cmd, b.rgb, a.rgb, 1.f - t, rb, error, false, b.id, a.id))
         return false;
     ncnn::VkMat nv;
     ncnn::VkMat maps;
@@ -1369,7 +1558,36 @@ bool RifeEngine::interpolate_selector(const GpuFrame& a, const GpuFrame& b, floa
     }
     const ncnn::VkMat* cand[5] = {&r1, r05.empty() ? nullptr : &r05, &mc, rb.empty() ? nullptr : &rb, use_nv ? &nv : nullptr};
     ncnn::VkMat out;
-    return record_selector(cmd, a, b, cand, maps, out, error) && convert_and_download(cmd, out, dst, error);
+    const bool ok = record_selector(cmd, a, b, cand, maps, out, error) && convert_and_download(cmd, out, dst, error);
+    if (use_nv && !cache_headroom())
+    {
+        // Sans mesure fiable ou sans réserve, conserver le chemin de recalcul initial.
+        dense_inc_cache.release();
+        dense_maps_cache.release();
+    }
+    return ok;
+}
+
+bool RifeEngine::cache_headroom(size_t extra, uint64_t minimum_reserve) const
+{
+    const ncnn::GpuInfo& info = vkdev->info;
+    if (!info.support_VK_EXT_memory_budget() || !ncnn::vkGetPhysicalDeviceMemoryProperties2KHR)
+        return false;
+    const uint32_t type = blob_vkallocator->buffer_memory_type_index;
+    if (type >= info.physicalDeviceMemoryProperties().memoryTypeCount)
+        return false;
+    const uint32_t heap = info.physicalDeviceMemoryProperties().memoryTypes[type].heapIndex;
+    VkPhysicalDeviceMemoryBudgetPropertiesEXT budget{};
+    budget.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT;
+    VkPhysicalDeviceMemoryProperties2KHR props{};
+    props.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2_KHR;
+    props.pNext = &budget;
+    ncnn::vkGetPhysicalDeviceMemoryProperties2KHR(info.physicalDevice(), &props);
+    const VkDeviceSize total = budget.heapBudget[heap];
+    const VkDeviceSize used = budget.heapUsage[heap];
+    // Réserve d'au moins 1 Gio et 20 % du budget annoncé (qui n'est pas la VRAM libre).
+    const VkDeviceSize reserve = std::max<VkDeviceSize>(minimum_reserve, total / 5);
+    return total > used && total - used >= reserve && total - used - reserve >= extra;
 }
 
 bool RifeEngine::record_flip(ncnn::VkCompute& cmd, const ncnn::VkMat& src, int flip, ncnn::VkMat& dst, std::string& error)
@@ -1443,7 +1661,8 @@ bool RifeEngine::rife_tta_rgb(const GpuFrame& a, const GpuFrame& b, float t, ncn
             std::swap(in0, in1);
 
         ncnn::VkMat out;
-        if (!infer_rife(cmd, in0, in1, reverse ? 1.f - t : t, out, error))
+        if (!infer_rife(cmd, in0, in1, reverse ? 1.f - t : t, out, error,
+                        false, reverse ? b.id : a.id, reverse ? a.id : b.id, flip))
             return false;
         if (out.w != w_padded || out.h != h_padded || out.c != 3)
         {

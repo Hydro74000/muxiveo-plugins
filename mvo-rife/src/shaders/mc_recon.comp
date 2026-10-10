@@ -1,6 +1,7 @@
 // Muxiveo — MC : reconstruction au temps t par compensation recouvrante (OBMC) des
 // 4 blocs voisins. Chaque côté est écarté s'il échantillonne hors image. Sorties :
-// image RGB (fp32), erreur bilatérale minimale (luminance) et indicateur de bord de cadre.
+// RGB direct dans le format du réseau, ou RGB fp32 + erreur bilatérale et bord de cadre
+// pour l'ancienne règle hybride.
 
 #version 450
 
@@ -14,6 +15,7 @@ layout (binding = 2) readonly buffer field_blob { vec2 field[]; };
 layout (binding = 3) writeonly buffer mc_blob { float mc_data[]; };
 layout (binding = 4) writeonly buffer q_blob { float q_data[]; };
 layout (binding = 5) writeonly buffer edge_blob { float edge_data[]; };
+layout (binding = 6) writeonly buffer rgb_blob { sfp rgb_data[]; };
 
 layout (push_constant) uniform parameter
 {
@@ -28,6 +30,7 @@ layout (push_constant) uniform parameter
     float kr;
     float kb;
     float lum_scale;
+    int rgb_only; // candidat MC du sélecteur : sortie directe, sans cartes q/edge
 } p;
 
 vec3 sample_rgb(int which, float x, float y)
@@ -104,13 +107,23 @@ void main()
         float wa = (1.f - p.t) * ia + 1e-3f;
         float wb = p.t * ib + 1e-3f;
         vec3 pk = (wa * A + wb * B) / (wa + wb);
-        float q = ia * ib > 0.f ? abs(lum(A) - lum(B)) : 0.f;
-        qbest = min(qbest, q);
+        if (p.rgb_only == 0)
+        {
+            float q = ia * ib > 0.f ? abs(lum(A) - lum(B)) : 0.f;
+            qbest = min(qbest, q);
+        }
         acc += wbl * pk;
         wsum += wbl;
     }
     int i = gy * p.w + gx;
     vec3 o = acc / max(wsum, 1e-12f);
+    if (p.rgb_only != 0)
+    {
+        rgb_data[i] = sfp(o.r);
+        rgb_data[p.cstep + i] = sfp(o.g);
+        rgb_data[2 * p.cstep + i] = sfp(o.b);
+        return;
+    }
     mc_data[i] = o.r;
     mc_data[p.w * p.h + i] = o.g;
     mc_data[2 * p.w * p.h + i] = o.b;

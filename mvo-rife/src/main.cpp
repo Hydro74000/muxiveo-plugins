@@ -357,6 +357,8 @@ struct Options
     std::string trt_cache;         // moteurs et caches TensorRT (défaut : cache utilisateur)
     double scene_threshold = 10.0;
     bool fp32 = false;
+    bool feature_cache = false;
+    int feature_cache_reserve = 1024;
     bool uhd = false;
     bool list_gpus = false;
     bool capabilities = false;
@@ -384,6 +386,8 @@ static void print_usage(FILE* fp)
             "  --scene-threshold <s>   seuil de changement de scène 0-100 (défaut : 10 ; 0 = désactivé)\n"
             "  --uhd                   mode rapide : flux optique à demi-résolution (échelles x2)\n"
             "  --fp32                  calcul en float32 (plus lent, précision maximale)\n"
+            "  --feature-cache         cache optionnel des têtes ncnn si la réserve de VRAM suffit\n"
+            "  --feature-cache-reserve <MiB> réserve minimale de ce cache (défaut : 1024 ; au moins 20 %% du budget)\n"
             "  --tta <n>               moyenne de n variantes : 2 = + sens temporel inverse, 4 = + miroir\n"
             "                          horizontal, 8 = + miroirs vertical et double (coût x n ; défaut : 1)\n"
             "  --engine <e>            rife (défaut) | hybrid : RIFE + compensation de mouvement par blocs,\n"
@@ -525,6 +529,11 @@ static bool parse_args(const std::vector<std::string>& args, Options& o, std::st
             if (!value(v) || !parse_double_option(a, v, 0.0, std::numeric_limits<double>::max(), o.progress_interval, error)) return false;
         }
         else if (a == "--fp32") o.fp32 = true;
+        else if (a == "--feature-cache") o.feature_cache = true;
+        else if (a == "--feature-cache-reserve")
+        {
+            if (!value(v) || !parse_int_option(a, v, 1024, std::numeric_limits<int>::max(), o.feature_cache_reserve, error)) return false;
+        }
         else if (a == "--uhd") o.uhd = true;
         else if (a == "--allow-interlaced") o.allow_interlaced = true;
         else if (a == "--debug-roundtrip") o.roundtrip = true;
@@ -693,7 +702,7 @@ static int print_capabilities(const Options& o, const fs::path& exe_dir)
 {
     static const char* const OPTIONS[] = {
         "input", "output", "factor", "fps", "model", "gpu", "matrix", "range", "chroma-loc", "scene-threshold", "uhd",
-        "fp32", "tta", "engine", "trt-plugin", "trt-cache", "backend", "nvof", "large-motion", "selector",
+        "fp32", "feature-cache", "feature-cache-reserve", "tta", "engine", "trt-plugin", "trt-cache", "backend", "nvof", "large-motion", "selector",
         "selector-weights", "ultra", "padding", "threads", "allow-interlaced", "progress-interval", "quiet", "verbose",
         "list-gpus", "capabilities", "version"};
     std::vector<std::string> models;
@@ -956,6 +965,8 @@ static int run(const Options& o, const fs::path& exe_dir)
     }
     RifeEngine engine;
     engine.set_tta(o.tta);
+    engine.set_feature_cache(o.feature_cache);
+    engine.set_feature_cache_reserve(o.feature_cache_reserve);
     engine.set_engine(o.engine == "mc" ? InterpEngine::Mc : (o.engine == "hybrid" ? InterpEngine::Hybrid : InterpEngine::Rife));
     // jeu de poids du sélecteur selon le modèle RIFE (v4.6 ou v4.15 ; autres modèles : poids v4.15)
     // poids du sélecteur : famille du modèle RIFE (v4.6, v4.15), variante affinée Muxiveo (« -mvo ») à part
@@ -1383,6 +1394,8 @@ static int run(const Options& o, const fs::path& exe_dir)
 
     if (!o.quiet && engine.selector())
         fprintf(stderr, "info: sélecteur : %lld image(s) avec le candidat flux NVIDIA\n", (long long)engine.selector_frames_nv());
+    if (!o.quiet && o.feature_cache)
+        fprintf(stderr, "info: cache des têtes ncnn : %lld réutilisation(s)\n", (long long)engine.feature_cache_hits());
     if (!o.quiet && engine.large_motion())
         fprintf(stderr, "info: grands mouvements : %lld paire(s) sur %lld\n", (long long)engine.large_motion_pairs_active(),
                 (long long)engine.large_motion_pairs_total());

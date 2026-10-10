@@ -85,6 +85,8 @@ def main() -> None:
     shutil.copy2(HERE / "selector" / "selector.txt", dest / "rife-models" / "selector.txt")
     for doc in ("README.md", "UPSTREAM.md", "models.json", "presets.json"):
         shutil.copy2(HERE / doc, dest / doc)
+    if (HERE / "docs").is_dir():
+        shutil.copytree(HERE / "docs", dest / "docs")
     for lic in sorted((HERE / "LICENSES").glob("*.txt")):
         shutil.copy2(lic, dest / "LICENSES" / lic.name)
     shutil.copy2(HERE.parent / "LICENSE", dest / "LICENSES" / "MIT-mvo-rife.txt")

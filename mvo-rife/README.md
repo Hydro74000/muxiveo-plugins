@@ -8,6 +8,15 @@ Extension de Muxiveo : installée, mise à jour et supprimée par l'application 
 utilisateur. Le moteur, ses modèles, les poids de son sélecteur et ses préréglages évoluent sans release de
 Muxiveo : l'application retient la version la plus récente dont le contrat (`--capabilities`) lui est connu.
 
+## Nouveautés 1.7.1
+
+- Calculs MC inutilisés supprimés et invariants réutilisés dans les préréglages hybrides, Ultra compris.
+- Recherche MC : prédicteur partagé et vecteurs strictement identiques dédupliqués, sans changer les candidats utiles.
+- Entrées TensorRT réutilisées entre sorties et entre paires ; Ultra et TTA temporel inversent leurs adresses sans recopie.
+- Cache optionnel des caractéristiques Vulkan pour v4.15 et Light, y compris Ultra, UHD et TTA 2/4/8,
+  avec réserve VRAM et repli automatique. Aucun changement de modèle ni de poids.
+- Priorité aux conversions 23,976 → 59,94 et 24 → 60. Voir le [rapport des mesures](docs/2026-10-10-performance-qualite.md).
+
 ```
 ffmpeg -i src.mkv -map 0:v:0 -pix_fmt yuv420p10le -f yuv4mpegpipe -strict -1 - \
   | muxiveo-rife --factor 2 --matrix bt2020nc --chroma-loc topleft \
@@ -146,6 +155,24 @@ muxiveo-rife --trt-plugin <dossier du plugin> [--trt-cache <dossier>] [--backend
   calcul fp16 (avec `--fp32`, inférence Vulkan).
 - `--list-gpus` indique `trt_compatible` (Turing ou plus récent, pilote NVIDIA 575 ou plus récent), et avec
   `--trt-plugin`, `trt` et `trt_status` (plugin réellement utilisable).
+
+## Cache optionnel des têtes ncnn (`--feature-cache`)
+
+Désactivé par défaut. Sur les graphes compatibles v4.15 et Light, cette option conserve les caractéristiques des
+deux images sources pour les sorties successives d'une même paire, en particulier à 23,976 → 59,94 et
+24 → 60. Le graphe et la forme des tenseurs sont vérifiés ; les réseaux normal et à flux demi-résolution
+ont des caches séparés. Chaque entrée est identifiée par sa source, son côté du graphe et son miroir :
+Ultra et TTA 2/4/8 conservent leurs propres caractéristiques, sans supposer que les deux branches partagent
+les mêmes poids. Le calcul et les poids restent identiques. v4.6 n'a pas ces têtes indépendantes et suit
+son calcul courant.
+
+Une première inférence amorce l'allocateur. La réutilisation demande ensuite une mesure de mémoire fiable
+et une réserve d'au moins 1 Gio et 20 % du budget GPU, en plus du coût estimé des têtes. Si la réserve
+manque ou ne peut pas être mesurée, le moteur recalcule normalement. L'inférence TensorRT suit son
+graphe courant. La ligne `info: cache des têtes ncnn` compte les
+réutilisations effectives. `--feature-cache-reserve <MiB>` permet d'augmenter la réserve minimale
+(défaut : 1024), par exemple pour garder davantage de place à un encodeur GPU. Voir les
+[mesures ciblées et décisions](docs/2026-10-10-performance-qualite.md).
 
 ## TTA (`--tta 2|4|8`)
 

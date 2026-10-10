@@ -406,13 +406,13 @@ bool TrtBackend::open(const std::string& model, int width, int height, const fs:
     return true;
 }
 
-bool TrtBackend::infer(float t, std::string& error)
+bool TrtBackend::infer(float t, std::string& error, bool reverse_inputs)
 {
     MvoTrtInferParams params;
     memset(&params, 0, sizeof params);
     params.struct_size = sizeof params;
-    params.in0 = slots[0].cuda_ptr;
-    params.in1 = slots[1].cuda_ptr;
+    params.in0 = slots[reverse_inputs ? 1 : 0].cuda_ptr;
+    params.in1 = slots[reverse_inputs ? 0 : 1].cuda_ptr;
     params.out = slots[2].cuda_ptr;
     params.t = t;
     char err[512] = {0};

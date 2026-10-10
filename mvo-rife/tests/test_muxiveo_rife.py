@@ -542,6 +542,115 @@ def test_selector_uses_fine_tuned_model_weights() -> None:
 
 
 @needs_selector
+@pytest.mark.parametrize("nvof", ["off", "auto"])
+def test_quality_cached_sources_preserve_common_timesteps(nvof: str) -> None:
+    """Les caches par paire ne modifient ni t=0,5, ni les sources après d'autres temps."""
+    models = Path(RIFE_BIN).resolve().parent / "rife-models"
+    if not (models / "rife-v4.15-mvo1" / "flownet.param").is_file():
+        pytest.skip("modèle rife-v4.15-mvo1 absent")
+    # Panoramique assez rapide pour exercer également le réseau à flux demi-résolution.
+    data = _panning(48)
+    args = (*_SEL, "--model", "rife-v4.15-mvo1", "--nvof", nvof)
+    twice = run_rife(data, *args, "--factor", "2")
+    four = run_rife(data, *args, "--factor", "4")
+    assert twice.returncode == four.returncode == 0, (twice.stderr + four.stderr).decode()
+    out2, out4 = parse_y4m(twice.stdout), parse_y4m(four.stdout)
+    assert out4.frames[0::4] == parse_y4m(data).frames
+    assert out4.frames[2::4] == out2.frames[1::2]
+
+
+@needs_selector
+def test_quality_multiple_timesteps_do_not_share_previous_pair() -> None:
+    """Texture et écart A/B doivent être recalculés même sans NVOF à la paire suivante."""
+    models = Path(RIFE_BIN).resolve().parent / "rife-models"
+    if not (models / "rife-v4.15-mvo1" / "flownet.param").is_file():
+        pytest.skip("modèle rife-v4.15-mvo1 absent")
+    data = make_y4m("testsrc2=size=668x404:rate=24,crop=334:202:n*8:0", frames=5, pix_fmt="yuv420p10le")
+    src = parse_y4m(data)
+    header = data.split(b"\n", 1)[0] + b"\n"
+    args = (*_SEL, "--model", "rife-v4.15-mvo1", "--nvof", "off", "--factor", "4")
+    full = run_rife(data, *args)
+    assert full.returncode == 0, full.stderr.decode()
+    out = parse_y4m(full.stdout)
+    for k in (0, 2, 3):
+        pair = run_rife(header + b"".join(b"FRAME\n" + f for f in src.frames[k:k + 2]), *args)
+        assert pair.returncode == 0, pair.stderr.decode()
+        assert out.frames[4*k+1:4*k+4] == parse_y4m(pair.stdout).frames[1:4], f"paire {k}"
+
+
+@needs_selector
+@pytest.mark.parametrize(("source_rate", "target"), [("24000:1001", "60000/1001"), ("24:1", "60/1")])
+@pytest.mark.parametrize("nvof", ["off", "auto"])
+@pytest.mark.parametrize("backend", ["vulkan", "tensorrt"])
+def test_quality_two_and_half_uses_correct_pair_and_timestep(source_rate: str, target: str,
+                                                            nvof: str, backend: str) -> None:
+    """À ×2,5, les temps 0,4/0,8 puis 0,2/0,6 restent propres à chaque paire."""
+    models = Path(RIFE_BIN).resolve().parent / "rife-models"
+    if not (models / "rife-v4.15-mvo1" / "flownet.param").is_file():
+        pytest.skip("modèle rife-v4.15-mvo1 absent")
+    gpu = _test_gpu()
+    extra: tuple[str, ...] = ()
+    if backend == "tensorrt":
+        if not TRT_PLUGIN or not any(g.get("trt_compatible") for g in GPUS):
+            pytest.skip("plugin TensorRT et GPU NVIDIA compatible requis")
+        gpu = _trt_gpu()
+        extra = ("--trt-plugin", TRT_PLUGIN)
+    data = _panning(48).replace(b" F25:1 ", f" F{source_rate} ".encode(), 1)
+    common = (RIFE_BIN, "--quiet", "-g", str(gpu), *_SEL, "--model", "rife-v4.15-mvo1",
+              "--nvof", nvof, "--backend", backend, *extra)
+    def invoke(*args: str) -> subprocess.CompletedProcess:
+        return subprocess.run([*common, *args], input=data, capture_output=True, timeout=600, check=False)
+    five, fractional = invoke("--factor", "5"), invoke("--fps", target)
+    assert five.returncode == fractional.returncode == 0, (five.stderr + fractional.stderr).decode()
+    out5, out25 = parse_y4m(five.stdout), parse_y4m(fractional.stdout)
+    assert out25.frames == out5.frames[0::2]
+
+
+@needs_selector
+@pytest.mark.parametrize("extra", [[], ["--uhd"], ["--fp32"], ["--tta", "2"], ["--tta", "4"], ["--tta", "8"], ["--ultra"]])
+def test_optional_head_cache_preserves_quality_at_two_and_half(extra: list[str]) -> None:
+    """Le cache optionnel garde les mêmes sorties avec plusieurs t et plusieurs paires."""
+    models = Path(RIFE_BIN).resolve().parent / "rife-models"
+    if not (models / "rife-v4.15-mvo1" / "flownet.param").is_file():
+        pytest.skip("modèle rife-v4.15-mvo1 absent")
+    data = _panning(48).replace(b" F25:1 ", b" F24000:1001 ", 1)
+    args = (*_SEL, "--model", "rife-v4.15-mvo1", "--backend", "vulkan", "--nvof", "off",
+            "--fps", "60000/1001", *extra)
+    plain, cached = run_rife(data, *args), _run_verbose(data, *args, "--feature-cache")
+    assert plain.returncode == cached.returncode == 0, (plain.stderr + cached.stderr).decode()
+    assert parse_y4m(plain.stdout).frames == parse_y4m(cached.stdout).frames
+    assert "cache des têtes ncnn :" in cached.stderr.decode()
+
+
+@needs_selector
+def test_optional_head_cache_falls_back_when_reserve_cannot_be_kept() -> None:
+    """Une réserve supérieure au budget interdit le cache, sans empêcher l'interpolation."""
+    data = _panning(6)
+    args = (*_SEL, "--model", "rife-v4.15", "--backend", "vulkan", "--nvof", "off", "--fps", "60/1")
+    plain = run_rife(data, *args)
+    cached = _run_verbose(data, *args, "--feature-cache", "--feature-cache-reserve", "2147483647")
+    assert plain.returncode == cached.returncode == 0, (plain.stderr + cached.stderr).decode()
+    assert parse_y4m(plain.stdout).frames == parse_y4m(cached.stdout).frames
+    assert "cache des têtes ncnn : 0 réutilisation(s)" in cached.stderr.decode()
+    bad = run_rife(data, *args, "--feature-cache-reserve", "0")
+    assert bad.returncode == 1 and b"--feature-cache-reserve" in bad.stderr
+
+
+@pytest.mark.parametrize("model", ["rife-v4.6", "rife-v4.15", "rife-v4.15-lite"])
+@pytest.mark.parametrize("extra", [[], ["--uhd"], ["--tta", "8"]])
+def test_optional_head_cache_preserves_other_rife_models(model: str, extra: list[str]) -> None:
+    """RIFE seul : graphe compatible mis en cache, autres graphes recalculés sans changement."""
+    models = Path(RIFE_BIN).resolve().parent / "rife-models"
+    if not (models / model / "flownet.param").is_file():
+        pytest.skip(f"modèle {model} absent")
+    data = _panning(6).replace(b" F25:1 ", b" F24000:1001 ", 1)
+    args = ("--model", model, "--backend", "vulkan", "--scene-threshold", "0", "--fps", "60000/1001", *extra)
+    plain, cached = run_rife(data, *args), run_rife(data, *args, "--feature-cache")
+    assert plain.returncode == cached.returncode == 0, (plain.stderr + cached.stderr).decode()
+    assert parse_y4m(plain.stdout).frames == parse_y4m(cached.stdout).frames
+
+
+@needs_selector
 @pytest.mark.parametrize("size", ["96x64", "334x202", "720x480", "1742x676"])
 def test_selector_any_size_without_seams(size: str) -> None:
     # bloc proportionnel à la largeur (8 px en SD … 64 px en 8K) : tailles non multiples du bloc acceptées
@@ -641,7 +750,8 @@ def test_tensorrt_backend_without_plugin_is_refused() -> None:
 
 @needs_trt_support
 @needs_trt_plugin
-@pytest.mark.parametrize("extra", [[], ["--engine", "hybrid"], ["--uhd"], ["--tta", "2"]])
+@pytest.mark.parametrize("extra", [[], ["--engine", "hybrid"], ["--uhd"], ["--tta", "2"],
+                                  ["--tta", "4"], ["--tta", "8"], ["--engine", "hybrid", "--ultra"]])
 def test_tensorrt_inference_keeps_originals_and_matches_vulkan(tmp_path: Path, extra: list[str]) -> None:
     data = make_y4m("testsrc2=size=160x96:rate=25", frames=6, pix_fmt="yuv420p10le")
     src = parse_y4m(data)
@@ -665,3 +775,21 @@ def test_tensorrt_inference_keeps_originals_and_matches_vulkan(tmp_path: Path, e
 def _trt_gpu() -> int:
     """Premier GPU compatible TensorRT."""
     return next(g["index"] for g in GPUS if g.get("trt_compatible"))
+
+
+@needs_trt_support
+@needs_trt_plugin
+@pytest.mark.parametrize("extra", [[], ["--engine", "hybrid"], ["--uhd"], ["--tta", "2"]])
+def test_tensorrt_cached_inputs_preserve_common_timesteps(extra: list[str]) -> None:
+    """Changer t réutilise les entrées, puis une nouvelle paire ou un TTA les remplace."""
+    data = _panning(48)
+    common = ("--model", "rife-v4.15-mvo1", "--backend", "tensorrt", "--trt-plugin", TRT_PLUGIN,
+              "--scene-threshold", "0", "--matrix", "bt709", "--nvof", "off", *extra)
+    def run_factor(factor: str) -> subprocess.CompletedProcess:
+        return subprocess.run([RIFE_BIN, "--quiet", "-g", str(_trt_gpu()), *common, "--factor", factor],
+                              input=data, capture_output=True, timeout=600, check=False)
+    twice, four = run_factor("2"), run_factor("4")
+    assert twice.returncode == four.returncode == 0, (twice.stderr + four.stderr).decode()
+    out2, out4 = parse_y4m(twice.stdout), parse_y4m(four.stdout)
+    assert out4.frames[0::4] == parse_y4m(data).frames
+    assert out4.frames[2::4] == out2.frames[1::2]

@@ -28,6 +28,7 @@ layout (push_constant) uniform parameter
     int gw;
     int gh;
     float t;
+    int write_maps; // cartes constantes : écrites uniquement à la première sortie de la paire
 } p;
 
 vec2 grid_at(int which, int gx, int gy)
@@ -124,7 +125,10 @@ void main()
     nv_data[o] = sfp(nv.r);
     nv_data[p.nv_cstep + o] = sfp(nv.g);
     nv_data[2 * p.nv_cstep + o] = sfp(nv.b);
-    int i = gy * p.w + gx;
-    map_data[i] = (inc[i] + inc_at(1, x + f01)) / 2.f;
-    map_data[p.w * p.h + i] = length(f01);
+    if (p.write_maps != 0)
+    {
+        int i = gy * p.w + gx;
+        map_data[i] = (inc[i] + inc_at(1, x + f01)) / 2.f;
+        map_data[p.w * p.h + i] = length(f01);
+    }
 }

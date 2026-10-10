@@ -40,6 +40,9 @@ shared float s_cnt[256];
 shared float s_cost[8];
 shared vec2 s_best;
 shared float s_best_cost;
+shared vec2 s_pred;
+shared vec2 s_candidates[31];
+shared int s_total;
 
 float bilinear(int which, float x, float y)
 {
@@ -139,7 +142,6 @@ void main()
     int team = lid >> 5;
     int lane = lid & 31;
 
-    vec2 pred = p.mode == 0 ? vec2(0.f) : (p.mode == 2 ? median_pred(bx, by) : parent_at(bx, by));
     int total;
     if (p.mode == 0)
         total = (2 * p.radius + 1) * (2 * p.radius + 1);
@@ -152,7 +154,28 @@ void main()
     {
         s_best = vec2(0.f);
         s_best_cost = 3.4e38f;
+        s_pred = p.mode == 0 ? vec2(0.f) : (p.mode == 2 ? median_pred(bx, by) : parent_at(bx, by));
+        s_total = total;
+        if (p.mode != 0 && total <= 31)
+        {
+            s_total = 0;
+            for (int k = 0; k < total; k++)
+            {
+                int kk = p.mode == 2 ? (k < 9 ? (k + 4) % 9 : 9) : k;
+                vec2 v = candidate(kk, bx, by, s_pred);
+                bool duplicate = false;
+                for (int j = 0; j < s_total; j++)
+                    if (all(equal(floatBitsToUint(v), floatBitsToUint(s_candidates[j]))))
+                        duplicate = true;
+                if (!duplicate)
+                    s_candidates[s_total++] = v;
+            }
+        }
     }
+    barrier();
+    vec2 pred = s_pred;
+    bool compact = p.mode != 0 && total <= 31;
+    total = s_total;
     for (int base = 0; base < total; base += 8)
     {
         int k = base + team;
@@ -163,7 +186,7 @@ void main()
         {
             // mode 2 : bloc courant évalué en premier
             int kk = p.mode == 2 ? (k < 9 ? (k + 4) % 9 : 9) : k;
-            v = candidate(kk, bx, by, pred);
+            v = compact ? s_candidates[k] : candidate(kk, bx, by, pred);
             int wn = 16 + 2 * p.margin;
             int wq = wn * wn;
             for (int q = lane; q < wq; q += 32)
