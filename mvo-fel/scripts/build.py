@@ -68,8 +68,12 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("build", type=Path)
     parser.add_argument("--gpu", action="store_true", help="Prototype Vulkan avec dépendances statiques privées")
+    parser.add_argument("--defer-gpu-tests", action="store_true",
+                        help="Préparer sur une machine sans GPU ; validation matérielle exigée ensuite par le packaging")
     parser.add_argument("--jobs", type=int, default=min(8, os.cpu_count() or 1))
     args = parser.parse_args()
+    if args.defer_gpu_tests and not args.gpu:
+        parser.error("--defer-gpu-tests exige --gpu")
     build = args.build.resolve()
     build.mkdir(parents=True, exist_ok=True)
     cache = build / "sources"
@@ -126,7 +130,8 @@ def main() -> None:
          f"-DMVO_FEL_VULKAN_PROTOTYPE={'ON' if args.gpu else 'OFF'}",
          f"-DMVO_FEL_REFERENCE_TESTS={'ON' if args.gpu else 'OFF'}"], ROOT, env)
     run(["cmake", "--build", str(build / "plugin"), "--parallel", str(max(1,args.jobs))], ROOT, env)
-    run(["ctest", "--test-dir", str(build / "plugin"), "--output-on-failure"], ROOT, env)
+    run(["ctest", "--test-dir", str(build / "plugin"), "--output-on-failure",
+         *(["-E", "^fel_(gpu_)?reference$"] if args.defer_gpu_tests else [])], ROOT, env)
 
 
 if __name__ == "__main__":

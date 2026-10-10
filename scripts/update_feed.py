@@ -57,12 +57,17 @@ def build_entry(name: str, tag: str, assets: Path, published: str | None = None)
         manifest = read_manifest(archive)
         if manifest.get("name") != name:
             raise ValueError(f"{archive.name} : extension {manifest.get('name')} au lieu de {name}")
-        fields = {k: v for k, v in manifest.items() if k not in ("files", "platform", "executable", "library")}
+        per_platform = ("capabilities", "direct_ffmpeg") if name == "mvo-fel" else ()
+        fields = {k: v for k, v in manifest.items()
+                  if k not in ("files", "platform", "executable", "library", *per_platform)}
         if common is None:
             common = fields
         elif fields != common:
             raise ValueError(f"{archive.name} : manifeste différent des autres plates-formes")
-        platforms.append({"platform": manifest["platform"], "asset": archive.name, "size": archive.stat().st_size})
+        if name == "mvo-fel" and any(p["platform"] == manifest["platform"] for p in platforms):
+            raise ValueError(f"{archive.name} : plusieurs archives pour la même plate-forme")
+        platforms.append({"platform": manifest["platform"], "asset": archive.name, "size": archive.stat().st_size,
+                          **{k: manifest[k] for k in per_platform if k in manifest}})
     assert common is not None
     if tag != f"{name}-v{common['version']}":
         raise ValueError(f"tag {tag} différent de la version {common['version']}")

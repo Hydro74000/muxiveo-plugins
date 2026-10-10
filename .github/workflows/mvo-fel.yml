@@ -8,6 +8,11 @@ on:
   pull_request:
     paths: ["mvo-fel/**", ".github/workflows/mvo-fel.yml", "scripts/update_feed.py"]
   workflow_dispatch:
+    inputs:
+      prepare_gpu:
+        description: "Préparer le prototype GPU portable pour validation matérielle avant publication"
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -17,6 +22,30 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  linux_gpu_candidate:
+    if: github.event_name == 'workflow_dispatch' && inputs.prepare_gpu
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Préparer le GPU et FFmpeg privé sur glibc 2.28
+        run: |
+          docker run --rm -v "$PWD:/src" -w /src/mvo-fel quay.io/pypa/manylinux_2_28_x86_64 bash -euo pipefail -c '
+            dnf install -y -q nasm pkgconf-pkg-config
+            export PATH=/opt/python/cp312-cp312/bin:$PATH
+            python -m pip install cmake ninja meson jinja2
+            curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs -o /tmp/rustup.sh
+            bash /tmp/rustup.sh -y --profile minimal --default-toolchain 1.90.0
+            source "$HOME/.cargo/env"
+            python scripts/build.py build-gpu --gpu --defer-gpu-tests
+            python scripts/build_direct.py build-gpu
+            tar czf gpu-candidate.tar.gz -C build-gpu plugin ffmpeg-direct/ffmpeg sources ffmpeg/config.h ffmpeg-direct/config.h ffmpeg-direct/ffbuild/config.mak'
+          sudo chown -R "$(id -u):$(id -g)" mvo-fel/gpu-candidate.tar.gz
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mvo-fel-gpu-candidate
+          path: mvo-fel/gpu-candidate.tar.gz
+          if-no-files-found: error
+
   linux:
     runs-on: ubuntu-latest
     steps:
@@ -134,9 +163,10 @@ jobs:
           TAG: ${{ github.ref_name }}
         run: |
           set -euo pipefail
+          python scripts/test_update_feed.py
           python scripts/update_feed.py --name mvo-fel --tag "$TAG" --assets assets --out mvo-fel.json
           (cd assets && sha256sum * > SHA256SUMS)
-          gh release create "$TAG" assets/* --latest=false --title "$TAG" --notes-file mvo-fel/README.md
+          gh release create "$TAG" assets/* --prerelease --latest=false --title "$TAG" --notes-file mvo-fel/README.md
           if ! gh release view extensions-feed >/dev/null 2>&1; then
             gh release create extensions-feed --prerelease --latest=false --title "Flux des extensions" --notes "Versions des extensions Muxiveo"
           fi
