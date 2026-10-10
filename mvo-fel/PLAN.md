@@ -330,8 +330,10 @@ iGPU et GPU dédié FEL, RIFE sur son GPU habituel, et relève les charges
 calcul/encodeur/décodeur. Une carte libre n'est pas automatiquement plus rapide :
 sans RIFE, NVEncC + FEL RTX prend 12,79 s contre 16,31 s avec FEL iGPU.
 
-La conversion/dithering GPU et la réduction des copies restent prioritaires
-pour accélérer NVEncC ; ces mesures n'impliquent pas un parcours sans copie RAM.
+La [réduction des copies et le transport direct](docs/2026-10-10-fel-transport-optimizations.md)
+sont implémentés. NVEncC conserve le NUT allégé ; FFmpeg/NVENC peut recevoir
+des images GPU sans retour RGB en RAM, sur Linux/NVIDIA compatible, sans RIFE.
+La fidélité du filtre direct est attestée par les pixels qu'il produit réellement.
 Windows, macOS/MoltenVK, Intel et plusieurs cartes dédiées restent à mesurer
 sur leurs matériels. Les tests de politique simulés ne remplacent pas ces
 benchmarks physiques. L'activation reste exclusivement explicite et désactivée

@@ -153,7 +153,12 @@ x265 DV/HDR10/SDR, FFmpeg/NVENC, NVEncC et BL seul réussis sur le build statiqu
 307 tests Python ciblés, Ruff et Mypy sur l'application et les scripts FEL au vert.
 La matrice RIFE ajoute des mesures séparées, sans remplacer la validation PQ.
 
-## Prochain goulot à réduire
+## Goulot identifié, puis deux transports optimisés
+
+Les deux voies décrites ci-dessous sont maintenant implémentées :
+[pipe NUT allégé et raccordement GPU direct](2026-10-10-fel-transport-optimizations.md).
+Les coûts historiques suivants motivent ces travaux ; le rapport lié donne
+les mesures actualisées et les limites du prototype direct.
 
 Le surcoût n'impose aucun facteur ×2. Dans la matrice complète, NVEncC seul
 passe de 5,84 à 12,82 s (+119,5 %), tandis que NVEncC avec RIFE passe de 14,53 à
@@ -163,7 +168,7 @@ nécessaires, mais leurs temps ne s'additionnent pas nécessairement au temps
 d'encodage lorsque les étapes se chevauchent. Un profilage interne sur un
 extrait plus long est nécessaire pour attribuer le surcoût.
 
-Chaque image UHD rapatrie actuellement 66,4 Mo RGBA, puis transporte 49,8 Mo
+Avant l'optimisation, chaque image UHD rapatriait 66,4 Mo RGBA, puis transportait 49,8 Mo
 GBRP16 vers FFmpeg avant conversion YUV et nouveau téléversement à NVEncC.
 La réduction de précision doit rester après les traitements qui en ont besoin.
 Les prochaines optimisations utiles sont une conversion/dithering GPU validée

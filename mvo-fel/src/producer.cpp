@@ -1,8 +1,14 @@
 // SPDX-License-Identifier: LGPL-2.1-or-later
 #include "fel_abi.h"
+#include "fel_direct_abi.h"
 #include "reconstruction.hpp"
 #include <algorithm>
 #include <atomic>
+#include <array>
+#include <chrono>
+#include <iomanip>
+#include <locale>
+#include <sstream>
 #include <cstring>
 #include <deque>
 #include <future>
@@ -29,10 +35,20 @@ void fel_gpu_destroy(void *);
 size_t fel_gpu_devices(char *, size_t);
 int fel_gpu_device_name(void *, char *, size_t);
 int fel_gpu_render(void *, const AVDOVIMetadata *, const AVFrame *, const AVFrame *, uint16_t *);
+int fel_gpu_render_planar(void *, const AVDOVIMetadata *, const AVFrame *, const AVFrame *, AVFrame *);
+void *fel_gpu_import(const void *, int, int);
+int fel_gpu_render_vulkan(void *, const AVDOVIMetadata *, const AVFrame *, const AVFrame *, AVFrame *);
 #endif
 }
 
 namespace {
+using Clock = std::chrono::steady_clock;
+struct Timer {
+    double &elapsed;
+    Clock::time_point start=Clock::now();
+    explicit Timer(double &counter) : elapsed(counter) {}
+    ~Timer() { elapsed+=std::chrono::duration<double>(Clock::now()-start).count(); }
+};
 struct Failure : std::runtime_error {
     int status;
     explicit Failure(const std::string &message, int code=MVO_FEL_ERROR)
@@ -120,10 +136,13 @@ struct mvo_fel_context {
 #ifdef MVO_FEL_VULKAN_PROTOTYPE
     void *gpu_prototype = nullptr;
     bool gpu_attempted = false;
-    std::vector<uint16_t> gpu_pixels;
 #endif
     int64_t frames = 0, last_pts = AV_NOPTS_VALUE;
     bool output_closed = false, raw = false, started = false;
+    std::array<double,7> timing{}; // ouverture, lecture, BL, EL, pixels, NUT, pipe.
+    std::string statistics;
+    mvo_fel_layers layers = nullptr;
+    bool pulling = false, drained = false;
 
     mvo_fel_context(const char *path, int index, int count, AVRational rate)
         : source(path), stream_index(index), threads(std::clamp(count, 1, 16)), fps(rate) {}
@@ -142,6 +161,7 @@ struct mvo_fel_context {
     static int write_packet(void *p, const uint8_t *data, int size) {
         auto &self = *static_cast<mvo_fel_context *>(p);
         if (self.cancelled.load()) return AVERROR_EXIT;
+        Timer timer(self.timing[6]);
         if (self.write(self.opaque, data, size)) {
             self.output_closed = true;
             return AVERROR(EPIPE);
@@ -198,7 +218,6 @@ struct mvo_fel_context {
         check(avformat_write_header(output, nullptr), "En-tête NUT");
         rgb = frame();
         rgb->format = AV_PIX_FMT_GBRP16LE; rgb->width = base.width; rgb->height = base.height;
-        check(av_frame_get_buffer(rgb.get(), 32), "Allocation image RGB");
     }
     std::string device = "auto", backend = "cpu";
     void pair() {
@@ -220,9 +239,30 @@ struct mvo_fel_context {
             if (kind != 1 && kind != 3) throw Failure("RPU original invalide ou sans FEL pendant le décodage");
             const muxiveo::fel::Mapping mapping(*reinterpret_cast<const AVDOVIMetadata *>(sd->data));
             if (!mapping.residual) throw Failure("Résiduel désactivé pendant la reconstruction FEL");
+            if (layers) {
+                if(base->width<=0 || base->height<=0 || base->width>8192 || base->height>8192)
+                    throw Failure("Dimensions source invalides");
+                const auto timebase=raw ? av_inv_q(fps) : stream->time_base;
+                const auto pts=raw ? frames : base->pts;
+                if(last_pts!=AV_NOPTS_VALUE && pts<=last_pts)
+                    throw Failure("Horodatages de présentation non croissants");
+                last_pts=pts;
+                if(layers(opaque,base.get(),enhancement.get(),sd->data,pts,
+                          raw ? 1 : base->duration,timebase.num,timebase.den))
+                    throw Failure("Consommateur de couches FEL arrêté",MVO_FEL_OUTPUT_CLOSED);
+                ++frames;
+                return;
+            }
             if (!output) open_output(*base);
             if (base->width != rgb->width || base->height != rgb->height)
                 throw Failure("Changement de dimensions pendant la reconstruction");
+            auto p = packet();
+            const int size = av_image_get_buffer_size(AV_PIX_FMT_GBRP16LE, rgb->width, rgb->height, 1);
+            check(size, "Taille image"); check(av_new_packet(p.get(), size), "Allocation paquet RGB");
+            check(av_image_fill_arrays(rgb->data, rgb->linesize, p->data,
+                AV_PIX_FMT_GBRP16LE, rgb->width, rgb->height, 1), "Plans du paquet RGB");
+            {
+            Timer pixels(timing[4]);
 #ifdef MVO_FEL_VULKAN_PROTOTYPE
             if (!gpu_attempted && device != "cpu") {
                 gpu_attempted = true;
@@ -232,23 +272,13 @@ struct mvo_fel_context {
                     char name[256];
                     fel_gpu_device_name(gpu_prototype, name, sizeof(name));
                     backend = std::string("vulkan: ")+name;
-                    gpu_pixels.resize(4ull*base->width*base->height);
                 }
             }
             if (gpu_prototype) {
-            if (!fel_gpu_render(gpu_prototype,
+            if (!fel_gpu_render_planar(gpu_prototype,
                     reinterpret_cast<const AVDOVIMetadata *>(sd->data),
-                    base.get(), enhancement.get(), gpu_pixels.data()))
+                    base.get(), enhancement.get(), rgb.get()))
                 throw Failure("Échec de reconstruction du prototype Vulkan");
-            for (int y = 0; y < base->height; ++y) {
-                check_cancelled();
-                for (int x = 0; x < base->width; ++x) for (int c = 0; c < 3; ++c) {
-                    const int plane = c == 0 ? 2 : c == 1 ? 0 : 1;
-                    auto *pixel = rgb->data[plane]+y*rgb->linesize[plane]+2*x;
-                    const auto value = gpu_pixels[4ull*(y*base->width+x)+c];
-                    pixel[0] = value & 255; pixel[1] = value >> 8;
-                }
-            }
             } else
 #endif
             {
@@ -264,11 +294,8 @@ struct mvo_fel_context {
             }));
             for (auto &worker : workers) worker.get();
             }
-            auto p = packet();
-            const int size = av_image_get_buffer_size(AV_PIX_FMT_GBRP16LE, rgb->width, rgb->height, 1);
-            check(size, "Taille image"); check(av_new_packet(p.get(), size), "Allocation paquet RGB");
-            check(av_image_copy_to_buffer(p->data, size, rgb->data, rgb->linesize,
-                AV_PIX_FMT_GBRP16LE, rgb->width, rgb->height, 1), "Copie image RGB");
+            }
+            Timer nut(timing[5]);
             const AVRational timebase = raw ? av_inv_q(fps) : stream->time_base;
             p->pts = p->dts = av_rescale_q(raw ? frames : base->pts, timebase, out_stream->time_base);
             if (last_pts != AV_NOPTS_VALUE && p->pts <= last_pts)
@@ -284,12 +311,13 @@ struct mvo_fel_context {
     void run() {
         if (started) throw Failure("Contexte déjà exécuté");
         started = true;
-        open();
+        { Timer timer(timing[0]); open(); }
         auto p = packet();
         int64_t identity = 0;
         for (;;) {
             check_cancelled();
-            const int ret = av_read_frame(input, p.get());
+            int ret;
+            { Timer timer(timing[1]); ret=av_read_frame(input,p.get()); }
             if (ret == AVERROR_EOF) break;
             check(ret, "Lecture source", MVO_FEL_INPUT_ERROR);
             if (p->stream_index == stream_index) {
@@ -297,24 +325,64 @@ struct mvo_fel_context {
                 p->opaque_ref = av_buffer_alloc(sizeof(identity));
                 if (!p->opaque_ref) throw std::bad_alloc();
                 std::memcpy(p->opaque_ref->data, &identity, sizeof(identity)); ++identity;
-                bl.send(p.get()); el.send(p.get()); pair();
+                { Timer timer(timing[2]); bl.send(p.get()); }
+                { Timer timer(timing[3]); el.send(p.get()); }
+                pair();
             }
             av_packet_unref(p.get());
         }
-        bl.send(nullptr); el.send(nullptr); pair();
+        { Timer timer(timing[2]); bl.send(nullptr); }
+        { Timer timer(timing[3]); el.send(nullptr); }
+        pair();
         if (!bl.ready.empty() || !el.ready.empty()) throw Failure("Fin de flux BL/EL désalignée");
         if (!frames) throw Failure("Aucune image FEL reconstruite");
         check(av_write_trailer(output), "Fin NUT");
         avio_flush(io); check(io->error, "Vidange NUT");
     }
+    int next() {
+        if(!started) { started=true; pulling=true; Timer timer(timing[0]); open(); }
+        if(!pulling)throw Failure("Contexte NUT déjà exécuté");
+        const auto before=frames;
+        pair();
+        if(frames!=before)return MVO_FEL_OK;
+        auto p=packet();
+        while(!drained) {
+            check_cancelled();
+            int ret;
+            {Timer timer(timing[1]);ret=av_read_frame(input,p.get());}
+            if(ret==AVERROR_EOF) {
+                {Timer timer(timing[2]);bl.send(nullptr);}
+                {Timer timer(timing[3]);el.send(nullptr);}
+                drained=true;
+            } else {
+                check(ret,"Lecture source",MVO_FEL_INPUT_ERROR);
+                if(p->stream_index==stream_index) {
+                    av_buffer_unref(&p->opaque_ref);
+                    p->opaque_ref=av_buffer_alloc(sizeof(int64_t));
+                    if(!p->opaque_ref)throw std::bad_alloc();
+                    const auto identity=input_identity++;
+                    std::memcpy(p->opaque_ref->data,&identity,sizeof(identity));
+                    {Timer timer(timing[2]);bl.send(p.get());}
+                    {Timer timer(timing[3]);el.send(p.get());}
+                }
+                av_packet_unref(p.get());
+            }
+            pair();
+            if(frames!=before)return MVO_FEL_OK;
+        }
+        if(!bl.ready.empty() || !el.ready.empty())throw Failure("Fin de flux BL/EL désalignée");
+        if(!frames)throw Failure("Aucune image FEL reconstruite");
+        return 5;
+    }
+    int64_t input_identity=0;
 };
 
 uint32_t mvo_fel_abi_version() { return MVO_FEL_ABI; }
 const char *mvo_fel_capabilities() {
 #ifdef MVO_FEL_VULKAN_PROTOTYPE
-    return "{\"abi\":1,\"version\":\"" MVO_FEL_VERSION "\",\"transport\":\"nut\",\"pixel_format\":\"gbrp16le\",\"cpu\":true,\"backend\":\"vulkan-prototype\",\"device_selection\":1,\"experimental\":true}";
+    return "{\"abi\":1,\"version\":\"" MVO_FEL_VERSION "\",\"transport\":\"nut\",\"pixel_format\":\"gbrp16le\",\"cpu\":true,\"backend\":\"vulkan-prototype\",\"statistics\":1,\"device_selection\":1,\"experimental\":true}";
 #else
-    return "{\"abi\":1,\"version\":\"" MVO_FEL_VERSION "\",\"transport\":\"nut\",\"pixel_format\":\"gbrp16le\",\"cpu\":true,\"device_selection\":1}";
+    return "{\"abi\":1,\"version\":\"" MVO_FEL_VERSION "\",\"transport\":\"nut\",\"pixel_format\":\"gbrp16le\",\"cpu\":true,\"statistics\":1,\"device_selection\":1}";
 #endif
 }
 int mvo_fel_classify(const uint8_t *nal, size_t size) {
@@ -357,6 +425,17 @@ int mvo_fel_set_device(mvo_fel_context *p, const char *device) {
     return 0;
 }
 const char *mvo_fel_backend(const mvo_fel_context *p) { return p ? p->backend.c_str() : ""; }
+const char *mvo_fel_statistics(mvo_fel_context *p) {
+    if (!p) return "{}";
+    std::ostringstream text;
+    text.imbue(std::locale::classic());
+    text << std::fixed << std::setprecision(6) << "{\"frames\":" << p->frames;
+    const char *names[]={"open_s","read_s","decode_bl_s","decode_el_s","pixels_s","nut_s","pipe_s"};
+    for(size_t i=0;i<p->timing.size();++i)text << ",\"" << names[i] << "\":" << p->timing[i];
+    text << '}';
+    p->statistics=text.str();
+    return p->statistics.c_str();
+}
 int mvo_fel_run(mvo_fel_context *p, mvo_fel_write write, mvo_fel_progress progress, void *opaque) {
     if (!p || !write) return MVO_FEL_ERROR;
     p->write = write; p->progress = progress; p->opaque = opaque;
@@ -371,3 +450,34 @@ int mvo_fel_run(mvo_fel_context *p, mvo_fel_write write, mvo_fel_progress progre
 void mvo_fel_cancel(mvo_fel_context *p) { if (p) p->cancelled.store(true); }
 const char *mvo_fel_error(const mvo_fel_context *p) { return p ? p->error.c_str() : "Contexte absent"; }
 void mvo_fel_destroy(mvo_fel_context *p) { delete p; }
+unsigned mvo_fel_libavutil_version() { return avutil_version(); }
+int mvo_fel_next_layers(mvo_fel_context *p,mvo_fel_layers callback,void *opaque) {
+    if(!p || !callback)return MVO_FEL_ERROR;
+    p->layers=callback;p->opaque=opaque;
+    try {p->check_cancelled();return p->next();}
+    catch(const Failure &e){p->error=e.what();return p->cancelled.load() ? MVO_FEL_CANCELLED : e.status;}
+    catch(const std::exception &e){p->error=e.what();return MVO_FEL_ERROR;}
+    catch(...){p->error="Erreur native inconnue";return MVO_FEL_ERROR;}
+}
+void *mvo_fel_vulkan_create(const void *device,int w,int h) {
+#ifdef MVO_FEL_VULKAN_PROTOTYPE
+    if(!device || w<=0 || h<=0 || w>8192 || h>8192)return nullptr;
+    return fel_gpu_import(device,w,h);
+#else
+    return nullptr;
+#endif
+}
+int mvo_fel_vulkan_render(void *gpu,const void *md,const void *bl,const void *el,void *output) {
+#ifdef MVO_FEL_VULKAN_PROTOTYPE
+    if(!gpu || !md || !bl || !el || !output)return -1;
+    return fel_gpu_render_vulkan(gpu,static_cast<const AVDOVIMetadata*>(md),
+        static_cast<const AVFrame*>(bl),static_cast<const AVFrame*>(el),static_cast<AVFrame*>(output)) ? 0 : -1;
+#else
+    return -1;
+#endif
+}
+void mvo_fel_vulkan_destroy(void *gpu) {
+#ifdef MVO_FEL_VULKAN_PROTOTYPE
+    fel_gpu_destroy(gpu);
+#endif
+}

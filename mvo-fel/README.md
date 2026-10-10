@@ -8,7 +8,7 @@ indépendamment de la conservation du RPU en sortie.
 version publiée.** Un prototype Vulkan Linux x86_64 est empaquetable après
 validation numérique liée à sa bibliothèque exacte. Les tests couvrent AMD et
 NVIDIA, des séquences synthétiques et trois scènes FEL réelles. La lecture sur
-matériel Dolby Vision et la CI multiplateforme restent à valider avant une
+matériel Dolby Vision et les builds GPU des autres OS restent à valider avant une
 release générale. Le [plan](PLAN.md) et
 le [rapport réel](docs/2026-10-10-real-fel-validation.md) détaillent ces limites.
 
@@ -22,10 +22,17 @@ ou une source sans EL donnent une opération sans effet annoncée au journal.
 - Bibliothèque `libmvo_fel.so`, `mvo_fel.dll` ou `libmvo_fel.dylib`, ABI C
   versionnée et adaptateur Python `ctypes` dans Muxiveo.
 - FFmpeg minimal et libdovi **liés statiquement dans le plugin**, symboles privés.
-  Aucun binaire FFmpeg supplémentaire, aucune modification du PATH ou du FFmpeg
-  système. Le FFmpeg configuré dans Muxiveo reste utilisé pour les traitements
-  et l'encodage. Le plugin ne fournit que les composants nécessaires au HEVC
+  Aucune modification du PATH ou du FFmpeg système. Le FFmpeg configuré dans
+  Muxiveo reste utilisé pour le parcours en pipe. Le plugin ne fournit que les composants nécessaires au HEVC
   BL/EL et au transport NUT ; les autres codecs restent ceux de Muxiveo.
+- Transport direct expérimental Linux/NVIDIA : un **FFmpeg privé supplémentaire**
+  avec source `mvo_fel` et raccordement `mvo_fel_cuda`, uniquement pour cette
+  reconstruction et l'encodeur `hevc_nvenc`. Images Vulkan → conversion P010
+  et dithering → transfert GPU CUDA → NVENC, sans NUT ni retour des images RGB
+  en RAM. Les décodeurs BL/EL restent CPU. Les pilotes ≥ 570, la même carte
+  physique et une géométrie sans redimensionnement sont requis. Autres codecs,
+  RIFE, SDR, filtres non pris en charge, autre GPU ou pilote inconnu conservent
+  le pipe. Aucun encodeur ou traitement RIFE n'est réécrit ou déplacé.
 - Calcul CPU portable, AVX2 sélectionné à l'exécution si disponible, sans GPU
   obligatoire. NVIDIA n'est pas requis : le consommateur peut être un encodeur
   logiciel ou un chemin matériel existant de Muxiveo.
@@ -62,6 +69,8 @@ La construction exécute les tests mathématiques et une reconstruction via l'AB
 Le packaging refait ce test sur la bibliothèque copiée dans le paquet, puis
 produit le manifeste et les sommes SHA-256. La CI dédiée construit les trois
 plateformes indépendamment de RIFE.
+Les builds CPU Linux, Windows et macOS, ainsi que la référence numérique Mesa,
+ont passé la CI pour la première publication du code.
 
 Pour les seuls tests mathématiques, des en-têtes FFmpeg système suffisent :
 
@@ -130,6 +139,24 @@ une autre plateforme. Le paquet est autonome hors pilote graphique ; la voie
 CPU reste utilisable sans chargeur Vulkan. Ce build n'est pas activé en CI
 multiplateforme avant validation de ces configurations.
 
+Le transport direct se construit et s'atteste séparément, sur Linux NVIDIA :
+
+```sh
+python3 scripts/build_direct.py build
+python3 scripts/validate_gpu.py build/plugin/libmvo_fel.so \
+  build/plugin/fel_reference_file build/gpu-validation.json \
+  extrait-1.mkv extrait-2.mkv extrait-3.mkv --direct-ffmpeg build/ffmpeg-direct/ffmpeg
+python3 scripts/package.py linux-x86_64 build build/dist \
+  --validation build/gpu-validation.json --direct-ffmpeg build/ffmpeg-direct/ffmpeg
+```
+
+L'attestation vérifie aussi les images Vulkan produites par ce binaire exact,
+après lecture de 17 images, et refuse une différence d'empreinte avec le renderer
+de référence aux images 0/8/16. Le paquet contient le binaire `ffmpeg-fel`, ses
+sources et configurations, les en-têtes NVIDIA MIT épinglés et leurs notices.
+Muxiveo ne l'utilise que si le manifeste du plugin l'annonce et que le workflow
+est compatible. Sinon, la reconstruction FEL continue par NUT.
+
 Un paquet local peut être installé sans release depuis la racine Muxiveo :
 
 ```sh
@@ -171,6 +198,10 @@ l'extrait est hors chronométrage ; des extraits courts ne prédisent pas le co�
 d'un film complet.
 Le [benchmark local appairé](docs/2026-10-10-fel-workflow-benchmark.md) contient
 les mesures sur le média réel fourni.
+Les [deux optimisations de transport](docs/2026-10-10-fel-transport-optimizations.md)
+décrivent la nouvelle voie directe et le pipe allégé. Pour comparer FFmpeg/NVENC,
+utiliser `--codecs hevc_nvenc`, puis ajouter
+`--direct-ffmpeg /chemin/ffmpeg-fel` pour la série directe.
 L'[investigation GPU](docs/2026-10-10-performance-gpu.md) détaille la correction
 PQ, la distribution locale et les performances. La
 [matrice de placements](docs/2026-10-10-gpu-pipeline-matrix.md) compare x265 et

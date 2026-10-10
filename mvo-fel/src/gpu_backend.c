@@ -6,6 +6,7 @@
 #include <libplacebo/shaders/custom.h>
 #include <libplacebo/shaders/sampling.h>
 #include <libplacebo/utils/libav.h>
+#include <libavutil/hwcontext_vulkan.h>
 #include <stdio.h>
 #include <math.h>
 #include <string.h>
@@ -17,7 +18,7 @@ struct fel_gpu {
     pl_log log;
     pl_vulkan vk;
     pl_dispatch dispatch;
-    pl_tex source[6], middle[6], scaled[6], target;
+    pl_tex source[6], middle[6], scaled[6], target, planar[3];
     pl_shader_obj lut[12];
     pl_tex axes[3][6];
     int axis_w[3], axis_h[3], axis_loc[3];
@@ -49,6 +50,7 @@ void fel_gpu_destroy(void *context)
         for (int c=0;c<3;++c) for(int a=0;a<6;++a) pl_tex_destroy(p->vk->gpu, &p->axes[c][a]);
         for (int i = 0; i < 12; ++i) pl_shader_obj_destroy(&p->lut[i]);
         pl_tex_destroy(p->vk->gpu, &p->target);
+        for (int c=0;c<3;++c) pl_tex_destroy(p->vk->gpu, &p->planar[c]);
     }
     pl_dispatch_destroy(&p->dispatch);
     pl_vulkan_destroy(&p->vk);
@@ -75,10 +77,10 @@ void *fel_gpu_create(int width, int height, const char *device)
     p->vk = pl_vulkan_create(p->log, &params);
     if (!p->vk) goto fail;
     p->dispatch = pl_dispatch_create(p->log, p->vk->gpu);
-    pl_fmt fmt = pl_find_fmt(p->vk->gpu, PL_FMT_UNORM, 4, 16, 16, PL_FMT_CAP_RENDERABLE);
+    pl_fmt fmt = pl_find_fmt(p->vk->gpu, PL_FMT_UNORM, 4, 16, 16, PL_FMT_CAP_RENDERABLE | PL_FMT_CAP_SAMPLEABLE);
     if (!fmt || !p->dispatch) goto fail;
     p->target = pl_tex_create(p->vk->gpu, pl_tex_params(
-        .w = width, .h = height, .format = fmt, .renderable = true, .host_readable = true));
+        .w = width, .h = height, .format = fmt, .renderable = true, .sampleable = true, .host_readable = true));
     if (!p->target) goto fail;
     return p;
 fail:
@@ -251,10 +253,9 @@ static int join_layer(struct fel_gpu *p, pl_shader sh, int enhancement)
     });
 }
 
-int fel_gpu_render(void *context, const AVDOVIMetadata *metadata,
-                           const AVFrame *bl, const AVFrame *el, uint16_t *rgba)
+static int render_target(struct fel_gpu *p, const AVDOVIMetadata *metadata,
+                         const AVFrame *bl, const AVFrame *el)
 {
-    struct fel_gpu *p = context;
     if (!scale_layer(p, bl, 0, metadata) || !scale_layer(p, el, 1, metadata)) return 0;
     struct pl_dovi_metadata dovi = {0};
     pl_map_dovi_metadata(&dovi, metadata);
@@ -266,11 +267,54 @@ int fel_gpu_render(void *context, const AVDOVIMetadata *metadata,
     int ok = eh && join_layer(p, sh, 0) && join_layer(p, eh, 1);
     if (ok) {
         pl_shader_decode_color_ex(sh, pl_color_decode_args(.repr = &repr, .enhancement_layer = eh));
-        ok = pl_dispatch_finish(p->dispatch, pl_dispatch_params(.shader = &sh, .target = p->target)) &&
-             pl_tex_download(p->vk->gpu, pl_tex_transfer_params(.tex = p->target, .ptr = rgba));
+        ok = pl_dispatch_finish(p->dispatch, pl_dispatch_params(.shader = &sh, .target = p->target));
     }
     pl_dispatch_abort(p->dispatch, &sh);
     pl_shader_free(&eh);
+    return ok;
+}
+
+int fel_gpu_render(void *context, const AVDOVIMetadata *metadata,
+                   const AVFrame *bl, const AVFrame *el, uint16_t *rgba)
+{
+    struct fel_gpu *p = context;
+    return render_target(p, metadata, bl, el) &&
+           pl_tex_download(p->vk->gpu, pl_tex_transfer_params(.tex=p->target,.ptr=rgba));
+}
+
+static void downloaded(void *unused) { (void)unused; }
+
+// Quantification identique au chemin RGBA16 ; séparation GBR sur GPU et
+// rapatriement direct dans le paquet NUT, sans déinterleave ni copie CPU.
+int fel_gpu_render_planar(void *context, const AVDOVIMetadata *metadata,
+                         const AVFrame *bl, const AVFrame *el, AVFrame *output)
+{
+    struct fel_gpu *p = context;
+    if (!render_target(p, metadata, bl, el)) return 0;
+    pl_fmt fmt=pl_find_fmt(p->vk->gpu,PL_FMT_UNORM,1,16,16,PL_FMT_CAP_RENDERABLE);
+    if(!fmt)return 0;
+    int ok=1;
+    for(int c=0;c<3 && ok;++c) {
+        ok=pl_tex_recreate(p->vk->gpu,&p->planar[c],pl_tex_params(.w=p->width,.h=p->height,
+            .format=fmt,.renderable=true,.host_readable=true));
+        if(!ok)break;
+        struct pl_shader_desc source={.desc={.name="rgb",.type=PL_DESC_SAMPLED_TEX},
+            .binding={.object=p->target}};
+        const char *body[]={"color=vec4(texelFetch(rgb,ivec2(gl_FragCoord.xy),0).g,0.0,0.0,1.0);",
+                            "color=vec4(texelFetch(rgb,ivec2(gl_FragCoord.xy),0).b,0.0,0.0,1.0);",
+                            "color=vec4(texelFetch(rgb,ivec2(gl_FragCoord.xy),0).r,0.0,0.0,1.0);"};
+        pl_shader sh=pl_dispatch_begin(p->dispatch);
+        ok=pl_shader_custom(sh,&(struct pl_custom_shader){.body=body[c],.input=PL_SHADER_SIG_NONE,
+            .output=PL_SHADER_SIG_COLOR,.descriptors=&source,.num_descriptors=1,
+            .output_w=p->width,.output_h=p->height});
+        ok=ok && pl_dispatch_finish(p->dispatch,pl_dispatch_params(.shader=&sh,.target=p->planar[c]));
+        pl_dispatch_abort(p->dispatch,&sh);
+        if(ok)ok=pl_tex_download(p->vk->gpu,pl_tex_transfer_params(.tex=p->planar[c],
+            .ptr=output->data[c],.row_pitch=output->linesize[c],
+            .callback=p->vk->gpu->limits.callbacks ? downloaded : NULL));
+    }
+    // Les tampons appartiennent au paquet ; même une erreur attend les DMA lancés.
+    pl_gpu_finish(p->vk->gpu);
     return ok;
 }
 
@@ -319,4 +363,89 @@ size_t fel_gpu_devices(char *buffer, size_t capacity)
     if(buffer && capacity>=used)memcpy(buffer,json,used);
     pl_vk_inst_destroy(&inst);
     return used;
+}
+
+// Contexte emprunté à FFmpeg ; aucune création d'un second périphérique GPU.
+static void lock_queue(void *context,uint32_t family,uint32_t index)
+{
+#if FF_API_VULKAN_SYNC_QUEUES
+    AVHWDeviceContext *device=context;
+    AVVulkanDeviceContext *vk=device->hwctx;
+    if(vk->lock_queue)vk->lock_queue(device,family,index);
+#endif
+}
+static void unlock_queue(void *context,uint32_t family,uint32_t index)
+{
+#if FF_API_VULKAN_SYNC_QUEUES
+    AVHWDeviceContext *device=context;
+    AVVulkanDeviceContext *vk=device->hwctx;
+    if(vk->unlock_queue)vk->unlock_queue(device,family,index);
+#endif
+}
+
+void *fel_gpu_import(const void *context,int width,int height)
+{
+    const AVHWDeviceContext *device=context;
+    if(device->type!=AV_HWDEVICE_TYPE_VULKAN)return NULL;
+    const AVVulkanDeviceContext *vk=device->hwctx;
+    struct fel_gpu *p=calloc(1,sizeof(*p));
+    if(!p)return NULL;
+    p->width=width;p->height=height;
+    p->log=pl_log_create(PL_API_VER,pl_log_params(.log_cb=pl_log_simple,.log_level=PL_LOG_WARN));
+    struct pl_vulkan_import_params params={.instance=vk->inst,.get_proc_addr=vk->get_proc_addr,
+        .phys_device=vk->phys_dev,.device=vk->act_dev,.extensions=vk->enabled_dev_extensions,
+        .num_extensions=vk->nb_enabled_dev_extensions,.features=&vk->device_features,
+        .lock_queue=lock_queue,.unlock_queue=unlock_queue,.queue_ctx=(void*)device,
+        .queue_graphics={.index=VK_QUEUE_FAMILY_IGNORED},
+        .queue_compute={.index=VK_QUEUE_FAMILY_IGNORED},
+        .queue_transfer={.index=VK_QUEUE_FAMILY_IGNORED},.max_api_version=VK_API_VERSION_1_3};
+    for(int i=0;i<vk->nb_qf;++i) {
+        const AVVulkanDeviceQueueFamily *q=&vk->qf[i];
+        struct pl_vulkan_queue queue={.index=q->idx,.count=q->num,.flags=vk->queue_flags};
+        if(q->flags&VK_QUEUE_GRAPHICS_BIT)params.queue_graphics=queue;
+        if(q->flags&VK_QUEUE_COMPUTE_BIT)params.queue_compute=queue;
+        if(q->flags&VK_QUEUE_TRANSFER_BIT)params.queue_transfer=queue;
+    }
+    p->vk=pl_vulkan_import(p->log,&params);
+    if(!p->vk)goto fail;
+    p->dispatch=pl_dispatch_create(p->log,p->vk->gpu);
+    pl_fmt fmt=pl_find_fmt(p->vk->gpu,PL_FMT_UNORM,4,16,16,PL_FMT_CAP_RENDERABLE | PL_FMT_CAP_SAMPLEABLE);
+    if(!fmt || !p->dispatch)goto fail;
+    p->target=pl_tex_create(p->vk->gpu,pl_tex_params(.w=width,.h=height,.format=fmt,
+        .renderable=true,.sampleable=true));
+    if(!p->target)goto fail;
+    return p;
+fail:
+    fel_gpu_destroy(p);
+    return NULL;
+}
+
+int fel_gpu_render_vulkan(void *context,const AVDOVIMetadata *metadata,
+                          const AVFrame *bl,const AVFrame *el,AVFrame *output)
+{
+    struct fel_gpu *p=context;
+    if(output->format!=AV_PIX_FMT_VULKAN || output->width!=p->width || output->height!=p->height ||
+       bl->width!=p->width || bl->height!=p->height || !output->hw_frames_ctx)return 0;
+    const AVHWFramesContext *frames=(const AVHWFramesContext*)output->hw_frames_ctx->data;
+    if(frames->sw_format!=AV_PIX_FMT_GBRP16LE)return 0;
+    if(!render_target(p,metadata,bl,el))return 0;
+    struct pl_frame target={0};
+    if(!pl_map_avframe_ex(p->vk->gpu,&target,&(struct pl_avframe_params){.frame=output}))return 0;
+    int ok=target.num_planes==3 && (!target.acquire || target.acquire(p->vk->gpu,&target));
+    struct pl_shader_desc source={.desc={.name="rgb",.type=PL_DESC_SAMPLED_TEX},.binding={.object=p->target}};
+    const char *body[]={"color=vec4(texelFetch(rgb,ivec2(gl_FragCoord.xy),0).g,0.0,0.0,1.0);",
+                        "color=vec4(texelFetch(rgb,ivec2(gl_FragCoord.xy),0).b,0.0,0.0,1.0);",
+                        "color=vec4(texelFetch(rgb,ivec2(gl_FragCoord.xy),0).r,0.0,0.0,1.0);"};
+    for(int c=0;c<3 && ok;++c) {
+        pl_shader sh=pl_dispatch_begin(p->dispatch);
+        ok=pl_shader_custom(sh,&(struct pl_custom_shader){.body=body[c],.input=PL_SHADER_SIG_NONE,
+            .output=PL_SHADER_SIG_COLOR,.descriptors=&source,.num_descriptors=1,
+            .output_w=p->width,.output_h=p->height});
+        ok=ok && pl_dispatch_finish(p->dispatch,pl_dispatch_params(.shader=&sh,.target=target.planes[c].texture));
+        pl_dispatch_abort(p->dispatch,&sh);
+    }
+    if(target.release)target.release(p->vk->gpu,&target);
+    pl_gpu_flush(p->vk->gpu);
+    pl_unmap_avframe(p->vk->gpu,&target);
+    return ok;
 }

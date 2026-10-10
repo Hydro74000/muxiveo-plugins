@@ -23,6 +23,12 @@
     "sha256": "ada386ba78aa2682dca58e7cff4b959f63bab5d08ed1ec166cc5a8eeade108dd",
     "license": "Apache-2.0 and MIT"
   },
+  "ffnvcodec": {
+    "revision": "57f8cc0bb68e5f16f3787ea92cea59000f7bf97f",
+    "url": "https://codeload.github.com/FFmpeg/nv-codec-headers/tar.gz/57f8cc0bb68e5f16f3787ea92cea59000f7bf97f",
+    "sha256": "bafc79a8183093dfcf7bf2ce316ef9eeb9f460199ebffdf4201ec249db87e6ab",
+    "license": "MIT"
+  },
   "glslang": {
     "revision": "a57276bf558f5cf94d3a9854ebdf5a2236849a5a",
     "url": "https://codeload.github.com/KhronosGroup/glslang/tar.gz/a57276bf558f5cf94d3a9854ebdf5a2236849a5a",

@@ -68,6 +68,24 @@ class PackageValidationTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "PQ12"):
             self.load()
 
+    def test_direct_binary_and_pixels_are_required(self):
+        binary = self.library.with_name("ffmpeg-fel")
+        binary.write_bytes(b"filtre de test")
+        self.report["direct"] = {"binary_sha256": package.digest(binary),
+            "filter_sources": {p.name: package.digest(p) for p in sorted((package.ROOT/'integrations/ffmpeg').glob('*.c'))}}
+        for sample in self.report["samples"]:
+            sample["direct"] = {"transport": "vulkan", "frames_read": 17,
+                                "frame_sha256": sample["producer"]["frame_sha256"]}
+        self.load()
+        package.check_direct(binary, self.validation)
+        self.report["samples"][0]["direct"]["frame_sha256"] = ["c"*64]*3
+        self.load()
+        with self.assertRaisesRegex(RuntimeError, "Pixels"):
+            package.check_direct(binary, self.validation)
+        binary.write_bytes(b"autre filtre")
+        with self.assertRaisesRegex(RuntimeError, "incompatible"):
+            package.check_direct(binary, self.validation)
+
 
 if __name__ == "__main__":
     unittest.main()

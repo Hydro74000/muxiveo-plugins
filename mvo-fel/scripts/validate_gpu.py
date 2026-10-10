@@ -11,6 +11,7 @@ import subprocess
 from pathlib import Path
 
 from validate_producer import validate_producer
+from validate_direct import validate_direct
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -25,6 +26,7 @@ def main() -> None:
     parser.add_argument("oracle", type=Path)
     parser.add_argument("report", type=Path)
     parser.add_argument("clips", type=Path, nargs="+")
+    parser.add_argument("--direct-ffmpeg", type=Path, help="Valider aussi le filtre Vulkan privé")
     args = parser.parse_args()
     if len(args.clips) < 3:
         parser.error("Au moins trois scènes FEL distinctes sont nécessaires")
@@ -45,6 +47,9 @@ def main() -> None:
               "backend_source_sha256": digest(ROOT / "src/gpu_backend.c"),
               "dependencies": json.loads((ROOT / "dependencies.json").read_text()),
               "tolerance_pq12": 2, "samples": [], "passed": False}
+    if args.direct_ffmpeg:
+        report["direct"] = {"binary_sha256": digest(args.direct_ffmpeg),
+                            "filter_sources": {p.name: digest(p) for p in sorted((ROOT/'integrations/ffmpeg').glob('*.c'))}}
     for device in devices:
         env = dict(os.environ, MVO_FEL_TEST_DEVICE=device["uuid"])
         for index, clip in enumerate(args.clips):
@@ -63,10 +68,19 @@ def main() -> None:
             if len(pixels) != 3 or len({size for size, _ in pixels}) != 1:
                 raise RuntimeError(f"Empreintes des images de référence absentes : {log}")
             producer = validate_producer(lib, clip, device["uuid"], int(pixels[0][0]), [sha for _, sha in pixels])
+            direct = (validate_direct(args.direct_ffmpeg, args.library, clip, device["uuid"], int(pixels[0][0]),
+                                      [sha for _, sha in pixels]) if args.direct_ffmpeg else None)
             report["samples"].append({"device": device, "clip_sha256": digest(clip), "frames": 3,
                 "max_cpu_pq12": max(cpu), "max_reference_pq12": max(oracle), "log": name,
-                "producer": producer})
+                "producer": producer, "direct": direct})
             args.report.write_text(json.dumps(report, ensure_ascii=False, indent=2)+"\n")
+    if (digest(args.library) != report["library_sha256"] or digest(args.oracle) != report["oracle_sha256"]
+            or digest(ROOT / "src/gpu_backend.c") != report["backend_source_sha256"]
+            or json.loads((ROOT / "dependencies.json").read_text()) != report["dependencies"]):
+        raise RuntimeError("Le moteur ou ses sources ont changé pendant la validation")
+    if args.direct_ffmpeg and (digest(args.direct_ffmpeg) != report["direct"]["binary_sha256"]
+            or report["direct"]["filter_sources"] != {p.name: digest(p) for p in sorted((ROOT/'integrations/ffmpeg').glob('*.c'))}):
+        raise RuntimeError("Le prototype direct a changé pendant la validation")
     report["passed"] = True
     args.report.write_text(json.dumps(report, ensure_ascii=False, indent=2)+"\n")
     print(f"Validation stricte terminée : {args.report}", flush=True)

@@ -72,6 +72,8 @@ if(BUILD_TESTING)
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/smoke.py $<TARGET_FILE:mvo_fel>)
     add_test(NAME fel_package COMMAND ${Python3_EXECUTABLE}
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_package.py)
+    add_test(NAME fel_layers COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/layers.py $<TARGET_FILE:mvo_fel>)
   endif()
   if(MVO_FEL_REFERENCE_TESTS)
     pkg_check_modules(PLACEBO REQUIRED IMPORTED_TARGET libplacebo>=7.374.0)

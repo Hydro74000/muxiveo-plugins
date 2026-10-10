@@ -1,0 +1,383 @@
+{
+  "date": "2026-10-10",
+  "hardware": {
+    "cpu": "AMD Ryzen 7 7800X3D",
+    "fel_gpu": "NVIDIA GeForce RTX 4070 Ti SUPER",
+    "threads": 12
+  },
+  "method": "workflow complet DV P8.1, contrôle sorties hors chronométrage, source commerciale non redistribuée",
+  "short_direct_cases": [
+    {
+      "codec": "hevc_nvenc",
+      "preset": "p5",
+      "fel": false,
+      "repeat": 1,
+      "seconds": 6.413251150006545,
+      "frames": 73,
+      "fps": 11.382682245326617,
+      "width": 3840,
+      "height": 1600,
+      "bytes": 8450609,
+      "source_frames": 73,
+      "pts_error_ms": 0.500000000000167,
+      "output_mbit_s": 22.204055232438797,
+      "fel_device": "auto",
+      "rife": false,
+      "fel_transport": "bl",
+      "rife_gpu": -1,
+      "telemetry": {},
+      "fel_backend": [],
+      "fel_timings": []
+    },
+    {
+      "codec": "hevc_nvenc",
+      "preset": "p5",
+      "fel": true,
+      "repeat": 1,
+      "seconds": 10.912377726999694,
+      "frames": 73,
+      "fps": 6.68965113069551,
+      "width": 3840,
+      "height": 1600,
+      "bytes": 8399436,
+      "source_frames": 73,
+      "pts_error_ms": 0.500000000000167,
+      "output_mbit_s": 22.069597689981254,
+      "fel_device": "auto",
+      "rife": false,
+      "fel_transport": "nut",
+      "rife_gpu": -1,
+      "telemetry": {},
+      "fel_backend": [
+        "FEL — moteur choisi : NVIDIA GeForce RTX 4070 Ti SUPER (auto ; priorité GPU dédié > iGPU > CPU).",
+        "FEL — moteur exécuté : vulkan: NVIDIA GeForce RTX 4070 Ti SUPER ; 73 images."
+      ],
+      "fel_timings": [
+        {
+          "frames": 73,
+          "open_s": 0.003578,
+          "read_s": 0.004155,
+          "decode_bl_s": 0.103413,
+          "decode_el_s": 0.00559,
+          "pixels_s": 2.562042,
+          "nut_s": 3.007752,
+          "pipe_s": 2.451972
+        }
+      ]
+    },
+    {
+      "codec": "hevc_nvenc",
+      "preset": "p5",
+      "fel": true,
+      "repeat": 1,
+      "seconds": 6.8279467889951775,
+      "frames": 73,
+      "fps": 10.691354554440357,
+      "width": 3840,
+      "height": 1600,
+      "bytes": 8405391,
+      "source_frames": 73,
+      "pts_error_ms": 0.500000000000167,
+      "output_mbit_s": 22.085244508915746,
+      "fel_device": "auto",
+      "rife": false,
+      "fel_transport": "direct",
+      "rife_gpu": -1,
+      "telemetry": {},
+      "fel_backend": [
+        "FEL — moteur choisi : NVIDIA GeForce RTX 4070 Ti SUPER (auto ; priorité GPU dédié > iGPU > CPU)."
+      ],
+      "fel_timings": []
+    },
+    {
+      "codec": "hevc_nvenc",
+      "preset": "p5",
+      "fel": true,
+      "repeat": 2,
+      "seconds": 6.850625127000967,
+      "frames": 73,
+      "fps": 10.655961849711893,
+      "width": 3840,
+      "height": 1600,
+      "bytes": 8405391,
+      "source_frames": 73,
+      "pts_error_ms": 0.500000000000167,
+      "output_mbit_s": 22.085244508915746,
+      "fel_device": "auto",
+      "rife": false,
+      "fel_transport": "direct",
+      "rife_gpu": -1,
+      "telemetry": {},
+      "fel_backend": [
+        "FEL — moteur choisi : NVIDIA GeForce RTX 4070 Ti SUPER (auto ; priorité GPU dédié > iGPU > CPU)."
+      ],
+      "fel_timings": []
+    },
+    {
+      "codec": "hevc_nvenc",
+      "preset": "p5",
+      "fel": true,
+      "repeat": 2,
+      "seconds": 10.756328332005069,
+      "frames": 73,
+      "fps": 6.786702464519526,
+      "width": 3840,
+      "height": 1600,
+      "bytes": 8399436,
+      "source_frames": 73,
+      "pts_error_ms": 0.500000000000167,
+      "output_mbit_s": 22.069597689981254,
+      "fel_device": "auto",
+      "rife": false,
+      "fel_transport": "nut",
+      "rife_gpu": -1,
+      "telemetry": {},
+      "fel_backend": [
+        "FEL — moteur choisi : NVIDIA GeForce RTX 4070 Ti SUPER (auto ; priorité GPU dédié > iGPU > CPU).",
+        "FEL — moteur exécuté : vulkan: NVIDIA GeForce RTX 4070 Ti SUPER ; 73 images."
+      ],
+      "fel_timings": [
+        {
+          "frames": 73,
+          "open_s": 0.000611,
+          "read_s": 0.004254,
+          "decode_bl_s": 0.083572,
+          "decode_el_s": 0.005062,
+          "pixels_s": 2.45374,
+          "nut_s": 2.911732,
+          "pipe_s": 2.383893
+        }
+      ]
+    },
+    {
+      "codec": "hevc_nvenc",
+      "preset": "p5",
+      "fel": false,
+      "repeat": 2,
+      "seconds": 6.337229932993068,
+      "frames": 73,
+      "fps": 11.519228554410706,
+      "width": 3840,
+      "height": 1600,
+      "bytes": 8450609,
+      "source_frames": 73,
+      "pts_error_ms": 0.500000000000167,
+      "output_mbit_s": 22.204055232438797,
+      "fel_device": "auto",
+      "rife": false,
+      "fel_transport": "bl",
+      "rife_gpu": -1,
+      "telemetry": {},
+      "fel_backend": [],
+      "fel_timings": []
+    },
+    {
+      "codec": "hevc_nvenc",
+      "preset": "p5",
+      "fel": false,
+      "repeat": 3,
+      "seconds": 6.414515977987321,
+      "frames": 73,
+      "fps": 11.380437783694658,
+      "width": 3840,
+      "height": 1600,
+      "bytes": 8450609,
+      "source_frames": 73,
+      "pts_error_ms": 0.500000000000167,
+      "output_mbit_s": 22.204055232438797,
+      "fel_device": "auto",
+      "rife": false,
+      "fel_transport": "bl",
+      "rife_gpu": -1,
+      "telemetry": {},
+      "fel_backend": [],
+      "fel_timings": []
+    },
+    {
+      "codec": "hevc_nvenc",
+      "preset": "p5",
+      "fel": true,
+      "repeat": 3,
+      "seconds": 10.713497554999776,
+      "frames": 73,
+      "fps": 6.813834569452284,
+      "width": 3840,
+      "height": 1600,
+      "bytes": 8399436,
+      "source_frames": 73,
+      "pts_error_ms": 0.500000000000167,
+      "output_mbit_s": 22.069597689981254,
+      "fel_device": "auto",
+      "rife": false,
+      "fel_transport": "nut",
+      "rife_gpu": -1,
+      "telemetry": {},
+      "fel_backend": [
+        "FEL — moteur choisi : NVIDIA GeForce RTX 4070 Ti SUPER (auto ; priorité GPU dédié > iGPU > CPU).",
+        "FEL — moteur exécuté : vulkan: NVIDIA GeForce RTX 4070 Ti SUPER ; 73 images."
+      ],
+      "fel_timings": [
+        {
+          "frames": 73,
+          "open_s": 0.001211,
+          "read_s": 0.004216,
+          "decode_bl_s": 0.09798,
+          "decode_el_s": 0.005046,
+          "pixels_s": 2.43885,
+          "nut_s": 2.9106,
+          "pipe_s": 2.396633
+        }
+      ]
+    },
+    {
+      "codec": "hevc_nvenc",
+      "preset": "p5",
+      "fel": true,
+      "repeat": 3,
+      "seconds": 6.713361153000733,
+      "frames": 73,
+      "fps": 10.873837759699628,
+      "width": 3840,
+      "height": 1600,
+      "bytes": 8405391,
+      "source_frames": 73,
+      "pts_error_ms": 0.500000000000167,
+      "output_mbit_s": 22.085244508915746,
+      "fel_device": "auto",
+      "rife": false,
+      "fel_transport": "direct",
+      "rife_gpu": -1,
+      "telemetry": {},
+      "fel_backend": [
+        "FEL — moteur choisi : NVIDIA GeForce RTX 4070 Ti SUPER (auto ; priorité GPU dédié > iGPU > CPU)."
+      ],
+      "fel_timings": []
+    }
+  ],
+  "long_direct_cases": [
+    {
+      "codec": "hevc_nvenc",
+      "preset": "p5",
+      "fel": false,
+      "repeat": 1,
+      "seconds": 21.12421624500712,
+      "frames": 721,
+      "fps": 34.13144381962167,
+      "width": 3840,
+      "height": 1600,
+      "bytes": 76610219,
+      "source_frames": 721,
+      "pts_error_ms": 0.5000000000023874,
+      "output_mbit_s": 20.380676255783055,
+      "fel_device": "auto",
+      "rife": false,
+      "fel_transport": "bl",
+      "rife_gpu": -1,
+      "telemetry": {},
+      "fel_backend": [],
+      "fel_timings": []
+    },
+    {
+      "codec": "hevc_nvenc",
+      "preset": "p5",
+      "fel": true,
+      "repeat": 1,
+      "seconds": 61.24210561100335,
+      "frames": 721,
+      "fps": 11.772945962694955,
+      "width": 3840,
+      "height": 1600,
+      "bytes": 76578143,
+      "source_frames": 721,
+      "pts_error_ms": 0.5000000000023874,
+      "output_mbit_s": 20.372143052509216,
+      "fel_device": "auto",
+      "rife": false,
+      "fel_transport": "nut",
+      "rife_gpu": -1,
+      "telemetry": {},
+      "fel_backend": [
+        "FEL — moteur choisi : NVIDIA GeForce RTX 4070 Ti SUPER (auto ; priorité GPU dédié > iGPU > CPU).",
+        "FEL — moteur exécuté : vulkan: NVIDIA GeForce RTX 4070 Ti SUPER ; 721 images."
+      ],
+      "fel_timings": [
+        {
+          "frames": 721,
+          "open_s": 0.00136,
+          "read_s": 0.030945,
+          "decode_bl_s": 0.137591,
+          "decode_el_s": 0.036008,
+          "pixels_s": 20.301817,
+          "nut_s": 26.628589,
+          "pipe_s": 21.580365
+        }
+      ]
+    },
+    {
+      "codec": "hevc_nvenc",
+      "preset": "p5",
+      "fel": true,
+      "repeat": 1,
+      "seconds": 24.160727226990275,
+      "frames": 721,
+      "fps": 29.841816979522086,
+      "width": 3840,
+      "height": 1600,
+      "bytes": 76582138,
+      "source_frames": 721,
+      "pts_error_ms": 0.5000000000023874,
+      "output_mbit_s": 20.373205845472146,
+      "fel_device": "auto",
+      "rife": false,
+      "fel_transport": "direct",
+      "rife_gpu": -1,
+      "telemetry": {},
+      "fel_backend": [
+        "FEL — moteur choisi : NVIDIA GeForce RTX 4070 Ti SUPER (auto ; priorité GPU dédié > iGPU > CPU)."
+      ],
+      "fel_timings": []
+    }
+  ],
+  "pipe_summary": [
+    {
+      "codec": "libx265",
+      "preset": "medium",
+      "bl_median_s": 13.61880144001043,
+      "fel_median_s": 15.696372268008417,
+      "bl_range_s": [
+        13.373859376995824,
+        13.652732551010558
+      ],
+      "fel_range_s": [
+        15.62751719399239,
+        15.724396178004099
+      ],
+      "added_s": 2.077570827997988,
+      "added_percent": 15.255166448747314,
+      "time_ratio": 1.1525516644874731,
+      "bl_fps": 5.360236752225099,
+      "fel_fps": 4.65075615903842
+    },
+    {
+      "codec": "nvencc_hevc",
+      "preset": "default",
+      "bl_median_s": 5.68833887699293,
+      "fel_median_s": 10.379517624009168,
+      "bl_range_s": [
+        5.66204710600141,
+        5.729544278990943
+      ],
+      "fel_range_s": [
+        10.342346813995391,
+        10.458822968997993
+      ],
+      "added_s": 4.691178747016238,
+      "added_percent": 82.47009976832062,
+      "time_ratio": 1.8247009976832063,
+      "bl_fps": 12.833271993561423,
+      "fel_fps": 7.033082137761542
+    }
+  ],
+  "long_library_sha256": "b17077c10b867ad4b5d872fb1561d1c6bec402bb88f8bd2aea056b1401fbddea",
+  "long_direct_ffmpeg_sha256": "494cd5144cef6a026cf9aef308fb036ca2920ba4fb68d85307d367e802c693eb"
+}

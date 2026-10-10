@@ -28,3 +28,11 @@ Prototype Vulkan : libplacebo est liée statiquement, avec le compilateur GLSL
 glslang (copyright Khronos Group et contributeurs). Notices complètes dans
 LICENSES/glslang.txt ; ses parties optionnelles et SPIRV-Tools ne sont pas
 construits. Le pilote Vulkan reste celui du système, chargé dynamiquement.
+# Transport GPU direct expérimental
+
+Le binaire privé `ffmpeg-fel` est construit depuis la même révision FFmpeg,
+avec deux filtres propres à mvo-fel sous LGPL-2.1-or-later. Les en-têtes
+nv-codec-headers 13.0.19 sont épinglés dans `dependencies.json`, sous MIT
+(notice originale dans `LICENSES/nv-codec-headers.txt`). Aucun SDK binaire
+NVIDIA propriétaire n'est redistribué ; le pilote fourni par la machine
+reste nécessaire. Le binaire ne remplace aucun FFmpeg installé.

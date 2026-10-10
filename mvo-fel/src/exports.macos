@@ -9,3 +9,9 @@ _mvo_fel_destroy
 _mvo_fel_devices
 _mvo_fel_set_device
 _mvo_fel_backend
+_mvo_fel_statistics
+_mvo_fel_libavutil_version
+_mvo_fel_next_layers
+_mvo_fel_vulkan_create
+_mvo_fel_vulkan_render
+_mvo_fel_vulkan_destroy

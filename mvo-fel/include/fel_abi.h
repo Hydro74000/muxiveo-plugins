@@ -35,6 +35,8 @@ MVO_FEL_EXPORT mvo_fel_context *mvo_fel_create(const char *source, int stream,
 MVO_FEL_EXPORT size_t mvo_fel_devices(char *buffer, size_t capacity);
 MVO_FEL_EXPORT int mvo_fel_set_device(mvo_fel_context *, const char *device);
 MVO_FEL_EXPORT const char *mvo_fel_backend(const mvo_fel_context *);
+/* Mesures locales après run ; pipe_s est inclus dans nut_s. */
+MVO_FEL_EXPORT const char *mvo_fel_statistics(mvo_fel_context *);
 MVO_FEL_EXPORT int mvo_fel_run(mvo_fel_context *, mvo_fel_write, mvo_fel_progress, void *);
 MVO_FEL_EXPORT void mvo_fel_cancel(mvo_fel_context *);
 /* Erreur valide jusqu'à destroy, à consulter après run uniquement. */
