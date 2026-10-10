@@ -31,6 +31,10 @@ if(NOT MVO_FEL_MATH_ONLY)
     target_compile_definitions(mvo_fel PRIVATE MVO_FEL_VULKAN_PROTOTYPE=1)
   endif()
   set_target_properties(mvo_fel PROPERTIES CXX_VISIBILITY_PRESET hidden VISIBILITY_INLINES_HIDDEN YES)
+  if(WIN32)
+    # Nom stable du manifeste, identique avec MSVC et MinGW.
+    set_target_properties(mvo_fel PROPERTIES PREFIX "")
+  endif()
   if(UNIX AND NOT APPLE)
     target_link_options(mvo_fel PRIVATE "-Wl,--exclude-libs,ALL"
         "-Wl,--as-needed"
