@@ -4,12 +4,12 @@ Extension facultative de Muxiveo. Le moteur reconstruit l'apport de la couche FE
 dans les pixels avant les filtres, le tone mapping, l'interpolation et l'encodage,
 indépendamment de la conservation du RPU en sortie.
 
-**Développement : bibliothèque et intégration fonctionnelles localement, aucune
-version publiée.** Un prototype Vulkan Linux x86_64 est empaquetable après
-validation numérique liée à sa bibliothèque exacte. Les tests couvrent AMD et
-NVIDIA, des séquences synthétiques et trois scènes FEL réelles. La lecture sur
-matériel Dolby Vision et les builds GPU des autres OS restent à valider avant une
-release générale. Le [plan](PLAN.md) et
+**Première préversion : `mvo-fel-v0.1.0`, installable depuis Extensions.**
+Le paquet Linux x86_64 propose le CPU, Vulkan et le transport direct expérimental
+NVIDIA, sur une base glibc 2.28. Les paquets Windows x86_64 et macOS arm64
+proposent le CPU ; le GPU sur ces deux OS reste à valider. Les tests couvrent AMD
+et NVIDIA, des séquences synthétiques et trois scènes FEL réelles. La lecture sur
+matériel Dolby Vision reste à valider avant une release générale. Le [plan](PLAN.md) et
 le [rapport réel](docs/2026-10-10-real-fel-validation.md) détaillent ces limites.
 
 Dans Encodage → HDR → Dolby Vision, la case reste **décochée par défaut pour tous
@@ -136,8 +136,9 @@ empreintes et les SHA-256 du moteur, des sources et des dépendances ; le
 schéma 1, qui testait seulement le renderer séparé, n'est plus accepté.
 Le packaging refuse un prototype sans attestation valide, ou sur
 une autre plateforme. Le paquet est autonome hors pilote graphique ; la voie
-CPU reste utilisable sans chargeur Vulkan. Ce build n'est pas activé en CI
-multiplateforme avant validation de ces configurations.
+CPU reste utilisable sans chargeur Vulkan. La CI peut préparer le candidat GPU
+Linux avec l'entrée `prepare_gpu` ; sa publication exige ensuite l'attestation
+sur les GPU physiques et les scènes réelles. Les autres OS conservent le CPU.
 
 Le transport direct se construit et s'atteste séparément, sur Linux NVIDIA :
 
@@ -147,7 +148,8 @@ python3 scripts/validate_gpu.py build/plugin/libmvo_fel.so \
   build/plugin/fel_reference_file build/gpu-validation.json \
   extrait-1.mkv extrait-2.mkv extrait-3.mkv --direct-ffmpeg build/ffmpeg-direct/ffmpeg
 python3 scripts/package.py linux-x86_64 build build/dist \
-  --validation build/gpu-validation.json --direct-ffmpeg build/ffmpeg-direct/ffmpeg
+  --validation build/gpu-validation.json --direct-ffmpeg build/ffmpeg-direct/ffmpeg \
+  --max-glibc 2.28
 ```
 
 L'attestation vérifie aussi les images Vulkan produites par ce binaire exact,

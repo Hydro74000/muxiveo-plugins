@@ -295,9 +295,9 @@ effet, moteur indisponible et reconstruction en échec suivie d'un repli BL.
   Ryzen 7800X3D/RTX 4070 Ti SUPER. Aucune extrapolation générale au film complet
   ou aux autres presets. Le moteur CPU reste coûteux.
 - Release générale encore conditionnée à la lecture Dolby Vision sur matériel
-  compatible, à un corpus élargi et à la CI multiplateforme. Un paquet prototype
-  Linux x86_64 validé numériquement est disponible localement.
-  Aucune version du plugin n'est publiée ni annoncée comme installable.
+  compatible et à un corpus élargi. La première préversion `mvo-fel-v0.1.0`
+  devient installable via le flux Extensions après validation de la CI
+  multiplateforme et du paquet GPU portable ; voir la publication ci-dessous.
 
 Le [rapport de validation réelle](docs/2026-10-10-real-fel-validation.md) contient
 les conditions et limites de ces mesures.
@@ -316,7 +316,7 @@ Le moteur et ses dépendances FFmpeg/libdovi/libplacebo/glslang sont privés et
 statiques. Le chargeur Vulkan est facultatif au chargement ; CPU reste disponible.
 Une attestation SHA-256 exacte est requise pour empaqueter le prototype Linux
 x86_64. Installation dans un dossier de test par le gestionnaire Extensions
-vérifiée ; aucun paquet GPU publié et aucune installation utilisateur modifiée.
+vérifiée ; aucune installation utilisateur modifiée pendant ces validations.
 
 L'interface propose Auto / GPU détectés / CPU, dynamique et enregistrée par
 UUID. Le choix est indépendant de celui de l'encodeur ou du RPU et conservé
@@ -338,3 +338,19 @@ Windows, macOS/MoltenVK, Intel et plusieurs cartes dédiées restent à mesurer
 sur leurs matériels. Les tests de politique simulés ne remplacent pas ces
 benchmarks physiques. L'activation reste exclusivement explicite et désactivée
 par défaut pour tous les profils.
+
+### Première préversion installable
+
+Le candidat du commit `1030741`, construit par la
+[CI 38065556166](https://github.com/Hydro74000/muxiveo-plugins/actions/runs/38065556166),
+porte les binaires Linux sur glibc 2.28. Sa bibliothèque et son FFmpeg privé
+ont passé de nouveau la validation numérique sur les deux GPU physiques et
+trois scènes réelles, avec vérification des images des deux transports.
+La [validation du paquet portable](docs/2026-10-10-portable-prerelease.md)
+documente les empreintes et les limites.
+
+La préversion `mvo-fel-v0.1.0` livre Linux x86_64 CPU/Vulkan/direct NVIDIA,
+Windows x86_64 CPU et macOS arm64 CPU. Le flux `extensions-feed/mvo-fel.json`
+décrit les capacités par plateforme et permet l'installation depuis l'unstable
+existante. Les variantes GPU Windows/macOS et la lecture sur appareil DV
+restent à valider ; cette préversion ne constitue pas une release générale.

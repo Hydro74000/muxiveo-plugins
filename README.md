@@ -11,7 +11,7 @@ elles.
 | [`mvo-rife`](mvo-rife/README.md) — Interpolation d'images | Moteur MVO-RIFE (muxiveo-rife : RIFE v4 Vulkan, moteur hybride, sélecteur appris), modèles et préréglages | Linux x86_64, Windows x64, macOS arm64 ; GPU Vulkan | 1.7.0 |
 | [`mvo-rife-models`](mvo-rife-models/README.md) — Modèles d'interpolation | Modèles RIFE affinés par Muxiveo (ncnn pour muxiveo-rife, PyTorch pour l'export ONNX) | toutes | 1.0.0 |
 | [`mvo-rife-trt`](mvo-rife-trt/README.md) — Accélération NVIDIA (TensorRT) | Inférence RIFE de MVO-RIFE sur les Tensor Cores (TensorRT for RTX) ; repli automatique sur Vulkan | Linux x86_64, Windows x64 ; GPU NVIDIA Turing ou plus récent | 1.1.0 |
-| [`mvo-fel`](mvo-fel/README.md) — Reconstruction Dolby Vision FEL | Reconstruction BL + EL + RPU avant encodage, bibliothèque CPU chargée par Muxiveo | Cibles : Linux x86_64, Windows x64, macOS arm64 | En développement, non publié |
+| [`mvo-fel`](mvo-fel/README.md) — Reconstruction Dolby Vision FEL | Reconstruction BL + EL + RPU avant encodage ; CPU, Vulkan et transport direct NVIDIA sur Linux | Linux x86_64 (CPU/GPU), Windows x64 et macOS arm64 (CPU) | [0.1.0 — préversion](https://github.com/Hydro74000/muxiveo-plugins/releases/tag/mvo-fel-v0.1.0) |
 
 ## Organisation
 

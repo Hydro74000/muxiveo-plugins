@@ -163,6 +163,12 @@ jobs:
           TAG: ${{ github.ref_name }}
         run: |
           set -euo pipefail
+          # Une préversion validée manuellement peut déjà porter ce tag.
+          # Préserver ses paquets GPU et son flux plutôt que publier le CPU à sa place.
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG déjà publiée : paquets et flux conservés."
+            exit 0
+          fi
           python scripts/test_update_feed.py
           python scripts/update_feed.py --name mvo-fel --tag "$TAG" --assets assets --out mvo-fel.json
           (cd assets && sha256sum * > SHA256SUMS)
