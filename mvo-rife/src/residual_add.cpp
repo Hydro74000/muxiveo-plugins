@@ -28,6 +28,9 @@ public:
                 || add[device]->create_pipeline(opt) || relu[device]->create_pipeline(opt)) return -1;
         }
         if (!vkdev) return 0;
+        // La fusion FP16 reste limitée au constructeur dont l’arrondi a été vérifié.
+        // Le contrôle matériel Intel trouve des écarts : conserver ses opérations natives.
+        if ((opt.use_fp16_storage || opt.use_fp16_packed) && vkdev->info.vendor_id() != 0x10de) return 0;
         std::vector<uint32_t> spirv;
         if (ncnn::compile_spirv_module(residual_add_comp_data, sizeof(residual_add_comp_data), opt, spirv)) return -1;
         pipeline = new ncnn::Pipeline(vkdev);
@@ -61,7 +64,7 @@ public:
         const ncnn::VkMat& a = in[0];
         const ncnn::VkMat& b = in[1];
         const size_t count = a.total() * a.elempack;
-        if (a.dims != b.dims || a.w != b.w || a.h != b.h || a.d != b.d || a.c != b.c
+        if (!pipeline || a.dims != b.dims || a.w != b.w || a.h != b.h || a.d != b.d || a.c != b.c
             || a.elempack != b.elempack || a.elemsize != b.elemsize || a.cstep != b.cstep
             || count % 4 != 0 || (a.elempack != 1 && a.elempack != 4))
         {

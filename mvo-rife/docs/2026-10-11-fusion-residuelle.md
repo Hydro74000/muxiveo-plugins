@@ -54,3 +54,22 @@ combinée contre la version livrée est nécessaire.
 - Référence native, mesures alternées et autres GPU/OS encore à terminer. Aucun gain qualitatif supplémentaire démontré.
 
 État : recherche, non livré. Les modèles installés ne sont pas modifiés.
+
+## Correction après contrôle Windows physique
+
+Sur GTX 1070, les 30 comparaisons des modes compatibles en ×2/×2,5 sont
+identiques, y compris les contrôles 10 bits BT.2020. Sur Intel UHD 630, le
+premier rendu Équilibré FP16 diverge. Le diagnostic isole la fusion : remettre
+les additions et activations séparées dans le même binaire conserve exactement
+la 1.7.1 pour v4.6/v4.15 ; les chemins FP32 sont également identiques.
+
+La divergence FP16 atteint 14 codes 8 bits dans le cas v4.6 testé, et 2 avec
+v4.15. Cette variante est refusée. Les tests élémentaires RGB passent pourtant :
+ils ne remplacent pas les rendus complets sur matériel réel.
+
+Le chemin fusionné FP16 est donc limité à NVIDIA, dont les contrôles natifs
+passent. Les autres constructeurs conservent les deux opérations ncnn natives ;
+ils peuvent toujours bénéficier du partage vérifié des têtes. La fusion FP32
+reste disponible. Cette protection doit encore être vérifiée dans le paquet
+Windows reconstruit et sur AMD avant adoption. Le diagnostic précis du pilote
+Intel reste ouvert ; aucun mode d’arrondi différent n’est supposé sans preuve.

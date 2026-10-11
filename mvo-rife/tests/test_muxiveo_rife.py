@@ -715,6 +715,45 @@ def test_different_native_head_weights_disable_cross_sharing(tmp_path: Path) -> 
     assert "partage(s) entre branches" not in cached.stderr.decode()
 
 
+@pytest.mark.parametrize("model", ["rife-v4.6", "rife-v4.15-mvo1"])
+@pytest.mark.parametrize("precision", [[], ["--fp32"]])
+@pytest.mark.parametrize("rate", [("--factor", "2"), ("--fps", "60000/1001")])
+def test_residual_fusion_preserves_full_native_model(
+    tmp_path: Path, model: str, precision: list[str], rate: tuple[str, str],
+) -> None:
+    """Les vrais blocs résiduels exercent les canaux et valeurs absents du graphe RGB minimal."""
+    source = Path(RIFE_BIN).resolve().parent / "rife-models" / model
+    if not (source / "flownet.param").is_file():
+        pytest.skip(f"modèle {model} absent")
+    lines = (source / "flownet.param").read_text().splitlines()
+    separated = lines[:2]
+    count = 0
+    for index, line in enumerate(lines[2:], start=2):
+        if line.split()[0] == "ReLU" and lines[index - 1].split()[0] == "BinaryOp":
+            tokens = line.split()
+            copied = f"native_residual_blob_{count}"
+            separated.append(f"Split native_residual_layer_{count} 1 1 {tokens[4]} {copied}")
+            tokens[4] = copied
+            line = " ".join(tokens)
+            count += 1
+        separated.append(line)
+    assert count == 32, "la fixture doit conserver les 32 additions/activations natives"
+    layers, blobs = map(int, lines[1].split())
+    separated[1] = f"{layers + count} {blobs + count}"
+    folder = tmp_path / model
+    folder.mkdir()
+    (folder / "flownet.param").write_text("\n".join(separated) + "\n")
+    shutil.copyfile(source / "flownet.bin", folder / "flownet.bin")
+    data = make_y4m("testsrc2=size=334x202:rate=24000/1001", frames=5, pix_fmt="yuv420p10le")
+    outputs = []
+    for path in [model, str(folder)]:
+        result = run_rife(data, "--model", path, "--backend", "vulkan", "--scene-threshold", "0",
+                          "--feature-cache", *rate, *precision)
+        assert result.returncode == 0, result.stderr.decode()
+        outputs.append(parse_y4m(result.stdout).frames)
+    assert outputs[0] == outputs[1]
+
+
 @pytest.mark.parametrize("broadcast", [False, True])
 @pytest.mark.parametrize("slope", ["0", "0.2", "-0.1", "1.5"])
 @pytest.mark.parametrize("precision", [[], ["--fp32"]])
