@@ -73,3 +73,38 @@ ils peuvent toujours bénéficier du partage vérifié des têtes. La fusion FP3
 reste disponible. Cette protection doit encore être vérifiée dans le paquet
 Windows reconstruit et sur AMD avant adoption. Le diagnostic précis du pilote
 Intel reste ouvert ; aucun mode d’arrondi différent n’est supposé sans preuve.
+
+## Validation du correctif et gain cumulé
+
+La garde du commit `3a1ce68` passe les contrôles sur matériel réel : Linux/NVIDIA
+et AMD (27 tests ciblés chacun, 18 comparaisons AMD), Windows/GTX 1070 et
+Intel UHD 630 (60 comparaisons identiques et 27 tests ciblés par GPU). La CI
+`38130144582` passe les trois compilations : Linux 214 tests/16 ignorés,
+Windows 58/172, macOS 83/147. macOS reste sans contrôle matériel Metal.
+
+Les deux optimisations combinées sont mesurées contre la 1.7.1 avec cache activé
+des deux côtés, 96 images source en 3840×1600, RTX 4070 Ti SUPER, Vulkan/NVOF auto,
+six répétitions alternées après amorçage, traitement natif hors chargement/encodage :
+
+| Mode | Cadence | Médiane 1.7.1 → candidat | Gain de débit |
+|---|---|---|---:|
+| Équilibré | ×2 | 8,250 → 8,010 s | +3,00 % |
+| Équilibré | ×2,5 | 13,070 → 12,695 s | +2,95 % |
+| Qualité | ×2 | 12,175 → 11,115 s | +9,54 % |
+| Qualité | ×2,5 | 18,855 → 17,915 s | +5,25 % |
+
+Le contrôle ciblé de la garde a des plages de temps recouvrantes, sans coût
+établi : Équilibré 12,63–12,72 → 12,58–12,72 s, Qualité
+17,83–17,89 → 17,76–18,10 s. Variations médianes : −0,16 % et −0,28 %.
+
+Les séquences 3840×2160 avec images natives connues conservent pixels et
+métriques moyens/pires blocs en ×2,5 (24→60) et ×2 complémentaire (30→60).
+Le paquet Linux CI passe le contrôle natif ×2,5 et 32 encodages Muxiveo
+FFmpeg/NVEncC : ×2/×2,5, cadences entières/fractionnaires, Équilibré/Qualité/
+Ultra/Light, cadence, chronologie, décodage complet et audio copié conformes.
+
+Les écarts d’un code sur l’autre séquence 3840×1600 ×2,5 restent conservés.
+RIFE seul est identique dans les deux familles ; la référence hybride varie
+également sur certains rendus. Les ablations n’isolent pas encore une cause
+unique. Aucune amélioration qualitative supplémentaire n’est revendiquée.
+Les poids installés et la réserve finale d’apprentissage restent inchangés.
