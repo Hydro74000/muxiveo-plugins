@@ -161,16 +161,18 @@ muxiveo-rife --trt-plugin <dossier du plugin> [--trt-cache <dossier>] [--backend
 Désactivé par défaut. Sur les graphes compatibles v4.15 et Light, cette option conserve les caractéristiques des
 deux images sources pour les sorties successives d'une même paire, en particulier à 23,976 → 59,94 et
 24 → 60. Le graphe et la forme des tenseurs sont vérifiés ; les réseaux normal et à flux demi-résolution
-ont des caches séparés. Chaque entrée est identifiée par sa source, son côté du graphe et son miroir :
-Ultra et TTA 2/4/8 conservent leurs propres caractéristiques, sans supposer que les deux branches partagent
-les mêmes poids. Le calcul et les poids restent identiques. v4.6 n'a pas ces têtes indépendantes et suit
-son calcul courant.
+ont des caches séparés. Chaque entrée est identifiée par sa source et son miroir. Les deux côtés restent
+séparés sauf si leurs opérations, paramètres et poids décodés sont vérifiés identiques au chargement.
+Dans ce cas, B qui devient A dans la paire suivante réutilise sa tête ; Ultra et TTA 2/4/8 bénéficient
+aussi du partage entre sens temporels, avec des miroirs distincts. Un graphe inconnu ou des poids
+différents conserve les caches séparés. v4.6 n'a pas ces têtes indépendantes et suit son calcul courant.
 
 Une première inférence amorce l'allocateur. La réutilisation demande ensuite une mesure de mémoire fiable
 et une réserve d'au moins 1 Gio et 20 % du budget GPU, en plus du coût estimé des têtes. Si la réserve
 manque ou ne peut pas être mesurée, le moteur recalcule normalement. L'inférence TensorRT suit son
 graphe courant. La ligne `info: cache des têtes ncnn` compte les
-réutilisations effectives. `--feature-cache-reserve <MiB>` permet d'augmenter la réserve minimale
+réutilisations effectives ; un compteur supplémentaire indique les partages entre branches lorsqu'ils
+ont lieu. `--feature-cache-reserve <MiB>` permet d'augmenter la réserve minimale
 (défaut : 1024), par exemple pour garder davantage de place à un encodeur GPU. Voir les
 [mesures ciblées et décisions](docs/2026-10-10-performance-qualite.md).
 

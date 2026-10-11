@@ -1396,6 +1396,8 @@ static int run(const Options& o, const fs::path& exe_dir)
         fprintf(stderr, "info: sélecteur : %lld image(s) avec le candidat flux NVIDIA\n", (long long)engine.selector_frames_nv());
     if (!o.quiet && o.feature_cache)
         fprintf(stderr, "info: cache des têtes ncnn : %lld réutilisation(s)\n", (long long)engine.feature_cache_hits());
+    if (engine.feature_cache_cross_hits())
+        fprintf(stderr, "info: cache des têtes ncnn : %lld partage(s) entre branches\n", (long long)engine.feature_cache_cross_hits());
     if (!o.quiet && engine.large_motion())
         fprintf(stderr, "info: grands mouvements : %lld paire(s) sur %lld\n", (long long)engine.large_motion_pairs_active(),
                 (long long)engine.large_motion_pairs_total());

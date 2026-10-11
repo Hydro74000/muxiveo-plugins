@@ -4,6 +4,9 @@
 // des pixels RGB 8 bits côté CPU.
 
 #include "engine.h"
+#include "head_sharing.h"
+#include "datareader.h"
+#include "modelbin.h"
 
 #include <algorithm>
 #include <cmath>
@@ -172,10 +175,30 @@ bool RifeEngine::init(int gpu_index, bool fp32, int num_threads, std::string& er
     return true;
 }
 
+// Deux décodages du même instantané, sans seconde lecture disque. Pas de référence
+// vers ces octets : les tenseurs natifs conservent leurs propres allocations.
+class HeadModelReader : public ncnn::DataReader
+{
+public:
+    explicit HeadModelReader(const std::vector<unsigned char>& bytes) : bytes(bytes) {}
+    size_t read(void* output, size_t size) const override
+    {
+        const size_t available = std::min(size, bytes.size() - cursor);
+        if (available) std::memcpy(output, bytes.data() + cursor, available);
+        cursor += available;
+        return available;
+    }
+private:
+    const std::vector<unsigned char>& bytes;
+    mutable size_t cursor = 0;
+};
+
 // Réseau RIFE v4 (param + poids) ; uhd : graphe réécrit pour un flux à demi-résolution.
 static bool load_flownet(ncnn::Net& net, const ncnn::Option& opt, ncnn::VulkanDevice* vkdev,
-                         const std::filesystem::path& dir, bool uhd, std::string& error)
+                         const std::filesystem::path& dir, bool uhd, bool check_shared,
+                         bool& shared_heads, std::string& error)
 {
+    shared_heads = false;
     net.opt = opt;
     net.set_vulkan_device(vkdev);
     net.register_custom_layer("rife.Warp", Warp_layer_creator);
@@ -218,7 +241,26 @@ static bool load_flownet(ncnn::Net& net, const ncnn::Option& opt, ncnn::VulkanDe
         error = "poids introuvables : " + model_path.u8string();
         return false;
     }
-    ret = net.load_model(fp);
+    HeadSharingProof proof(param);
+    int count, type;
+    if (check_shared && proof.next_load(count, type))
+    {
+        std::vector<unsigned char> bytes;
+        while ((n = fread(buf, 1, sizeof(buf), fp)) > 0)
+            bytes.insert(bytes.end(), buf, buf + n);
+        HeadModelReader observed(bytes);
+        ncnn::ModelBinFromDataReader weights(observed);
+        do
+        {
+            const ncnn::Mat tensor = weights.load(count, type);
+            proof.observe(count, type, tensor.data, tensor.total() * tensor.elemsize);
+        } while (proof.next_load(count, type));
+        HeadModelReader native(bytes);
+        ret = net.load_model(native);
+        shared_heads = ret == 0 && proof.equivalent();
+    }
+    else
+        ret = net.load_model(fp);
     fclose(fp);
     if (ret != 0)
     {
@@ -239,19 +281,25 @@ static bool load_flownet(ncnn::Net& net, const ncnn::Option& opt, ncnn::VulkanDe
 bool RifeEngine::load_model(const std::filesystem::path& dir, int _padding, bool uhd, std::string& error)
 {
     padding = std::max(1, _padding);
-    if (!load_flownet(flownet, opt, vkdev, dir, uhd, error))
+    bool shared = false;
+    if (!load_flownet(flownet, opt, vkdev, dir, uhd, feature_cache_on, shared, error))
         return false;
     identify_head_blobs(flownet, 0);
+    head_cache[0].shared = shared && head_cache[0].blob[0] >= 0 && head_cache[0].blob[1] >= 0;
     return true;
 }
 
 bool RifeEngine::load_large_motion_model(const std::filesystem::path& dir, std::string& error)
 {
-    lm_loaded = load_flownet(flownet_lm, opt, vkdev, dir, true, error);
+    bool shared = false;
+    lm_loaded = load_flownet(flownet_lm, opt, vkdev, dir, true, feature_cache_on, shared, error);
     if (!lm_loaded)
         flownet_lm.clear();
     else
+    {
         identify_head_blobs(flownet_lm, 1);
+        head_cache[1].shared = shared && head_cache[1].blob[0] >= 0 && head_cache[1].blob[1] >= 0;
+    }
     return lm_loaded;
 }
 
@@ -261,6 +309,7 @@ void RifeEngine::identify_head_blobs(ncnn::Net& net, int role)
     cached.release();
     cached.blob[0] = cached.blob[1] = -1;
     cached.warmed = false;
+    cached.shared = false;
     const auto& blobs = net.blobs();
     const auto& layers = net.layers();
     // Vérifier les dépendances du graphe, pas seulement le nom du modèle : ces deux
@@ -941,14 +990,15 @@ bool RifeEngine::record_network(ncnn::Net& net, ncnn::VkCompute& cmd, const ncnn
     int missing = 0;
     for (int side = 0; side < 2; side++)
     {
-        for (HeadCache::Entry& e : cached.entries[side])
+        auto& entries = cached.entries[cached.shared ? 0 : side];
+        for (HeadCache::Entry& e : entries)
             if (e.id == ids[side] && e.flip == flip && !e.head.empty())
                 selected[side] = &e;
         if (!selected[side])
         {
             missing++;
-            for (HeadCache::Entry& e : cached.entries[side])
-                if (e.head.empty()) { selected[side] = &e; break; }
+            for (HeadCache::Entry& e : entries)
+                if (e.head.empty() && &e != selected[0]) { selected[side] = &e; break; }
         }
     }
     // Borne prudente pour v4.15 (8 canaux) et lite (4 canaux). Le budget tient déjà
@@ -969,6 +1019,7 @@ bool RifeEngine::record_network(ncnn::Net& net, ncnn::VkCompute& cmd, const ncnn
             {
                 ex.input(cached.blob[side], entry.head);
                 head_hits++;
+                if (entry.side != side) head_cross_hits++;
             }
             else
             {
@@ -989,6 +1040,7 @@ bool RifeEngine::record_network(ncnn::Net& net, ncnn::VkCompute& cmd, const ncnn
                 }
                 entry.id = ids[side];
                 entry.flip = flip;
+                entry.side = side;
             }
         }
     }

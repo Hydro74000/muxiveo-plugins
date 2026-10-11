@@ -111,6 +111,7 @@ endforeach()
 add_executable(muxiveo-rife
     src/main.cpp
     src/engine.cpp
+    src/head_sharing.cpp
     src/y4m.cpp
     src/warp.cpp
     src/uhd.cpp

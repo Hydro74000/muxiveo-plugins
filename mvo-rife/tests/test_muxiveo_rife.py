@@ -650,6 +650,71 @@ def test_optional_head_cache_preserves_other_rife_models(model: str, extra: list
     assert parse_y4m(plain.stdout).frames == parse_y4m(cached.stdout).frames
 
 
+@pytest.mark.parametrize("rate", [("--factor", "2"), ("--fps", "60000/1001")])
+def test_identical_heads_are_reused_between_source_pairs(rate: tuple[str, str]) -> None:
+    """B devient A : la tête commune se réutilise aussi en ×2, sans changer les images."""
+    models = Path(RIFE_BIN).resolve().parent / "rife-models"
+    if not (models / "rife-v4.15-mvo1" / "flownet.param").is_file():
+        pytest.skip("modèle rife-v4.15-mvo1 absent")
+    data = _panning(6).replace(b" F25:1 ", b" F24000:1001 ", 1)
+    args = ("--model", "rife-v4.15-mvo1", "--backend", "vulkan", "--scene-threshold", "0", *rate)
+    plain = run_rife(data, *args)
+    cached = _run_verbose(data, *args, "--feature-cache")
+    assert plain.returncode == cached.returncode == 0, (plain.stderr + cached.stderr).decode()
+    assert parse_y4m(plain.stdout).frames == parse_y4m(cached.stdout).frames
+    if "cache des têtes ncnn : 0 réutilisation(s)" in cached.stderr.decode():
+        pytest.skip("réserve VRAM non disponible sur ce périphérique")
+    assert "partage(s) entre branches" in cached.stderr.decode()
+
+
+def test_different_native_head_weights_disable_cross_sharing(tmp_path: Path) -> None:
+    """Une seule tête modifiée interdit le partage tout en gardant l'interpolation native."""
+    import struct
+
+    source = Path(RIFE_BIN).resolve().parent / "rife-models" / "rife-v4.15-mvo1"
+    if not (source / "flownet.param").is_file():
+        pytest.skip("modèle rife-v4.15-mvo1 absent")
+    graph = (source / "flownet.param").read_text()
+    weights = bytearray((source / "flownet.bin").read_bytes())
+    offset = 0
+    modified = False
+    for line in graph.splitlines()[2:]:
+        tokens = line.split()
+        inputs, outputs = int(tokens[2]), int(tokens[3])
+        params = dict(token.split("=", 1) for token in tokens[4 + inputs + outputs:])
+        if tokens[0] == "MemoryData":
+            count = int(params.get("0", 0))
+            for key in ("1", "11", "2"):
+                count *= max(1, int(params.get(key, 0)))
+            assert params.get("21", "1") == "1"
+            offset += count * 4
+        elif tokens[0] in {"Convolution", "Deconvolution"}:
+            count = int(params["6"])
+            tag = struct.unpack_from("<I", weights, offset)[0]
+            if tag not in (0, 0x01306B47):
+                pytest.skip("format des poids de la fixture non pris en charge")
+            item_size, fmt = (2, "<e") if tag else (4, "<f")
+            offset += 4
+            if tokens[1] == "Conv_29":
+                value = struct.unpack_from(fmt, weights, offset)[0]
+                struct.pack_into(fmt, weights, offset, value + .25)
+                modified = True
+                break
+            offset += (count * item_size + 3) // 4 * 4
+            if params.get("5", "0") == "1":
+                offset += int(params["0"]) * 4
+    assert modified, "la fixture doit modifier la première convolution de la seconde tête"
+    (tmp_path / "flownet.param").write_text(graph)
+    (tmp_path / "flownet.bin").write_bytes(weights)
+    data = _panning(6).replace(b" F25:1 ", b" F24000:1001 ", 1)
+    args = ("--model", str(tmp_path), "--backend", "vulkan", "--scene-threshold", "0", "--fps", "60000/1001")
+    plain = run_rife(data, *args)
+    cached = _run_verbose(data, *args, "--feature-cache")
+    assert plain.returncode == cached.returncode == 0, (plain.stderr + cached.stderr).decode()
+    assert parse_y4m(plain.stdout).frames == parse_y4m(cached.stdout).frames
+    assert "partage(s) entre branches" not in cached.stderr.decode()
+
+
 @needs_selector
 @pytest.mark.parametrize("size", ["96x64", "334x202", "720x480", "1742x676"])
 def test_selector_any_size_without_seams(size: str) -> None:

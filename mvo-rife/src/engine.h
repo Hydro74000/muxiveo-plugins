@@ -105,6 +105,7 @@ public:
     void set_feature_cache(bool on) { feature_cache_on = on; }
     void set_feature_cache_reserve(int mib) { head_reserve = (uint64_t)mib << 20; }
     int64_t feature_cache_hits() const { return head_hits; }
+    int64_t feature_cache_cross_hits() const { return head_cross_hits; }
     void set_engine(InterpEngine e) { engine_mode = e; }
     // Inférence RIFE par le plugin TensorRT (nul = ncnn Vulkan). Le backend doit survivre aux interpolations.
     void set_trt(TrtBackend* backend) { trt = backend; trt_inputs[0] = {}; }
@@ -246,13 +247,15 @@ private:
             ncnn::VkMat head;
             uint64_t id = 0;
             int flip = 0;
+            int side = 0;
             void release() { head.release(); id = 0; }
         };
-        // Deux sources × quatre miroirs, séparés par côté : aucun partage de poids
-        // supposé entre les deux branches du graphe, même dans le sens inverse.
+        // Deux sources × quatre miroirs. Le premier groupe est commun uniquement
+        // après preuve d'identité des opérations et des poids des deux branches.
         Entry entries[2][8];
         int blob[2] = {-1, -1};
         bool warmed = false;
+        bool shared = false;
         void release() { for (auto& side : entries) for (Entry& e : side) e.release(); }
         void keep_sources(uint64_t a, uint64_t b)
         {
@@ -265,6 +268,7 @@ private:
     bool feature_cache_on = false;
     uint64_t head_reserve = 1ull << 30;
     int64_t head_hits = 0;
+    int64_t head_cross_hits = 0;
     TrtBackend* trt = nullptr;
     TrtBackend* trt_lm = nullptr;
     bool lm_loaded = false;
