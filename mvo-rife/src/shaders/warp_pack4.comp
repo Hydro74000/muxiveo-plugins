@@ -19,6 +19,7 @@ layout (push_constant) uniform parameter
     int h;
     int c;
     int cstep;
+    int flow_cstep; // Le flux reste en pack1, indépendamment des caractéristiques.
 } p;
 
 void main()
@@ -31,7 +32,7 @@ void main()
         return;
 
     afp flow_x = buffer_ld1(flow_blob_data, gy * p.w + gx);
-    afp flow_y = buffer_ld1(flow_blob_data, p.cstep + gy * p.w + gx);
+    afp flow_y = buffer_ld1(flow_blob_data, p.flow_cstep + gy * p.w + gx);
 
     afp sample_x = afp(gx) + flow_x;
     afp sample_y = afp(gy) + flow_y;
@@ -57,10 +58,14 @@ void main()
         afpvec4 v2 = buffer_ld4(image_blob_data, gz * p.cstep + y1 * p.w + x0);
         afpvec4 v3 = buffer_ld4(image_blob_data, gz * p.cstep + y1 * p.w + x1);
 
-        afpvec4 v4 = v0 * (afp(1.f) - alpha) + v1 * alpha;
-        afpvec4 v5 = v2 * (afp(1.f) - alpha) + v3 * alpha;
-
-        v = v4 * (afp(1.f) - beta) + v5 * beta;
+        // Conserver le calcul scalaire du Warp pack1 ; seule la disposition
+        // mémoire des quatre caractéristiques change.
+        for (int component = 0; component < 4; component++)
+        {
+            afp v4 = v0[component] * (afp(1.f) - alpha) + v1[component] * alpha;
+            afp v5 = v2[component] * (afp(1.f) - alpha) + v3[component] * alpha;
+            v[component] = v4 * (afp(1.f) - beta) + v5 * beta;
+        }
     }
 
     const int gi = gz * p.cstep + gy * p.w + gx;
