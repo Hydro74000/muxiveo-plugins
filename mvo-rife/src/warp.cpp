@@ -5,6 +5,7 @@
 
 #include "warp.comp.hex.h"
 #include "warp_pack4.comp.hex.h"
+#include "warp_rgb3.comp.hex.h"
 
 using namespace ncnn;
 
@@ -14,6 +15,7 @@ Warp::Warp()
 
     pipeline_warp = 0;
     pipeline_warp_pack4 = 0;
+    pipeline_warp_rgb3 = 0;
 }
 
 int Warp::create_pipeline(const Option& opt)
@@ -40,6 +42,22 @@ int Warp::create_pipeline(const Option& opt)
         pipeline_warp->create(spirv.data(), spirv.size() * 4, specializations);
     }
 
+    // Les trois canaux partagent les coordonnées et les chargements du flux.
+    {
+        std::vector<uint32_t> spirv;
+        if (compile_spirv_module(warp_rgb3_comp_data, sizeof(warp_rgb3_comp_data), opt, spirv) == 0)
+        {
+            pipeline_warp_rgb3 = new Pipeline(vkdev);
+            pipeline_warp_rgb3->set_optimal_local_size_xyz(16, 8, 1);
+            if (pipeline_warp_rgb3->create(spirv.data(), spirv.size() * sizeof(uint32_t), specializations) != 0)
+            {
+                delete pipeline_warp_rgb3;
+                pipeline_warp_rgb3 = 0;
+            }
+        }
+        // Une optimisation indisponible conserve le pipeline natif.
+    }
+
     // pack4
     {
         static std::vector<uint32_t> spirv;
@@ -64,6 +82,9 @@ int Warp::destroy_pipeline(const Option& opt)
 {
     delete pipeline_warp;
     pipeline_warp = 0;
+
+    delete pipeline_warp_rgb3;
+    pipeline_warp_rgb3 = 0;
 
     delete pipeline_warp_pack4;
     pipeline_warp_pack4 = 0;
@@ -172,6 +193,19 @@ int Warp::forward(const std::vector<VkMat>& bottom_blobs, std::vector<VkMat>& to
     constants[1].i = top_blob.h;
     constants[2].i = top_blob.c;
     constants[3].i = top_blob.cstep;
+
+    if (pipeline_warp_rgb3 && channels == 3 && elempack == 1 && image_blob.dims == 3
+        && flow_blob.dims == 3 && flow_blob.c == 2 && flow_blob.elempack == 1
+        && flow_blob.w == w && flow_blob.h == h && flow_blob.cstep == image_blob.cstep
+        && flow_blob.elemsize == elemsize)
+    {
+        VkMat dispatch;
+        dispatch.w = w;
+        dispatch.h = h;
+        dispatch.c = 1;
+        cmd.record_pipeline(pipeline_warp_rgb3, bindings, constants, dispatch);
+        return 0;
+    }
 
     // Muxiveo : ncnn >= 2025 n'a plus de chemin Vulkan pack8 (afpvec8 supprimé)
     if (elempack == 4)

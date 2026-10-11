@@ -87,7 +87,7 @@ endif()
 # Shaders : sources GLSL embarquées, compilées en SPIR-V au lancement par ncnn
 # ---------------------------------------------------------------------------
 set(MUXIVEO_RIFE_SHADERS
-    yuv_to_rgb rgb_to_yuv pack_samples rife_v4_timestep warp warp_pack4
+    yuv_to_rgb rgb_to_yuv pack_samples rife_v4_timestep warp warp_pack4 warp_rgb3
     tta_flip tta_accumulate tta_resolve
     mc_luma mc_down mc_search mc_median mc_recon mc_filter mc_region mc_blend mc_motion
     nv_flow nv_warp sel_stats sel_weights sel_blend
