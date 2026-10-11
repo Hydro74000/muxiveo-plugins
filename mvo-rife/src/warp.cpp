@@ -11,6 +11,7 @@ using namespace ncnn;
 Warp::Warp()
 {
     support_vulkan = true;
+    support_vulkan_packing = true;
 
     pipeline_warp = 0;
     pipeline_warp_pack4 = 0;
@@ -18,6 +19,9 @@ Warp::Warp()
 
 int Warp::create_pipeline(const Option& opt)
 {
+    // Sans stockage FP16 uniforme, conserver le chemin précédent :
+    // un changement de packing ne doit pas ajouter un nouvel arrondi.
+    if (opt.use_fp16_packed && !opt.use_fp16_storage) support_vulkan_packing = false;
     if (!vkdev)
         return 0;
 
@@ -40,21 +44,30 @@ int Warp::create_pipeline(const Option& opt)
         pipeline_warp->create(spirv.data(), spirv.size() * 4, specializations);
     }
 
-    // pack4
+    // Le nouveau chemin compacté est optionnel. Si son initialisation échoue,
+    // ncnn décompacte les entrées et conserve le Warp scalaire précédent.
+    if (support_vulkan_packing)
     {
         static std::vector<uint32_t> spirv;
         static ncnn::Mutex lock;
+        bool compiled = false;
         {
             ncnn::MutexLockGuard guard(lock);
-            if (spirv.empty())
+            compiled = !spirv.empty();
+            if (!compiled)
+                compiled = compile_spirv_module(warp_pack4_comp_data, sizeof(warp_pack4_comp_data), opt, spirv) == 0;
+        }
+        if (compiled && !spirv.empty())
+        {
+            pipeline_warp_pack4 = new Pipeline(vkdev);
+            pipeline_warp_pack4->set_optimal_local_size_xyz();
+            if (pipeline_warp_pack4->create(spirv.data(), spirv.size() * sizeof(uint32_t), specializations) != 0)
             {
-                compile_spirv_module(warp_pack4_comp_data, sizeof(warp_pack4_comp_data), opt, spirv);
+                delete pipeline_warp_pack4;
+                pipeline_warp_pack4 = 0;
             }
         }
-
-        pipeline_warp_pack4 = new Pipeline(vkdev);
-        pipeline_warp_pack4->set_optimal_local_size_xyz();
-        pipeline_warp_pack4->create(spirv.data(), spirv.size() * 4, specializations);
+        if (!pipeline_warp_pack4) support_vulkan_packing = false;
     }
 
     return 0;
@@ -149,7 +162,15 @@ int Warp::forward(const std::vector<Mat>& bottom_blobs, std::vector<Mat>& top_bl
 int Warp::forward(const std::vector<VkMat>& bottom_blobs, std::vector<VkMat>& top_blobs, VkCompute& cmd, const Option& opt) const
 {
     const VkMat& image_blob = bottom_blobs[0];
-    const VkMat& flow_blob = bottom_blobs[1];
+    // Les deux shaders lisent le flux scalaire, même si un graphe inconnu
+    // fournit un flux compacté. Les modèles RIFE connus utilisent deux canaux.
+    VkMat unpacked_flow;
+    if (bottom_blobs[1].elempack != 1)
+    {
+        vkdev->convert_packing(bottom_blobs[1], unpacked_flow, 1, cmd, opt);
+        if (unpacked_flow.empty()) return -100;
+    }
+    const VkMat& flow_blob = bottom_blobs[1].elempack == 1 ? bottom_blobs[1] : unpacked_flow;
 
     int w = image_blob.w;
     int h = image_blob.h;
@@ -176,6 +197,11 @@ int Warp::forward(const std::vector<VkMat>& bottom_blobs, std::vector<VkMat>& to
     // Muxiveo : ncnn >= 2025 n'a plus de chemin Vulkan pack8 (afpvec8 supprimé)
     if (elempack == 4)
     {
+        // Le flux à deux canaux reste scalaire ; son pas peut différer
+        // de celui des caractéristiques compactées par quatre.
+        vk_constant_type flow_cstep;
+        flow_cstep.i = flow_blob.cstep;
+        constants.push_back(flow_cstep);
         cmd.record_pipeline(pipeline_warp_pack4, bindings, constants, top_blob);
     }
     else // if (elempack == 1)
