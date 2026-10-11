@@ -6,6 +6,7 @@
 #include "engine.h"
 #include "head_sharing.h"
 #include "graph_fusion.h"
+#include "flow_pruning.h"
 #include "residual_add.h"
 #include "datareader.h"
 #include "modelbin.h"
@@ -221,6 +222,31 @@ static bool load_flownet(ncnn::Net& net, const ncnn::Option& opt, ncnn::VulkanDe
     while ((n = fread(buf, 1, sizeof(buf), fp)) > 0)
         param.append(buf, n);
     fclose(fp);
+    fp = open_binary(model_path);
+    if (!fp)
+    {
+        error = "poids introuvables : " + model_path.u8string();
+        return false;
+    }
+    std::vector<unsigned char> bytes;
+    while ((n = fread(buf, 1, sizeof(buf), fp)) > 0)
+        bytes.insert(bytes.end(), buf, buf + n);
+    const bool read_failed = ferror(fp) != 0;
+    fclose(fp);
+    if (read_failed)
+    {
+        error = "lecture des poids impossible : " + model_path.u8string();
+        return false;
+    }
+    // Le graphe et les poids restent ceux du fichier si la preuve de non-usage,
+    // la disposition des poids ou la consommation complète du binaire échouent.
+    std::string pruned_param;
+    std::vector<unsigned char> pruned_weights;
+    if (prune_unused_flow(param, bytes, pruned_param, pruned_weights) > 0)
+    {
+        param.swap(pruned_param);
+        bytes.swap(pruned_weights);
+    }
     if (uhd)
     {
         std::string rewritten;
@@ -241,19 +267,10 @@ static bool load_flownet(ncnn::Net& net, const ncnn::Option& opt, ncnn::VulkanDe
         return false;
     }
 
-    fp = open_binary(model_path);
-    if (!fp)
-    {
-        error = "poids introuvables : " + model_path.u8string();
-        return false;
-    }
     HeadSharingProof proof(param);
     int count, type;
     if (check_shared && proof.next_load(count, type))
     {
-        std::vector<unsigned char> bytes;
-        while ((n = fread(buf, 1, sizeof(buf), fp)) > 0)
-            bytes.insert(bytes.end(), buf, buf + n);
         HeadModelReader observed(bytes);
         ncnn::ModelBinFromDataReader weights(observed);
         do
@@ -266,8 +283,10 @@ static bool load_flownet(ncnn::Net& net, const ncnn::Option& opt, ncnn::VulkanDe
         shared_heads = ret == 0 && proof.equivalent();
     }
     else
-        ret = net.load_model(fp);
-    fclose(fp);
+    {
+        HeadModelReader native(bytes);
+        ret = net.load_model(native);
+    }
     if (ret != 0)
     {
         error = "flownet.bin invalide : " + model_path.u8string();

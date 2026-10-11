@@ -113,6 +113,7 @@ add_executable(muxiveo-rife
     src/engine.cpp
     src/head_sharing.cpp
     src/graph_fusion.cpp
+    src/flow_pruning.cpp
     src/residual_add.cpp
     src/y4m.cpp
     src/warp.cpp
