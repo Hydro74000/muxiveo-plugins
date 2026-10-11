@@ -91,7 +91,7 @@ set(MUXIVEO_RIFE_SHADERS
     tta_flip tta_accumulate tta_resolve
     mc_luma mc_down mc_search mc_median mc_recon mc_filter mc_region mc_blend mc_motion
     nv_flow nv_warp sel_stats sel_weights sel_blend
-    trt_pack
+    trt_pack residual_add
 )
 set(SHADER_HEADERS)
 foreach(shader ${MUXIVEO_RIFE_SHADERS})
@@ -112,6 +112,8 @@ add_executable(muxiveo-rife
     src/main.cpp
     src/engine.cpp
     src/head_sharing.cpp
+    src/graph_fusion.cpp
+    src/residual_add.cpp
     src/y4m.cpp
     src/warp.cpp
     src/uhd.cpp

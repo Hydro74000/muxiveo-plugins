@@ -5,6 +5,8 @@
 
 #include "engine.h"
 #include "head_sharing.h"
+#include "graph_fusion.h"
+#include "residual_add.h"
 #include "datareader.h"
 #include "modelbin.h"
 
@@ -202,6 +204,7 @@ static bool load_flownet(ncnn::Net& net, const ncnn::Option& opt, ncnn::VulkanDe
     net.opt = opt;
     net.set_vulkan_device(vkdev);
     net.register_custom_layer("rife.Warp", Warp_layer_creator);
+    net.register_custom_layer("rife.AddRelu", AddRelu_layer_creator);
 
     const std::filesystem::path param_path = dir / "flownet.param";
     const std::filesystem::path model_path = dir / "flownet.bin";
@@ -228,6 +231,9 @@ static bool load_flownet(ncnn::Net& net, const ncnn::Option& opt, ncnn::VulkanDe
         }
         param.swap(rewritten);
     }
+    std::string fused;
+    if (fuse_residual_activations(param, fused) > 0)
+        param.swap(fused);
     int ret = net.load_param_mem(param.c_str());
     if (ret != 0)
     {

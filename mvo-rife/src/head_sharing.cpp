@@ -109,7 +109,7 @@ HeadSharingProof::HeadSharingProof(const std::string& param)
             sides[paths[1][i]] = 1;
         }
         const std::set<std::string> no_weights = {"Input", "Split", "Crop", "Interp", "Concat", "PixelShuffle",
-                                                "BinaryOp", "Eltwise", "Sigmoid", "ReLU", "Clip", "rife.Warp"};
+                                                "BinaryOp", "Eltwise", "Sigmoid", "ReLU", "Clip", "rife.Warp", "rife.AddRelu"};
         for (size_t i = 0; i < layers.size(); i++)
         {
             const Layer& layer = layers[i];

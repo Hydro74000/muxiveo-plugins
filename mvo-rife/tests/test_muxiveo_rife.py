@@ -715,6 +715,36 @@ def test_different_native_head_weights_disable_cross_sharing(tmp_path: Path) -> 
     assert "partage(s) entre branches" not in cached.stderr.decode()
 
 
+@pytest.mark.parametrize("broadcast", [False, True])
+@pytest.mark.parametrize("slope", ["0", "0.2", "-0.1", "1.5"])
+@pytest.mark.parametrize("precision", [[], ["--fp32"]])
+def test_fused_addition_preserves_native_intermediate_rounding(
+    tmp_path: Path, slope: str, precision: list[str], broadcast: bool,
+) -> None:
+    """Un Split empêche la fusion dans le témoin et conserve ses deux opérations natives."""
+    # Décaler le signal pour exercer aussi les valeurs négatives et les pentes.
+    second = "in2" if broadcast else "in1"
+    prefix = ("Input a 0 1 in0\nInput b 0 1 in1\nInput t 0 1 in2\n"
+              "BinaryOp offset 1 1 in0 shifted 0=1 1=1 2=0.75\n"
+              f"BinaryOp addition 2 1 shifted {second} sum\n")
+    outputs = []
+    data = make_y4m("testsrc2=size=334x202:rate=24", frames=3, pix_fmt="yuv420p10le")
+    for separated in [True, False]:
+        folder = tmp_path / ("separated" if separated else "fused")
+        folder.mkdir()
+        if separated:
+            graph = "7767517\n7 7\n" + prefix + f"Split identity 1 1 sum copy\nReLU activation 1 1 copy out0 0={slope}\n"
+        else:
+            graph = "7767517\n6 6\n" + prefix + f"ReLU activation 1 1 sum out0 0={slope}\n"
+        (folder / "flownet.param").write_text(graph)
+        (folder / "flownet.bin").write_bytes(b"")
+        result = run_rife(data, "--model", str(folder), "--backend", "vulkan", "--scene-threshold", "0",
+                          "--fps", "60", *precision)
+        assert result.returncode == 0, result.stderr.decode()
+        outputs.append(parse_y4m(result.stdout).frames)
+    assert outputs[0] == outputs[1]
+
+
 @needs_selector
 @pytest.mark.parametrize("size", ["96x64", "334x202", "720x480", "1742x676"])
 def test_selector_any_size_without_seams(size: str) -> None:

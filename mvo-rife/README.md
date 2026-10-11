@@ -176,6 +176,15 @@ ont lieu. `--feature-cache-reserve <MiB>` permet d'augmenter la réserve minimal
 (défaut : 1024), par exemple pour garder davantage de place à un encodeur GPU. Voir les
 [mesures ciblées et décisions](docs/2026-10-10-performance-qualite.md).
 
+## Optimisations en validation sur cette branche de recherche
+
+Le [partage vérifié des têtes](docs/2026-10-11-partage-tetes.md) étend le cache
+optionnel. La [fusion addition/activation](docs/2026-10-11-fusion-residuelle.md)
+simplifie le calcul Vulkan de v4.6 et v4.15 en conservant l’arrondi intermédiaire.
+Elle s’applique aussi aux autres modes compatibles, dont Ultra, avec ou sans cache.
+Ces travaux ne sont pas encore livrés ; les écarts natifs et la couverture des
+GPU/OS restent explicitement suivis dans leurs rapports.
+
 ## TTA (`--tta 2|4|8`)
 
 Moyenne de plusieurs inférences de la même trame intermédiaire : `2` ajoute le sens temporel inverse

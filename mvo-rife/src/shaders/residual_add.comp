@@ -1,0 +1,47 @@
+// Fusion résiduelle : conserver l'arrondi intermédiaire de l'addition native.
+#version 450
+#if NCNN_fp16_storage
+#extension GL_EXT_shader_16bit_storage: require
+#endif
+layout(binding = 0) readonly buffer a_blob { sfpvec4 a[]; };
+layout(binding = 1) readonly buffer b_blob { sfpvec4 b[]; };
+layout(binding = 2) writeonly buffer o_blob { sfpvec4 o[]; };
+layout(push_constant) uniform parameter { uint n; float slope; } p;
+float storage_round(float value)
+{
+    // Les conversions pack/unpack peuvent être éliminées par le pilote :
+    // conserver les bits de l'arrondi IEEE 754 au plus proche, égalités au pair.
+    uint bits = floatBitsToUint(value);
+    uint sign = bits & 0x80000000u;
+    uint mag = bits & 0x7fffffffu;
+    uint exponent = mag >> 23;
+    if (exponent == 255u) return value;
+    if (exponent >= 143u) return uintBitsToFloat(sign | 0x7f800000u);
+    if (exponent >= 113u)
+    {
+        uint rounded = (mag + 0xfffu + ((mag >> 13) & 1u)) & 0xffffe000u;
+        if (rounded >= 0x47800000u) rounded = 0x7f800000u;
+        return uintBitsToFloat(sign | rounded);
+    }
+    if (exponent < 102u) return uintBitsToFloat(sign);
+    uint shift = 126u - exponent;
+    uint mantissa = (mag & 0x7fffffu) | 0x800000u;
+    uint rounded = (mantissa + ((1u << (shift - 1u)) - 1u)
+                    + ((mantissa >> shift) & 1u)) >> shift;
+    float tiny = float(rounded) * 5.9604644775390625e-8;
+    return uintBitsToFloat(sign | floatBitsToUint(tiny));
+}
+void main()
+{
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= p.n) return;
+    precise afpvec4 v = buffer_ld4(a, i) + buffer_ld4(b, i);
+#if NCNN_fp16_storage || NCNN_fp16_packed
+    v = vec4(storage_round(v.x), storage_round(v.y), storage_round(v.z), storage_round(v.w));
+#endif
+    if (p.slope == 0.f)
+        v = max(v, afpvec4(0.f));
+    else
+        v = mix(v, v * afp(p.slope), lessThan(v, afpvec4(0.f)));
+    buffer_st4(o, i, v);
+}
