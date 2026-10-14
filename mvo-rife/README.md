@@ -8,6 +8,18 @@ Extension de Muxiveo : installée, mise à jour et supprimée par l'application 
 utilisateur. Le moteur, ses modèles, les poids de son sélecteur et ses préréglages évoluent sans release de
 Muxiveo : l'application retient la version la plus récente dont le contrat (`--capabilities`) lui est connu.
 
+## Nouveautés 1.8.0
+
+- Graphe RIFE révisé au chargement, calcul conservé : têtes partagées entre côtés et paires, addition résiduelle
+  fusionnée (repli natif hors GPU validés), sortie de flux inutilisée supprimée, Warp RGB et caractéristiques
+  regroupés. Qualité 4K ×2,5 en Vulkan : environ +18 % de débit avec le cache des caractéristiques, +11 % sans
+  (voir [Warp RGB](docs/2026-10-11-warp-rgb.md) et [caractéristiques](docs/2026-10-11-warp-caracteristiques.md)).
+- Garde-fous du sélecteur hybride : candidat du flux NVIDIA écarté là où RIFE et MC concordent et où il s'en écarte,
+  ou là où ce flux est incohérent (changement de plan, fondu) ; candidat demi-résolution écarté selon la même règle ;
+  vecteurs NVIDIA de la recherche MC retenus seulement s'ils l'emportent nettement. Supprime les barreaux et grilles
+  dédoublés ou tordus, les textes fantômes de génériques et les plaques sur pluie ou fondus.
+- Contrat, ABI TensorRT, modèles, poids et poids du sélecteur inchangés.
+
 ## Nouveautés 1.7.1
 
 - Calculs MC inutilisés supprimés et invariants réutilisés dans les préréglages hybrides, Ultra compris.
