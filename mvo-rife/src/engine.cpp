@@ -1131,7 +1131,8 @@ bool RifeEngine::infer_rife(ncnn::VkCompute& cmd, const ncnn::VkMat& in0, const 
         cached.id[reverse ? 0 : 1] = b_id;
         cached.flip = flip;
         std::string trt_error;
-        if (backend->infer(t, trt_error, reverse))
+        // identités des images (caractéristiques réutilisées par le plugin) ; variantes en miroir : contenu transformé
+        if (backend->infer(t, trt_error, reverse, flip == 0 ? a_id : 0, flip == 0 ? b_id : 0))
         {
             out = backend->output();
             return true;

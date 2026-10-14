@@ -33,7 +33,8 @@ public:
     const ncnn::VkMat& input(int index) const { return slots[index].mat; }
     const ncnn::VkMat& output() const { return slots[2].mat; }
     // Inférence synchrone (Vulkan doit avoir terminé d'écrire les entrées).
-    bool infer(float t, std::string& error, bool reverse_inputs = false);
+    // id0, id1 : identités des images (0 : inconnue), transmises au plugin pour réutiliser leurs caractéristiques
+    bool infer(float t, std::string& error, bool reverse_inputs = false, uint64_t id0 = 0, uint64_t id1 = 0);
 
     std::string description() const { return summary; }
 

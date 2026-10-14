@@ -406,7 +406,7 @@ bool TrtBackend::open(const std::string& model, int width, int height, const fs:
     return true;
 }
 
-bool TrtBackend::infer(float t, std::string& error, bool reverse_inputs)
+bool TrtBackend::infer(float t, std::string& error, bool reverse_inputs, uint64_t id0, uint64_t id1)
 {
     MvoTrtInferParams params;
     memset(&params, 0, sizeof params);
@@ -415,6 +415,8 @@ bool TrtBackend::infer(float t, std::string& error, bool reverse_inputs)
     params.in1 = slots[reverse_inputs ? 0 : 1].cuda_ptr;
     params.out = slots[2].cuda_ptr;
     params.t = t;
+    params.id0 = id0;
+    params.id1 = id1;
     char err[512] = {0};
     const CudaDriver& cuda = CudaDriver::get();
     if (!cuda.push(cuda_ctx))

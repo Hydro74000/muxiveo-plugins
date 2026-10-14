@@ -8,6 +8,14 @@ Extension de Muxiveo : installée, mise à jour et supprimée par l'application 
 utilisateur. Le moteur, ses modèles, les poids de son sélecteur et ses préréglages évoluent sans release de
 Muxiveo : l'application retient la version la plus récente dont le contrat (`--capabilities`) lui est connu.
 
+## Nouveautés 1.9.0
+
+- Accélération NVIDIA (extension mvo-rife-trt 1.2.0 ou plus récente) : identités des images transmises au plugin,
+  qui calcule l'encodeur des modèles v4.15 une seule fois par image et le réutilise entre les sorties d'une paire,
+  le passage grands mouvements et la passe inverse d'Ultra. Images identiques à l'œil.
+- Interface du plugin étendue sans changer de version (champs `id0`, `id1` couverts par `struct_size`) :
+  compatible dans les deux sens avec les plugins et moteurs antérieurs.
+
 ## Nouveautés 1.8.0
 
 - Graphe RIFE révisé au chargement, calcul conservé : têtes partagées entre côtés et paires, addition résiduelle
