@@ -278,6 +278,25 @@ private:
     bool selector_on = true;
     bool ultra = false;
     std::string sel_family = "v415";
+    // Garde-fous du sélecteur (poids nul pour un candidat dans un bloc ; luminance en codes 10 bits / 1023) :
+    // - NV écarté si R1 et MC concordent (|MC - R1| < 3 codes, 12 quand l'amplitude NVOF moyenne du bloc reste sous
+    //   8 blocs) et si NV s'en écarte nettement (|NV - R1| > 4 codes et > 3 × |MC - R1|) : flux NVIDIA aberrant sur
+    //   fonds unis, textes et pluie, ou apparié à la période voisine d'un motif répétitif (grilles, barreaux) ;
+    // - NV écarté si l'incohérence aller-retour moyenne du flux NVIDIA dépasse 16 px (changement de plan, fondu) ;
+    // - R05 écarté selon la même règle de consensus (structures fines tordues par le flux demi-résolution).
+    float nv_guard_abs = 4.f / 1023.f;
+    float nv_guard_ratio = 3.f;
+    float nv_guard_mc_max = 3.f / 1023.f;
+    float nv_guard_mc_max_slow = 12.f / 1023.f;
+    float nv_guard_slow_blocks = 8.f;
+    float nv_guard_inc_max = 16.f / 64.f;
+    float r05_guard_abs = 4.f / 1023.f;
+    float r05_guard_ratio = 3.f;
+    float r05_guard_mc_max = 3.f / 1023.f;
+    // Surcoût des vecteurs NVOF dans la recherche MC pleine résolution (écart bilatéral moyen, codes de luminance) :
+    // retenus seulement s'ils battent les candidats hiérarchiques de plus qu'un pixel mal expliqué (MC_Q_THRESHOLD).
+    // Sinon, sur un motif périodique, MC reprend l'appariement à la période voisine de NVOF et le confirme.
+    float mc_hint_penalty = 20.f;
     std::vector<SelectorModel> sel_weights;
     ncnn::VkMat sel_models;          // paramètres des modèles (128 flottants chacun)
     std::vector<float> dense_f, dense_b;

@@ -21,6 +21,15 @@ layout (push_constant) uniform parameter
     int w;           // image utile
     int h;
     int block;
+    float nv_abs;    // garde-fou NV (0 : désactivé) : écart |NV - R1| minimal...
+    float nv_ratio;  // ...et rapport à |MC - R1| au-delà desquels NV, isolé face au consensus R1 / MC, est écarté...
+    float nv_mc_max; // ...si ce consensus est serré : |MC - R1| sous ce seuil (0 : sans condition)
+    float nv_inc_max;// NV écarté aussi si l'incohérence aller-retour moyenne du flux NVIDIA dépasse ce seuil (px / 64)
+    float r05_abs;   // garde-fou R05 (même principe que NV) : |R05 - R1| minimal (0 : désactivé)...
+    float r05_ratio; // ...rapport à |MC - R1|...
+    float r05_mc_max;// ...et consensus R1 / MC serré exigé
+    float nv_mc_max_slow; // consensus R1 / MC exigé quand le flux NVIDIA reste dans la portée de RIFE...
+    float nv_slow_mag;    // ...amplitude NVOF moyenne du bloc sous ce seuil (px / 64)
 } p;
 
 float stat(int bx, int by, int k)
@@ -91,10 +100,27 @@ void main()
         logit[c] = z;
         mx = max(mx, z);
     }
+    // garde-fou : R1 et MC concordent, NV s'en écarte nettement -> flux NVIDIA aberrant dans ce bloc (fonds unis,
+    // textes de génériques, pluie) : poids NV nul
+    // Mouvement dans la portée de RIFE (amplitude NVOF modérée) : consensus élargi, NV y vaut surtout par ses
+    // appariements à la période voisine sur les motifs répétitifs (grillages, barreaux : dédoublement)
+    float mc_max = p.nv_mc_max;
+    if (p.nv_mc_max_slow > mc_max && stat(bx, by, 8) < p.nv_slow_mag)
+        mc_max = p.nv_mc_max_slow;
+    bool drop_nv = (p.cands & 16) != 0 && p.nv_abs > 0.f && stat(bx, by, 3) > p.nv_abs
+                   && stat(bx, by, 3) > p.nv_ratio * stat(bx, by, 1)
+                   && (mc_max <= 0.f || stat(bx, by, 1) < mc_max);
+    // flux NVIDIA incohérent (changement de carton, fondu, fond uni) : candidat NV non fiable
+    drop_nv = drop_nv || ((p.cands & 16) != 0 && p.nv_inc_max > 0.f && stat(bx, by, 7) > p.nv_inc_max);
+    // garde-fou R05 : flux demi-résolution isolé face au consensus R1 / MC (structures fines au premier plan,
+    // rambardes, grilles : barreaux tordus et dédoublés)
+    bool drop_r05 = (p.cands & 2) != 0 && p.r05_abs > 0.f && stat(bx, by, 0) > p.r05_abs
+                    && stat(bx, by, 0) > p.r05_ratio * stat(bx, by, 1)
+                    && (p.r05_mc_max <= 0.f || stat(bx, by, 1) < p.r05_mc_max);
     float sum = 0.f;
     for (int c = 0; c < k; c++)
     {
-        logit[c] = exp(logit[c] - mx);
+        logit[c] = ((drop_nv && slot[c] == 4) || (drop_r05 && slot[c] == 1)) ? 0.f : exp(logit[c] - mx);
         sum += logit[c];
     }
     int o = (by * p.nbx + bx) * 5;

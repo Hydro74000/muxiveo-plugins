@@ -623,7 +623,7 @@ bool RifeEngine::record_mc(ncnn::VkCompute& cmd, const GpuFrame& a, const GpuFra
             hints_dirty = false;
         }
         bindings[4] = hinted ? hints_gpu : dummy;
-        std::vector<ncnn::vk_constant_type> constants(15);
+        std::vector<ncnn::vk_constant_type> constants(16);
         constants[0].i = lw[l];
         constants[1].i = lh[l];
         constants[2].i = iw;
@@ -639,6 +639,7 @@ bool RifeEngine::record_mc(ncnn::VkCompute& cmd, const GpuFrame& a, const GpuFra
         constants[12].f = coarse ? MC_LAMBDA_COARSE : MC_LAMBDA;
         constants[13].f = 0.5f;
         constants[14].i = l <= 1 ? MC_MARGIN_FINE : MC_MARGIN_COARSE;
+        constants[15].f = mc_hint_penalty;
         ncnn::VkMat dispatcher;
         dispatcher.w = bw * 16;
         dispatcher.h = bh * 16;
@@ -1534,7 +1535,7 @@ bool RifeEngine::record_selector(ncnn::VkCompute& cmd, const GpuFrame& a, const 
         bindings[0] = stats;
         bindings[1] = sel_models;
         bindings[2] = weights;
-        std::vector<ncnn::vk_constant_type> constants(9);
+        std::vector<ncnn::vk_constant_type> constants(18);
         constants[0].i = nbx;
         constants[1].i = nby;
         constants[2].i = mi * 128;
@@ -1544,6 +1545,15 @@ bool RifeEngine::record_selector(ncnn::VkCompute& cmd, const GpuFrame& a, const 
         constants[6].i = w;
         constants[7].i = h;
         constants[8].i = block;
+        constants[9].f = nv_guard_abs;
+        constants[10].f = nv_guard_ratio;
+        constants[11].f = nv_guard_mc_max;
+        constants[12].f = nv_guard_inc_max;
+        constants[13].f = r05_guard_abs;
+        constants[14].f = r05_guard_ratio;
+        constants[15].f = r05_guard_mc_max;
+        constants[16].f = nv_guard_mc_max_slow;
+        constants[17].f = nv_guard_slow_blocks * (float)block / 64.f;
         ncnn::VkMat dispatcher;
         dispatcher.w = nbx;
         dispatcher.h = nby;
