@@ -188,23 +188,22 @@ ont lieu. `--feature-cache-reserve <MiB>` permet d'augmenter la réserve minimal
 (défaut : 1024), par exemple pour garder davantage de place à un encodeur GPU. Voir les
 [mesures ciblées et décisions](docs/2026-10-10-performance-qualite.md).
 
-## Optimisations en validation sur cette branche de recherche
+## Optimisations du graphe (1.8.0)
 
 Le [partage vérifié des têtes](docs/2026-10-11-partage-tetes.md) étend le cache
 optionnel. La [fusion addition/activation](docs/2026-10-11-fusion-residuelle.md)
 simplifie le calcul Vulkan de v4.6 et v4.15 en conservant l’arrondi intermédiaire.
 Elle s’applique aussi aux autres modes compatibles, dont Ultra, avec ou sans cache.
 
-La branche de recherche retire également les sorties de flux inutilisées lors du
+Le moteur retire également les sorties de flux inutilisées lors du
 chargement Vulkan : une déconvolution à 24 sorties suivie d'un PixelShuffle ×2
 peut passer à 20 sorties si tous ses consommateurs ne lisent que les quatre
 canaux de flux et le masque. Les coefficients et biais actifs sont conservés ;
 les fichiers restent inchangés. Un graphe, une disposition de poids ou un usage
 non reconnu garde son calcul natif. Cette transformation concerne aussi les
-réseaux UHD, TTA, Light et Ultra compatibles. Les petits gains Qualité et les
-différences hybrides 4K restent en cours de validation avant livraison.
-Ces travaux ne sont pas encore livrés ; les écarts natifs et la couverture des
-GPU/OS restent explicitement suivis dans leurs rapports.
+réseaux UHD, TTA, Light et Ultra compatibles. Limite connue : en hybride 4K ×2,5,
+de rares valeurs peuvent varier d'un code 10 bits d'un rendu à l'autre (variation
+déjà présente avant ces optimisations, localisée dans la reconstruction MC).
 
 ## TTA (`--tta 2|4|8`)
 
