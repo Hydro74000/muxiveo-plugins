@@ -8,13 +8,21 @@ est nettement plus rapide.
 Muxiveo propose ce plugin uniquement sur les machines compatibles et l'installe, le met à jour et le supprime
 lui-même (page Extensions). Sans lui, ou au moindre problème, l'interpolation continue en Vulkan.
 
+## Nouveautés 1.2.0
+
+- Modèles RIFE v4.15 (Qualité, Ultra, Light) : l'encodeur des caractéristiques est aussi exporté à part
+  (`<modèle>-head.onnx`, `<modèle>[-uhd]-body.onnx`). Avec muxiveo-rife 1.9.0 ou plus récent, il n'est calculé
+  qu'une fois par image ; ses résultats servent à toutes les sorties d'une paire, au passage grands mouvements et
+  à la passe inverse d'Ultra. Images identiques à l'œil (arrondis d'au plus un code 10 bits).
+- Interface inchangée : avec un muxiveo-rife plus ancien, le modèle complet est utilisé comme avant.
+
 ## Compatibilité
 
 - GPU NVIDIA **Turing (RTX 20xx, GTX 16xx) ou plus récent** ; pilote NVIDIA **575 ou plus récent**.
 - Linux x86-64 (glibc 2.28 ou plus récente) et Windows 10/11 x64.
 - muxiveo-rife 1.4.0 ou plus récent (interface 1).
-- Préréglages couverts : Rapide, Équilibré, Qualité et Light (modèles RIFE v4.6, v4.15 et v4.15-lite, avec ou
-  sans le mode Fast).
+- Préréglages couverts : Rapide, Équilibré, Qualité, Ultra et Light (modèles RIFE v4.6, v4.15 et v4.15-lite, avec
+  ou sans le mode Fast).
 
 Au premier usage d'un modèle, le moteur TensorRT est préparé pour votre carte puis mis en cache (quelques
 secondes) ; les utilisations suivantes démarrent immédiatement.
@@ -27,7 +35,7 @@ secondes) ; les utilisations suivantes démarrent immédiatement.
 |---|---|
 | `libmvo_rife_trt.so` / `mvo_rife_trt.dll` | plugin (code de ce dépôt, MIT) |
 | `libtensorrt_rtx.so.1`, `libtensorrt_onnxparser_rtx.so.1` / `tensorrt_rtx_1_6.dll`, `tensorrt_onnxparser_rtx_1_6.dll` | NVIDIA TensorRT for RTX (licence NVIDIA) |
-| `models/*.onnx` | modèles RIFE exportés des poids officiels (Practical-RIFE, MIT) |
+| `models/*.onnx` | modèles RIFE exportés des poids officiels (Practical-RIFE, MIT) ; v4.15 : aussi encodeur et corps séparés |
 | `LICENSES/` | licences et mentions des composants |
 | `manifest.json` | version, interface, empreintes SHA-256 de chaque fichier |
 

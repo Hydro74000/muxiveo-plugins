@@ -13,6 +13,7 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <cstddef>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
@@ -298,33 +299,19 @@ using TrtPtr = std::unique_ptr<T, TrtDelete<T>>;
 
 } // namespace
 
-struct MvoTrtSession
+// Réseau TensorRT prêt à l'exécution : moteur, configuration, cache des noyaux, contexte et mémoire de travail.
+struct TrtNet
 {
-    Cuda* cu = nullptr;
-    CUdevice dev = 0;
-    CUcontext ctx = nullptr;
-    CUstream stream = nullptr;
-    Logger logger;
-    mvo_trt_log_fn log = nullptr;
-    void* log_user = nullptr;
-    TrtPtr<nvinfer1::IRuntime> runtime;
+    nvinfer1::IRuntime* runtime = nullptr;   // runtime propriétaire du moteur (doit lui survivre)
     TrtPtr<nvinfer1::ICudaEngine> engine;
     TrtPtr<nvinfer1::IRuntimeConfig> runtime_config;
     TrtPtr<nvinfer1::IRuntimeCache> runtime_cache;
     TrtPtr<nvinfer1::IExecutionContext> context;
-    CUdeviceptr timestep = 0;
     CUdeviceptr workspace = 0;
-    int width = 0;
-    int height = 0;
-    float last_t = -1.f;
-    bool first_inference = true;
     fs::path runtime_cache_path;
+    bool first_inference = true;
 
-    void info(const std::string& message) const
-    {
-        if (log)
-            log(log_user, MVO_TRT_LOG_INFO, message.c_str());
-    }
+    explicit operator bool() const { return static_cast<bool>(context); }
 
     void save_runtime_cache()
     {
@@ -335,19 +322,94 @@ struct MvoTrtSession
             write_file_atomic(runtime_cache_path, blob->data(), blob->size());
     }
 
+    void release(Cuda& cu)
+    {
+        context.reset();
+        runtime_config.reset();
+        runtime_cache.reset();
+        engine.reset();
+        if (workspace)
+            cu.cuMemFree(workspace);
+        workspace = 0;
+    }
+};
+
+// Caractéristiques des images (encodeur des familles v4.15), partagées par les sessions d'un même modèle et d'une
+// même taille (inférence normale, demi-résolution, sens inverse) : l'encodeur n'est calculé qu'une fois par image
+// tant que muxiveo-rife en transmet l'identité. Appels séquentiels (fil de muxiveo-rife), sans verrou interne.
+struct FeatureStore
+{
+    struct Entry
+    {
+        uint64_t id = 0;
+        CUdeviceptr buf = 0;
+        uint64_t used = 0;
+    };
+    Cuda* cu = nullptr;
+    CUcontext ctx = nullptr;
+    Logger logger;
+    TrtPtr<nvinfer1::IRuntime> runtime;   // propre : partagé au-delà de la session qui l'a créé
+    TrtNet head;
+    size_t bytes = 0;
+    Entry cached[2];   // images de la paire courante (la suivante en réutilise une)
+    Entry scratch[2];  // images sans identité : recalculées à chaque appel
+    uint64_t tick = 0;
+
+    ~FeatureStore()
+    {
+        if (!cu || !ctx || cu->cuCtxPushCurrent(ctx) != 0)
+            return;
+        head.release(*cu);
+        runtime.reset();
+        for (Entry* e : {&cached[0], &cached[1], &scratch[0], &scratch[1]})
+            if (e->buf)
+                cu->cuMemFree(e->buf);
+        CUcontext popped = nullptr;
+        cu->cuCtxPopCurrent(&popped);
+    }
+};
+
+static std::mutex g_features_mutex;
+static std::vector<std::pair<std::string, std::weak_ptr<FeatureStore>>> g_features;
+
+struct MvoTrtSession
+{
+    Cuda* cu = nullptr;
+    CUdevice dev = 0;
+    CUcontext ctx = nullptr;
+    CUstream stream = nullptr;
+    Logger logger;
+    mvo_trt_log_fn log = nullptr;
+    void* log_user = nullptr;
+    TrtPtr<nvinfer1::IRuntime> runtime;
+    TrtNet full;                           // modèle complet (sans identités d'images, ou modèle sans encodeur)
+    TrtNet body;                           // corps : caractéristiques fournies
+    std::shared_ptr<FeatureStore> features;
+    fs::path model_path;
+    fs::path cache_dir;
+    std::string device_suffix;             // -smXY-trtrtxV (moteurs) ; uuid ajouté pour les caches de noyaux
+    std::string uuid_hex;
+    CUdeviceptr timestep = 0;
+    int width = 0;
+    int height = 0;
+    float last_t = -1.f;
+
+    void info(const std::string& message) const
+    {
+        if (log)
+            log(log_user, MVO_TRT_LOG_INFO, message.c_str());
+    }
+
     ~MvoTrtSession()
     {
         if (!cu || !ctx)
             return;
         {
             ContextScope scope(*cu, ctx);
-            context.reset();
-            runtime_config.reset();
-            runtime_cache.reset();
-            engine.reset();
+            full.release(*cu);
+            body.release(*cu);
+            features.reset();
             runtime.reset();
-            if (workspace)
-                cu->cuMemFree(workspace);
             if (timestep)
                 cu->cuMemFree(timestep);
             if (stream)
@@ -391,13 +453,14 @@ int device_supported(int cuda_device, char* error, size_t error_size)
 }
 
 // Moteur relu du cache, sinon construit depuis le modèle ONNX puis mis en cache.
-bool load_or_build_engine(MvoTrtSession& s, const fs::path& model, const fs::path& engine_path, std::string& error)
+bool load_or_build_engine(MvoTrtSession& s, TrtNet& n, const fs::path& model, const fs::path& engine_path,
+                          std::string& error)
 {
     std::vector<char> blob;
     if (read_file(engine_path, blob))
     {
-        s.engine.reset(s.runtime->deserializeCudaEngine(blob.data(), blob.size()));
-        if (s.engine)
+        n.engine.reset(n.runtime->deserializeCudaEngine(blob.data(), blob.size()));
+        if (n.engine)
             return true;
         s.info("moteur TensorRT en cache illisible : reconstruction");
     }
@@ -426,12 +489,14 @@ bool load_or_build_engine(MvoTrtSession& s, const fs::path& model, const fs::pat
     }
     TrtPtr<nvinfer1::IBuilderConfig> config(builder->createBuilderConfig());
     nvinfer1::IOptimizationProfile* profile = builder->createOptimizationProfile();
-    for (const char* name : {"in0", "in1", "in2"})
+    // dimensions dynamiques (hauteur, largeur) pour chaque entrée ; canaux fixés par le modèle
+    for (int i = 0; i < network->getNbInputs(); i++)
     {
-        const int c = std::strcmp(name, "in2") == 0 ? 1 : 3;
-        profile->setDimensions(name, nvinfer1::OptProfileSelector::kMIN, nvinfer1::Dims4{1, c, kMinSide, kMinSide});
-        profile->setDimensions(name, nvinfer1::OptProfileSelector::kOPT, nvinfer1::Dims4{1, c, s.height, s.width});
-        profile->setDimensions(name, nvinfer1::OptProfileSelector::kMAX, nvinfer1::Dims4{1, c, kMaxSide, kMaxSide});
+        nvinfer1::ITensor* in = network->getInput(i);
+        const int c = in->getDimensions().d[1];
+        profile->setDimensions(in->getName(), nvinfer1::OptProfileSelector::kMIN, nvinfer1::Dims4{1, c, kMinSide, kMinSide});
+        profile->setDimensions(in->getName(), nvinfer1::OptProfileSelector::kOPT, nvinfer1::Dims4{1, c, s.height, s.width});
+        profile->setDimensions(in->getName(), nvinfer1::OptProfileSelector::kMAX, nvinfer1::Dims4{1, c, kMaxSide, kMaxSide});
     }
     config->addOptimizationProfile(profile);
     config->setNbComputeCapabilities(1);
@@ -444,8 +509,8 @@ bool load_or_build_engine(MvoTrtSession& s, const fs::path& model, const fs::pat
     }
     if (!write_file_atomic(engine_path, serialized->data(), serialized->size()))
         s.info("moteur TensorRT non mis en cache (dossier en lecture seule ?)");
-    s.engine.reset(s.runtime->deserializeCudaEngine(serialized->data(), serialized->size()));
-    if (!s.engine)
+    n.engine.reset(n.runtime->deserializeCudaEngine(serialized->data(), serialized->size()));
+    if (!n.engine)
     {
         error = "moteur TensorRT illisible : " + s.logger.take_error();
         return false;
@@ -455,6 +520,177 @@ bool load_or_build_engine(MvoTrtSession& s, const fs::path& model, const fs::pat
     std::snprintf(line, sizeof line, "moteur TensorRT construit en %.1f s (mis en cache)", seconds);
     s.info(line);
     return true;
+}
+
+// Réseau prêt : moteur (cache ou construction), configuration d'exécution, cache des noyaux, formes des entrées
+// (1 × canaux × hauteur × largeur) et mémoire de travail.
+bool prepare_net(MvoTrtSession& s, TrtNet& n, const fs::path& model, std::string& error)
+{
+    const std::string stem = model.stem().u8string() + s.device_suffix;
+    n.runtime_cache_path = s.cache_dir / (stem + "-" + s.uuid_hex + ".rtcache");
+    if (!load_or_build_engine(s, n, model, s.cache_dir / (stem + ".engine"), error))
+        return false;
+    n.runtime_config.reset(n.engine->createRuntimeConfig());
+    if (!n.runtime_config)
+    {
+        error = "configuration d'exécution TensorRT impossible";
+        return false;
+    }
+    n.runtime_config->setExecutionContextAllocationStrategy(nvinfer1::ExecutionContextAllocationStrategy::kUSER_MANAGED);
+    n.runtime_config->setDynamicShapesKernelSpecializationStrategy(nvinfer1::DynamicShapesKernelSpecializationStrategy::kEAGER);
+    n.runtime_cache.reset(n.runtime_config->createRuntimeCache());
+    if (n.runtime_cache)
+    {
+        std::vector<char> blob;
+        // Cache validé par TensorRT (version, GPU, pilote) ; refusé = recompilation transparente.
+        if (read_file(n.runtime_cache_path, blob))
+            n.runtime_cache->deserialize(blob.data(), blob.size());
+        n.runtime_config->setRuntimeCache(*n.runtime_cache);
+    }
+    n.context.reset(n.engine->createExecutionContext(n.runtime_config.get()));
+    if (!n.context)
+    {
+        error = "contexte d'exécution TensorRT impossible : " + s.logger.take_error();
+        return false;
+    }
+    for (int i = 0; i < n.engine->getNbIOTensors(); i++)
+    {
+        const char* name = n.engine->getIOTensorName(i);
+        if (n.engine->getTensorIOMode(name) != nvinfer1::TensorIOMode::kINPUT)
+            continue;
+        const int c = n.engine->getTensorShape(name).d[1];
+        if (!n.context->setInputShape(name, nvinfer1::Dims4{1, c, s.height, s.width}))
+        {
+            error = "dimensions refusées par le moteur : " + s.logger.take_error();
+            return false;
+        }
+    }
+    const size_t workspace_size = n.context->updateDeviceMemorySizeForShapes();
+    if (workspace_size > 0)
+    {
+        if (s.cu->cuMemAlloc(&n.workspace, workspace_size) != 0)
+        {
+            n.workspace = 0;
+            error = "mémoire GPU insuffisante (TensorRT)";
+            return false;
+        }
+        n.context->setDeviceMemoryV2(reinterpret_cast<void*>(n.workspace), static_cast<int64_t>(workspace_size));
+    }
+    return true;
+}
+
+// Exécution synchrone d'un réseau sur le flux de la session ; première exécution : noyaux spécialisés mis en cache.
+bool run_net(MvoTrtSession& s, TrtNet& n, std::string& error)
+{
+    const auto t0 = std::chrono::steady_clock::now();
+    if (!n.context->enqueueV3(reinterpret_cast<cudaStream_t>(s.stream)) || s.cu->cuStreamSynchronize(s.stream) != 0)
+    {
+        error = "échec d'inférence TensorRT : " + s.logger.take_error();
+        return false;
+    }
+    if (n.first_inference)
+    {
+        n.first_inference = false;
+        const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        if (seconds > 1.0)
+        {
+            char line[112];
+            std::snprintf(line, sizeof line, "noyaux TensorRT spécialisés pour %dx%d en %.1f s (mis en cache)", s.width,
+                          s.height, seconds);
+            s.info(line);
+        }
+        n.save_runtime_cache();
+    }
+    return true;
+}
+
+// Caractéristiques partagées du modèle (encodeur « <base>-head.onnx » à côté du modèle, base sans « -uhd »), créées
+// au besoin ; nullptr si le modèle n'a pas d'encodeur séparé.
+std::shared_ptr<FeatureStore> shared_features(MvoTrtSession& s, std::string& error)
+{
+    std::string base = s.model_path.stem().u8string();
+    if (base.size() > 4 && base.compare(base.size() - 4, 4, "-uhd") == 0)
+        base.resize(base.size() - 4);
+    const fs::path head = s.model_path.parent_path() / (base + "-head.onnx");
+    std::error_code ec;
+    if (!fs::is_regular_file(head, ec))
+        return nullptr;
+    const std::string key = head.u8string() + "|" + std::to_string(s.width) + "x" + std::to_string(s.height) + "|"
+                            + std::to_string(static_cast<int>(s.dev));
+    std::lock_guard<std::mutex> lock(g_features_mutex);
+    for (auto it = g_features.begin(); it != g_features.end();)
+    {
+        if (auto f = it->second.lock())
+        {
+            if (it->first == key)
+                return f;
+            ++it;
+        }
+        else
+            it = g_features.erase(it);
+    }
+    auto f = std::make_shared<FeatureStore>();
+    f->cu = s.cu;
+    f->ctx = s.ctx;
+    f->runtime.reset(nvinfer1::createInferRuntime(f->logger));
+    if (!f->runtime)
+    {
+        error = "runtime TensorRT indisponible (encodeur)";
+        return nullptr;
+    }
+    f->head.runtime = f->runtime.get();
+    if (!prepare_net(s, f->head, head, error))
+        return nullptr;
+    const nvinfer1::Dims out = f->head.context->getTensorShape("f0");
+    if (out.nbDims != 4 || out.d[1] <= 0 || out.d[2] != s.height || out.d[3] != s.width)
+    {
+        error = "encodeur : sortie f0 inattendue";
+        return nullptr;
+    }
+    f->bytes = static_cast<size_t>(out.d[1]) * out.d[2] * out.d[3] * 2;
+    g_features.emplace_back(key, f);
+    return f;
+}
+
+// Caractéristiques de l'image `in` d'identité `id` (0 : inconnue, emplacement temporaire `scratch`), calculées par
+// l'encodeur sur le flux de la session si elles ne sont pas déjà connues. `keep` : entrée à ne pas évincer.
+CUdeviceptr image_features(MvoTrtSession& s, uint64_t id, CUdeviceptr in, int scratch, const FeatureStore::Entry* keep,
+                           FeatureStore::Entry*& entry, std::string& error)
+{
+    FeatureStore& f = *s.features;
+    entry = nullptr;
+    if (id)
+    {
+        for (FeatureStore::Entry& e : f.cached)
+            if (e.id == id && e.buf)
+            {
+                e.used = ++f.tick;
+                entry = &e;
+                return e.buf;
+            }
+        for (FeatureStore::Entry& e : f.cached)
+            if (&e != keep && (!entry || e.used < entry->used))
+                entry = &e;
+    }
+    else
+        entry = &f.scratch[scratch];
+    if (!entry->buf && s.cu->cuMemAlloc(&entry->buf, f.bytes) != 0)
+    {
+        entry->buf = 0;
+        error = "mémoire GPU insuffisante (caractéristiques TensorRT)";
+        return 0;
+    }
+    entry->id = 0;   // invalide tant que l'encodeur n'a pas réussi
+    if (!f.head.context->setTensorAddress("in0", reinterpret_cast<void*>(in))
+        || !f.head.context->setTensorAddress("f0", reinterpret_cast<void*>(entry->buf)) || !run_net(s, f.head, error))
+    {
+        if (error.empty())
+            error = "liaison des tenseurs impossible (encodeur) : " + s.logger.take_error();
+        return 0;
+    }
+    entry->id = id;
+    entry->used = ++f.tick;
+    return entry->buf;
 }
 
 MvoTrtSession* create(const MvoTrtCreateParams* p, char* error, size_t error_size)
@@ -490,15 +726,15 @@ MvoTrtSession* create(const MvoTrtCreateParams* p, char* error, size_t error_siz
 
     try
     {
-        const fs::path model = fs::u8path(p->model_path);
-        const fs::path cache_dir = fs::u8path(p->cache_dir);
+        s->model_path = fs::u8path(p->model_path);
+        s->cache_dir = fs::u8path(p->cache_dir);
         std::error_code ec;
-        fs::create_directories(cache_dir, ec);
+        fs::create_directories(s->cache_dir, ec);
         const int cc = compute_capability(c, s->dev);
         CUuuid uuid{};
         c.cuDeviceGetUuid(&uuid, s->dev);
-        const std::string stem = model.stem().u8string() + "-sm" + std::to_string(cc) + "-trtrtx" + trt_version();
-        s->runtime_cache_path = cache_dir / (stem + "-" + hex(uuid.bytes, 16) + ".rtcache");
+        s->device_suffix = "-sm" + std::to_string(cc) + "-trtrtx" + trt_version();
+        s->uuid_hex = hex(uuid.bytes, 16);
 
         s->runtime.reset(nvinfer1::createInferRuntime(s->logger));
         if (!s->runtime)
@@ -506,54 +742,30 @@ MvoTrtSession* create(const MvoTrtCreateParams* p, char* error, size_t error_siz
             set_error(error, error_size, "runtime TensorRT indisponible");
             return nullptr;
         }
+        s->full.runtime = s->body.runtime = s->runtime.get();
         std::string err;
-        if (!load_or_build_engine(*s, model, cache_dir / (stem + ".engine"), err))
+        // Encodeur séparé (familles v4.15) : corps + caractéristiques partagées ; sinon modèle complet.
+        const fs::path body = s->model_path.parent_path() / (s->model_path.stem().u8string() + "-body.onnx");
+        if (fs::is_regular_file(body, ec))
+        {
+            s->features = shared_features(*s, err);
+            if (s->features && !prepare_net(*s, s->body, body, err))
+            {
+                s->body.release(c);
+                s->features.reset();
+            }
+            if (!s->features)
+            {
+                s->info("encodeur séparé indisponible (" + err + ") : modèle complet");
+                err.clear();
+            }
+            else
+                s->info("caractéristiques calculées une fois par image (encodeur séparé)");
+        }
+        if (!s->features && !prepare_net(*s, s->full, s->model_path, err))
         {
             set_error(error, error_size, err);
             return nullptr;
-        }
-
-        s->runtime_config.reset(s->engine->createRuntimeConfig());
-        if (!s->runtime_config)
-        {
-            set_error(error, error_size, "configuration d'exécution TensorRT impossible");
-            return nullptr;
-        }
-        s->runtime_config->setExecutionContextAllocationStrategy(nvinfer1::ExecutionContextAllocationStrategy::kUSER_MANAGED);
-        s->runtime_config->setDynamicShapesKernelSpecializationStrategy(nvinfer1::DynamicShapesKernelSpecializationStrategy::kEAGER);
-        s->runtime_cache.reset(s->runtime_config->createRuntimeCache());
-        if (s->runtime_cache)
-        {
-            std::vector<char> blob;
-            // Cache validé par TensorRT (version, GPU, pilote) ; refusé = recompilation transparente.
-            if (read_file(s->runtime_cache_path, blob))
-                s->runtime_cache->deserialize(blob.data(), blob.size());
-            s->runtime_config->setRuntimeCache(*s->runtime_cache);
-        }
-        s->context.reset(s->engine->createExecutionContext(s->runtime_config.get()));
-        if (!s->context)
-        {
-            set_error(error, error_size, "contexte d'exécution TensorRT impossible : " + s->logger.take_error());
-            return nullptr;
-        }
-        const nvinfer1::Dims4 rgb{1, 3, s->height, s->width};
-        const nvinfer1::Dims4 map{1, 1, s->height, s->width};
-        if (!s->context->setInputShape("in0", rgb) || !s->context->setInputShape("in1", rgb)
-            || !s->context->setInputShape("in2", map))
-        {
-            set_error(error, error_size, "dimensions refusées par le moteur : " + s->logger.take_error());
-            return nullptr;
-        }
-        const size_t workspace_size = s->context->updateDeviceMemorySizeForShapes();
-        if (workspace_size > 0)
-        {
-            if (c.cuMemAlloc(&s->workspace, workspace_size) != 0)
-            {
-                s->workspace = 0;
-                set_error(error, error_size, "mémoire GPU insuffisante (TensorRT)");
-                return nullptr;
-            }
-            s->context->setDeviceMemoryV2(reinterpret_cast<void*>(s->workspace), static_cast<int64_t>(workspace_size));
         }
         if (c.cuMemAlloc(&s->timestep, static_cast<size_t>(s->width) * s->height * 2) != 0)
         {
@@ -578,7 +790,7 @@ MvoTrtSession* create(const MvoTrtCreateParams* p, char* error, size_t error_siz
 
 int infer(MvoTrtSession* s, const MvoTrtInferParams* p, char* error, size_t error_size)
 {
-    if (!s || !p || p->struct_size < sizeof(MvoTrtInferParams) || !p->in0 || !p->in1 || !p->out)
+    if (!s || !p || p->struct_size < offsetof(MvoTrtInferParams, id0) || !p->in0 || !p->in1 || !p->out)
     {
         set_error(error, error_size, "paramètres d'inférence invalides");
         return 0;
@@ -599,32 +811,67 @@ int infer(MvoTrtSession* s, const MvoTrtInferParams* p, char* error, size_t erro
         }
         s->last_t = p->t;
     }
-    if (!s->context->setTensorAddress("in0", reinterpret_cast<void*>(p->in0))
-        || !s->context->setTensorAddress("in1", reinterpret_cast<void*>(p->in1))
-        || !s->context->setTensorAddress("in2", reinterpret_cast<void*>(s->timestep))
-        || !s->context->setTensorAddress("out0", reinterpret_cast<void*>(p->out)))
+    std::string err;
+    // Identités des images transmises (muxiveo-rife ≥ 1.9.0) : encodeur une fois par image ; sinon modèle complet,
+    // préparé à la première demande.
+    const bool ids = p->struct_size >= sizeof(MvoTrtInferParams);
+    if (s->features && ids)
+    {
+        FeatureStore::Entry* e0 = nullptr;
+        FeatureStore::Entry* e1 = nullptr;
+        const CUdeviceptr f0 = image_features(*s, p->id0, p->in0, 0, nullptr, e0, err);
+        const CUdeviceptr f1 = f0 ? image_features(*s, p->id1, p->in1, 1, e0, e1, err) : 0;
+        if (!f0 || !f1)
+        {
+            set_error(error, error_size, err);
+            return 0;
+        }
+        if (!s->body.context->setTensorAddress("in0", reinterpret_cast<void*>(p->in0))
+            || !s->body.context->setTensorAddress("in1", reinterpret_cast<void*>(p->in1))
+            || !s->body.context->setTensorAddress("f0", reinterpret_cast<void*>(f0))
+            || !s->body.context->setTensorAddress("f1", reinterpret_cast<void*>(f1))
+            || !s->body.context->setTensorAddress("in2", reinterpret_cast<void*>(s->timestep))
+            || !s->body.context->setTensorAddress("out0", reinterpret_cast<void*>(p->out)))
+        {
+            set_error(error, error_size, "liaison des tenseurs impossible : " + s->logger.take_error());
+            return 0;
+        }
+        if (!run_net(*s, s->body, err))
+        {
+            set_error(error, error_size, err);
+            return 0;
+        }
+        return 1;
+    }
+    if (!s->full)
+    {
+        try
+        {
+            if (!prepare_net(*s, s->full, s->model_path, err))
+            {
+                s->full.release(c);
+                set_error(error, error_size, err);
+                return 0;
+            }
+        }
+        catch (const std::exception& e)
+        {
+            set_error(error, error_size, std::string("erreur interne : ") + e.what());
+            return 0;
+        }
+    }
+    if (!s->full.context->setTensorAddress("in0", reinterpret_cast<void*>(p->in0))
+        || !s->full.context->setTensorAddress("in1", reinterpret_cast<void*>(p->in1))
+        || !s->full.context->setTensorAddress("in2", reinterpret_cast<void*>(s->timestep))
+        || !s->full.context->setTensorAddress("out0", reinterpret_cast<void*>(p->out)))
     {
         set_error(error, error_size, "liaison des tenseurs impossible : " + s->logger.take_error());
         return 0;
     }
-    const auto t0 = std::chrono::steady_clock::now();
-    if (!s->context->enqueueV3(reinterpret_cast<cudaStream_t>(s->stream)) || c.cuStreamSynchronize(s->stream) != 0)
+    if (!run_net(*s, s->full, err))
     {
-        set_error(error, error_size, "échec d'inférence TensorRT : " + s->logger.take_error());
+        set_error(error, error_size, err);
         return 0;
-    }
-    if (s->first_inference)
-    {
-        s->first_inference = false;
-        const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-        if (seconds > 1.0)
-        {
-            char line[112];
-            std::snprintf(line, sizeof line, "noyaux TensorRT spécialisés pour %dx%d en %.1f s (mis en cache)", s->width,
-                          s->height, seconds);
-            s->info(line);
-        }
-        s->save_runtime_cache();
     }
     return 1;
 }

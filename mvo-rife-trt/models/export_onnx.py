@@ -4,6 +4,9 @@ Architectures IFNet v4.6, v4.15 et v4.15-lite reprises de vs-rife (MIT, HolyWu ;
 Interface identique aux modèles ncnn de muxiveo-rife : in0, in1 (RGB [0,1], fp16, NCHW), in2 (carte de
 temps, fp16) → out0 (RGB fp16). Dimensions dynamiques (multiples du padding de muxiveo-rife).
 Variante « -uhd » : échelles du flux doublées (équivalent de muxiveo-rife --uhd / Practical-RIFE scale=0.5).
+Familles v4.15 (encodeur de caractéristiques) : aussi « <modèle>-head.onnx » (in0 → f0, caractéristiques d'une image)
+et « <modèle>[-uhd]-body.onnx » (in0, in1, f0, f1, in2 → out0), pour que le plugin calcule l'encodeur une seule fois
+par image ; leur composition est vérifiée identique au modèle complet à l'export.
 
 Usage : python export_onnx.py <dossier des poids> <dossier de sortie>
 Les poids (models.json) sont vérifiés par SHA-256 avant usage.
@@ -182,6 +185,41 @@ ARCHS = {
 SCALES = {"rife-v4.25": [16.0, 8.0, 4.0, 2.0, 1.0], "rife-v4.25-heavy": [16.0, 8.0, 4.0, 2.0, 1.0]}
 
 
+class Body415(nn.Module):
+    """Corps d'IFNet v4.15 : caractéristiques f0, f1 fournies (même calcul que Net415.forward après l'encodeur)."""
+
+    def __init__(self, net):
+        super().__init__()
+        self.net = net
+
+    def forward(self, in0, in1, f0, f1, in2):
+        n = self.net
+        img0, img1, t = in0.clamp(0.0, 1.0), in1.clamp(0.0, 1.0), in2
+        blocks = [n.block0, n.block1, n.block2, n.block3]
+        wi0, wi1, flow, mask = img0, img1, None, None
+        for i in range(4):
+            if flow is None:
+                flow, mask, _ = blocks[i](torch.cat((img0, img1, f0, f1, t), 1), None, n.scales[i])
+            else:
+                wf0, wf1 = warp(f0, flow[:, :2]), warp(f1, flow[:, 2:4])
+                fd, mask, _ = blocks[i](torch.cat((wi0, wi1, wf0, wf1, t, mask), 1), flow, n.scales[i])
+                flow = flow + fd
+            wi0, wi1 = warp(img0, flow[:, :2]), warp(img1, flow[:, 2:4])
+        mask = torch.sigmoid(mask)
+        return wi0 * mask + wi1 * (1 - mask)
+
+
+class Head415(nn.Module):
+    """Encodeur d'IFNet v4.15 seul : caractéristiques d'une image (bornée à [0, 1] comme dans Net415.forward)."""
+
+    def __init__(self, net):
+        super().__init__()
+        self.net = net
+
+    def forward(self, in0):
+        return self.net.encode(in0.clamp(0.0, 1.0))
+
+
 def fetch_weights(name: str, info: dict, weights_dir: Path) -> Path:
     path = weights_dir / Path(info["url"]).name
     if not path.is_file():
@@ -192,6 +230,47 @@ def fetch_weights(name: str, info: dict, weights_dir: Path) -> Path:
     if digest != info["sha256"]:
         raise SystemExit(f"{name} : SHA-256 inattendu ({digest})")
     return path
+
+
+def load_net(name: str, weights: Path, scales):
+    net = ARCHS[name](scales).eval()
+    ckpt = torch.load(weights, map_location="cpu")
+    state = {k.replace("module.", ""): v for k, v in ckpt.items() if "teacher" not in k and "caltime" not in k}
+    missing, unexpected = net.load_state_dict(state, strict=False)
+    if missing:
+        raise SystemExit(f"{name} : poids manquants {missing}")
+    return net
+
+
+def export_split(name: str, weights: Path, uhd: bool, out_dir: Path, with_head: bool) -> None:
+    """Encodeur et corps séparés (familles v4.15) ; composition vérifiée identique au modèle complet (fp32)."""
+    scales = SCALES.get(name, [8.0, 4.0, 2.0, 1.0])
+    if uhd:
+        scales = [2 * s for s in scales]
+    net = load_net(name, weights, scales)
+    head, body = Head415(net), Body415(net)
+    g = torch.Generator().manual_seed(0)
+    a, b = torch.rand(1, 3, 128, 192, generator=g), torch.rand(1, 3, 128, 192, generator=g)
+    t = torch.full((1, 1, 128, 192), 0.4)
+    with torch.no_grad():
+        ref, split = net(a, b, t), body(a, b, head(a), head(b), t)
+    if not torch.equal(ref, split):
+        raise SystemExit(f"{name} : encodeur + corps différent du modèle complet ({(ref - split).abs().max():.3g})")
+    head, body = head.half(), body.half()
+    size = 256
+    x = torch.rand(1, 3, size, size).half()
+    if with_head:
+        path = out_dir / f"{name}-head.onnx"
+        torch.onnx.export(head, (x,), str(path), input_names=["in0"], output_names=["f0"], opset_version=17, dynamo=False,
+                          dynamic_axes={n: {2: "h", 3: "w"} for n in ("in0", "f0")})
+        print(f"{path.name} : {path.stat().st_size / 1e6:.1f} Mo", flush=True)
+    f = head(x)
+    args = (x, torch.rand(1, 3, size, size).half(), f, f.clone(), torch.full((1, 1, size, size), 0.5).half())
+    path = out_dir / f"{name}{'-uhd' if uhd else ''}-body.onnx"
+    torch.onnx.export(body, args, str(path), input_names=["in0", "in1", "f0", "f1", "in2"], output_names=["out0"],
+                      opset_version=17, dynamo=False,
+                      dynamic_axes={n: {2: "h", 3: "w"} for n in ("in0", "in1", "f0", "f1", "in2", "out0")})
+    print(f"{path.name} : {path.stat().st_size / 1e6:.1f} Mo", flush=True)
 
 
 def export(name: str, weights: Path, uhd: bool, out_path: Path) -> None:
@@ -221,6 +300,8 @@ def main() -> None:
         weights = fetch_weights(name, info, weights_dir)
         for variant in manifest["variants"]:
             export(name, weights, variant == "-uhd", out_dir / f"{name}{variant}.onnx")
+            if ARCHS[name] is Net415 or name == "rife-v4.15-lite":
+                export_split(name, weights, variant == "-uhd", out_dir, with_head=variant == "")
 
 
 if __name__ == "__main__":

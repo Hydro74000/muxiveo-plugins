@@ -57,6 +57,11 @@ typedef struct MvoTrtInferParams
     uint64_t in1;
     uint64_t out;
     float t;                /* position temporelle (0 < t < 1) */
+    /* Ajoutés en muxiveo-rife 1.9.0 (même ABI : présents si struct_size les couvre). Identités des images in0 et in1,
+     * stables tant que leur contenu ne change pas (0 : inconnue) : le plugin peut réutiliser les calculs propres à une
+     * image (caractéristiques de l'encodeur), y compris entre sessions et sorties successives. */
+    uint64_t id0;
+    uint64_t id1;
 } MvoTrtInferParams;
 
 typedef struct MvoTrtApi
