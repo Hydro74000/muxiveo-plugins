@@ -140,6 +140,7 @@ struct mvo_fel_context {
     int64_t frames = 0, last_pts = AV_NOPTS_VALUE;
     bool output_closed = false, raw = false, started = false;
     std::array<double,7> timing{}; // ouverture, lecture, BL, EL, pixels, NUT, pipe.
+    Clock::time_point began{}, ended{};
     std::string statistics;
     mvo_fel_layers layers = nullptr;
     bool pulling = false, drained = false;
@@ -311,6 +312,7 @@ struct mvo_fel_context {
     void run() {
         if (started) throw Failure("Contexte déjà exécuté");
         started = true;
+        began = Clock::now();
         { Timer timer(timing[0]); open(); }
         auto p = packet();
         int64_t identity = 0;
@@ -340,7 +342,7 @@ struct mvo_fel_context {
         avio_flush(io); check(io->error, "Vidange NUT");
     }
     int next() {
-        if(!started) { started=true; pulling=true; Timer timer(timing[0]); open(); }
+        if(!started) { started=true; pulling=true; began=Clock::now(); Timer timer(timing[0]); open(); }
         if(!pulling)throw Failure("Contexte NUT déjà exécuté");
         const auto before=frames;
         pair();
@@ -432,6 +434,10 @@ const char *mvo_fel_statistics(mvo_fel_context *p) {
     text << std::fixed << std::setprecision(6) << "{\"frames\":" << p->frames;
     const char *names[]={"open_s","read_s","decode_bl_s","decode_el_s","pixels_s","nut_s","pipe_s"};
     for(size_t i=0;i<p->timing.size();++i)text << ",\"" << names[i] << "\":" << p->timing[i];
+    // Durée murale du thread producteur : base du débit réel, étages superposés compris.
+    const auto end = p->ended.time_since_epoch().count() ? p->ended : Clock::now();
+    const double wall = p->began.time_since_epoch().count() ? std::chrono::duration<double>(end-p->began).count() : 0;
+    text << ",\"wall_s\":" << wall << ",\"fps\":" << (wall > 0 ? p->frames/wall : 0);
     text << '}';
     p->statistics=text.str();
     return p->statistics.c_str();
@@ -444,6 +450,7 @@ int mvo_fel_run(mvo_fel_context *p, mvo_fel_write write, mvo_fel_progress progre
     catch (const Failure &exc) { p->error = exc.what(); result = exc.status; }
     catch (const std::exception &exc) { p->error = exc.what(); result = MVO_FEL_ERROR; }
     catch (...) { p->error = "Erreur native inconnue"; result = MVO_FEL_ERROR; }
+    p->ended = Clock::now();
     if (p->cancelled.load()) return MVO_FEL_CANCELLED;
     return p->output_closed ? MVO_FEL_OUTPUT_CLOSED : result;
 }
