@@ -354,3 +354,33 @@ Windows x86_64 CPU et macOS arm64 CPU. Le flux `extensions-feed/mvo-fel.json`
 décrit les capacités par plateforme et permet l'installation depuis l'unstable
 existante. Les variantes GPU Windows/macOS et la lecture sur appareil DV
 restent à valider ; cette préversion ne constitue pas une release générale.
+
+## État au 15 octobre 2026 (plan de continuation)
+
+Le [plan de continuation](docs/2026-10-15-plan-continuation.md) a été réalisé lot par lot, chaque lot étant commité puis audité.
+
+- **Correctifs :**
+  - seek natif (aperçus) ;
+  - RPU P8.1 dérivé du RPU original, sans seconde lecture de la source ;
+  - position chroma du BL appliquée et signalée, y compris pour `hevc_nvenc`.
+- **Transport :**
+  - écriture native sur le pipe, sans callback Python ;
+  - pipeline à trois étages bornés et pool de paquets ;
+  - image finale Y'CbCr 4:2:0 tramée par le plugin quand l'aval ne touche pas aux pixels ;
+  - NVEncC alimenté directement, avec recadrage dans le plugin.
+- **GPU :**
+  - décodage Vulkan Video contrôlé (2 × 48 images comparées au logiciel) ;
+  - composition fusionnée en entiers exacts.
+  - Écart PQ12 face au CPU ramené de 1,37 à 0,125 au maximum.
+- **CPU :** 0,7 → 10,4 i/s UHD (entiers exacts séparables, PQ vectorisée).
+- **Plateformes :**
+  - GPU Windows attesté sur matériel réel ;
+  - macOS : CPU, avec le GPU en choix manuel derrière une sonde CI ;
+  - cœurs tensoriels et direct VAAPI/QSV non retenus, faute de gain mesurable ([lot 7](docs/2026-10-15-lot7-coeurs-tensoriels.md), [lot 9](docs/2026-10-15-lot9-plateformes.md)).
+
+Restent avant une release générale :
+
+- publication de 0.2.0 puis épinglage dans Muxiveo (accord du mainteneur) ;
+- lecture P8.1 et repli HDR10 sur un téléviseur Dolby Vision ;
+- candidats CI Windows (MSYS2) et sonde macOS à exécuter ;
+- validation physique sur GPU AMD/Intel dédiés.

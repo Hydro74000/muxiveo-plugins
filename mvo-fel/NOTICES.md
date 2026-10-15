@@ -10,8 +10,13 @@ des couches dans `sample_el`. Copyright des contributeurs de libplacebo ;
 licence LGPL-2.1-or-later. La révision est épinglée dans `dependencies.json`.
 Sources : https://github.com/haasn/libplacebo.
 
+Table de tramage `src/blue_noise.h` : rangs d'un bruit bleu 64×64 produit par
+`pl_generate_blue_noise` de libplacebo (même révision), LGPL-2.1-or-later.
+
 FFmpeg : copyright des contributeurs de FFmpeg, LGPL-2.1-or-later ; aucune
-option GPL/nonfree n'est activée dans la construction embarquée.
+option GPL/nonfree n'est activée dans la construction embarquée. La version GPU
+active en plus Vulkan et le hwaccel `hevc_vulkan` (LGPL, chargeur Vulkan ouvert
+à l'exécution, en-têtes Khronos épinglés dans `dependencies.json`).
 Sources : https://github.com/FFmpeg/FFmpeg.
 
 libdovi (`dolby_vision`) : copyright quietvoid et contributeurs, MIT.

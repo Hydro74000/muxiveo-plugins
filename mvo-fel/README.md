@@ -4,51 +4,89 @@ Extension facultative de Muxiveo. Le moteur reconstruit l'apport de la couche FE
 dans les pixels avant les filtres, le tone mapping, l'interpolation et l'encodage,
 indépendamment de la conservation du RPU en sortie.
 
-**Première préversion : `mvo-fel-v0.1.0`, installable depuis Extensions.**
-Le paquet Linux x86_64 propose le CPU, Vulkan et le transport direct expérimental
-NVIDIA, sur une base glibc 2.28. Les paquets Windows x86_64 et macOS arm64
-proposent le CPU ; le GPU sur ces deux OS reste à valider. Les tests couvrent AMD
-et NVIDIA, des séquences synthétiques et trois scènes FEL réelles. La lecture sur
-matériel Dolby Vision reste à valider avant une release générale. Le [plan](PLAN.md) et
-le [rapport réel](docs/2026-10-10-real-fel-validation.md) détaillent ces limites.
+**Préversion publiée : `mvo-fel-v0.1.0`.** La version 0.2.0 (lots 1 à 9 du
+[plan de continuation](docs/2026-10-15-plan-continuation.md)) est prête dans le
+dépôt ; sa publication et son épinglage dans Muxiveo attendent l'accord du
+mainteneur. La lecture sur matériel Dolby Vision reste à valider avant une
+release générale.
 
 Dans Encodage → HDR → Dolby Vision, la case reste **décochée par défaut pour tous
 les profils, P5/P7 compris**. Seule une activation explicite demande la
 reconstruction, puis libdovi confirme la présence d'un FEL au lancement. Un MEL
 ou une source sans EL donnent une opération sans effet annoncée au journal.
 
+## Plateformes et validation (15/10/2026)
+
+| Plateforme | Rendu | Décodage BL/EL | Validation |
+|---|---|---|---|
+| Linux x86_64 | Vulkan (AMD, NVIDIA), CPU | Vulkan Video contrôlé, sinon CPU | 6 scènes FEL réelles × 2 GPU |
+| Windows x86_64 | Vulkan (NVIDIA, Intel), CPU | Vulkan Video contrôlé, sinon CPU | 6 scènes × GTX 1070 + UHD 630 ([lot 9](docs/2026-10-15-lot9-plateformes.md)) |
+| macOS arm64 | CPU ; GPU MoltenVK en choix manuel seulement | CPU | CI uniquement : sonde non bloquante |
+
+Écart maximal sur toutes les attestations : 0,125 code PQ12 face au CPU et 0,107
+face à l'oracle `kernel64`, pour une limite de 2.
+
+Débit du plugin seul, 300 images UHD, sortie 10 bits finale (Ryzen 7800X3D) :
+
+| Moteur | 0.1.0 | 0.2.0 |
+|---|---:|---:|
+| RTX 4070 Ti SUPER | 12,3 i/s (callback Python, RGB) | 85–88 i/s |
+| iGPU AMD Raphael | ~14 i/s | 22,8 i/s |
+| CPU, 12 threads | 0,7 i/s | 10,4 i/s |
+
+Les durées de workflow complètes (x265, NVEncC, FFmpeg/NVENC NUT et direct) sont
+consignées avec le plan de continuation.
+
 ## Architecture
 
-- Bibliothèque `libmvo_fel.so`, `mvo_fel.dll` ou `libmvo_fel.dylib`, ABI C
-  versionnée et adaptateur Python `ctypes` dans Muxiveo.
-- FFmpeg minimal et libdovi **liés statiquement dans le plugin**, symboles privés.
-  Aucune modification du PATH ou du FFmpeg système. Le FFmpeg configuré dans
-  Muxiveo reste utilisé pour le parcours en pipe. Le plugin ne fournit que les composants nécessaires au HEVC
-  BL/EL et au transport NUT ; les autres codecs restent ceux de Muxiveo.
-- Transport direct expérimental Linux/NVIDIA : un **FFmpeg privé supplémentaire**
-  avec source `mvo_fel` et raccordement `mvo_fel_cuda`, uniquement pour cette
-  reconstruction et l'encodeur `hevc_nvenc`. Images Vulkan → conversion P010
-  et dithering → transfert GPU CUDA → NVENC, sans NUT ni retour des images RGB
-  en RAM. Les décodeurs BL/EL restent CPU. Les pilotes ≥ 570, la même carte
-  physique et une géométrie sans redimensionnement sont requis. Autres codecs,
-  RIFE, SDR, filtres non pris en charge, autre GPU ou pilote inconnu conservent
-  le pipe. Aucun encodeur ou traitement RIFE n'est réécrit ou déplacé.
-- Calcul CPU portable, AVX2 sélectionné à l'exécution si disponible, sans GPU
-  obligatoire. NVIDIA n'est pas requis : le consommateur peut être un encodeur
-  logiciel ou un chemin matériel existant de Muxiveo.
-- Prototype Vulkan : libplacebo et glslang statiques privés, pilote Vulkan
-  chargé seulement pour le GPU. Choix dynamique **Auto / GPU détectés / CPU**
-  dans Muxiveo, enregistré par UUID dans la piste et les profils. La liste FEL
-  n'assimile pas les indices Vulkan, CUDA/NVENC et RIFE.
-- Décodage BL/EL → reconstruction RGB PQ `gbrp16le` → **NUT en pipe** → filtres →
-  tone mapping éventuel → RIFE éventuel → **un encodage compressé final**. Aucun
-  fichier vidéo décompressé complet. Le mode deux passes refait la reconstruction
-  pour chaque passe ; une erreur FEL peut provoquer une reprise entière sur BL.
-- Pas de Display Management, de trim d'écran ni d'analyse des « faux FEL ».
-- Installation, mise à jour et suppression depuis Extensions, release autonome
-  `mvo-fel-vX.Y.Z` et flux `extensions-feed/mvo-fel.json`. Aucun téléchargement
-  pendant l'encodage. Une demande sans moteur disponible produit un avertissement
-  et utilise le BL, sans effacer le choix de l'utilisateur.
+- **Bibliothèque** `libmvo_fel.so`, `mvo_fel.dll` ou `libmvo_fel.dylib`. ABI C 1
+  et extensions additives annoncées par `mvo_fel_capabilities()` : `seek`,
+  `fd_output`, `output_formats` / `dithers`, `crop`, `timestamps`,
+  `direct_formats`. L'adaptateur Python `ctypes` est dans Muxiveo
+  (`core/fel/`).
+- **Dépendances statiques et symboles privés** : FFmpeg minimal (démuxeurs,
+  HEVC, `dovi_split`, NUT ; `hevc_vulkan` dans la version GPU), libdovi,
+  libplacebo et glslang. Aucune modification du PATH ni du FFmpeg système. Les
+  chargeurs Vulkan et pilotes sont ouverts à l'exécution.
+- **Pipeline natif à trois étages bornés** :
+  1. lecture, décodage BL/EL et appariement strict avec le RPU (ordre de
+     présentation, identité des access units) ;
+  2. rendu ;
+  3. écriture.
+
+  Les paquets viennent d'un pool réutilisé. Le seek natif positionne la source
+  (aperçus) sans reconstruire ce qui précède.
+- **Rendu GPU** (Vulkan) : une seule passe de composition lit les plans BL/EL.
+  Le rééchantillonnage Spline16 se fait en entiers exacts : chroma BL et trois
+  résiduels EL, avec zéro et signe du résiduel exacts. Viennent ensuite les
+  shaders libplacebo NLQ/mapping/couleurs, puis la conversion de sortie.
+- **Rendu CPU** : même arithmétique entière, passes séparables, PQ float32
+  vectorisée (AVX2+FMA choisi à l'exécution, NEON sur arm64). Repli en double
+  pour une géométrie non rationnelle.
+- **Décodage Vulkan Video** : au départ du job, 48 images par couche sont
+  décodées deux fois sur le GPU et comparées au décodage logiciel. Au moindre
+  écart, ou sans l'extension, le décodage reste sur CPU.
+- **Sorties** : RGB PQ 16 bits, ou Y'CbCr BT.2020nc limité 4:2:0 (16, 10 ou
+  8 bits) sous-échantillonné à la position chroma du BL, avec un tramage
+  déterministe (bruit bleu par défaut) identique sur CPU et GPU. Recadrage pair
+  et PTS relatifs possibles.
+- **Transports** :
+  - NUT écrit directement sur le pipe du consommateur (descripteur ou HANDLE),
+    sans callback ;
+  - NVEncC lit le plugin sans étage FFmpeg quand l'aval ne touche pas aux
+    pixels ;
+  - direct expérimental Linux/NVIDIA : P010 final → CUDA → `hevc_nvenc` par
+    `ffmpeg-fel`, avec couches décodées sur le même GPU.
+- **Hors périmètre** : ni Display Management, ni trim d'écran, ni détection de
+  « faux FEL ». Installation, mise à jour et suppression depuis Extensions,
+  release autonome `mvo-fel-vX.Y.Z` et flux `extensions-feed/mvo-fel.json`.
+  Aucun téléchargement pendant l'encodage.
+
+Décisions documentées :
+
+- [lot 7](docs/2026-10-15-lot7-coeurs-tensoriels.md) : cœurs tensoriels non
+  retenus, aucun gain de bout en bout mesurable ;
+- [lot 9](docs/2026-10-15-lot9-plateformes.md) : direct VAAPI/QSV non livré.
 
 ## Construction et paquet local
 
@@ -134,11 +172,13 @@ empreintes GBRP16LE que le renderer comparé aux références CPU et `kernel64`.
 Aucun intermédiaire vidéo n'est écrit. L'attestation de schéma 2 contient ces
 empreintes et les SHA-256 du moteur, des sources et des dépendances ; le
 schéma 1, qui testait seulement le renderer séparé, n'est plus accepté.
-Le packaging refuse un prototype sans attestation valide, ou sur
-une autre plateforme. Le paquet est autonome hors pilote graphique ; la voie
-CPU reste utilisable sans chargeur Vulkan. La CI peut préparer le candidat GPU
-Linux avec l'entrée `prepare_gpu` ; sa publication exige ensuite l'attestation
-sur les GPU physiques et les scènes réelles. Les autres OS conservent le CPU.
+Le packaging refuse un paquet GPU sans attestation valide. Il est autorisé sur
+Linux et Windows ; macOS reste CPU, faute de contenu réel en CI. Le paquet est
+autonome hors pilote graphique : `package.py` vérifie les dépendances ELF, ou les
+imports de DLL Windows. La voie CPU reste utilisable sans chargeur Vulkan. La CI
+prépare les candidats GPU Linux et Windows avec l'entrée `prepare_gpu`, et sonde
+MoltenVK sur macOS. Leur publication exige ensuite l'attestation sur les GPU
+physiques et les scènes réelles.
 
 Le transport direct se construit et s'atteste séparément, sur Linux NVIDIA :
 
