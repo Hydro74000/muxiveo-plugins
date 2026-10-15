@@ -446,10 +446,11 @@ struct mvo_fel_context {
         }
     }
 #endif
-    // Contrôle du décodage Vulkan Video sur les premières images (même départ) : codes BL/EL
-    // et RPU identiques au décodage logiciel, sinon décodage CPU pour tout le job.
+    // Contrôle du décodage Vulkan Video sur les premières images (même départ) : deux décodages
+    // Vulkan indépendants comparés au logiciel, codes BL/EL et RPU. Un décodeur instable (ex.
+    // Pascal sous Windows) diverge d'un passage à l'autre : décodage CPU pour tout le job.
     bool verify_hw_decode() {
-        constexpr int needed = 16;
+        constexpr int needed = 48;  // environ deux GOP UHD
         AVFormatContext *probe = avformat_alloc_context();
         if (!probe) throw std::bad_alloc();
         probe->interrupt_callback = {interrupt, this};
@@ -460,21 +461,25 @@ struct mvo_fel_context {
         if (avformat_find_stream_info(probe, nullptr) < 0) return false;
         AVStream *track = probe->streams[stream_index];
         if (target != AV_NOPTS_VALUE) av_seek_frame(probe, stream_index, target, AVSEEK_FLAG_BACKWARD);
-        std::array<Layer, 4> layers; // BL logiciel, BL Vulkan, EL logiciel, EL Vulkan
+        // Par couche : logiciel, Vulkan, Vulkan (second décodage indépendant).
+        std::array<Layer, 6> layers;
         int compared[2] = {0, 0};
         bool same = true, available = true;
         try {
-            layers[0].init(track, "bl_rpu", std::max(1, threads/3));
-            layers[1].init(track, "bl_rpu", 1, hw_device);
-            layers[2].init(track, "el", std::max(1, threads/3));
-            layers[3].init(track, "el", 1, hw_device);
+            for (int layer = 0; layer < 2; ++layer) {
+                const char *mode = layer ? "el" : "bl_rpu";
+                layers[3*layer].init(track, mode, std::max(1, threads/3));
+                layers[3*layer + 1].init(track, mode, 1, hw_device);
+                layers[3*layer + 2].init(track, mode, 1, hw_device);
+            }
             auto p = packet();
             auto drain = [&] {
                 for (int layer = 0; layer < 2 && same; ++layer) {
-                    auto &sw = layers[2*layer], &hw = layers[2*layer + 1];
-                    while (same && !sw.ready.empty() && !hw.ready.empty()) {
-                        same = same_frame(*sw.ready.front(), *hw.ready.front(), layer == 0);
-                        sw.ready.pop_front(); hw.ready.pop_front();
+                    auto &sw = layers[3*layer], &first = layers[3*layer + 1], &second = layers[3*layer + 2];
+                    while (same && !sw.ready.empty() && !first.ready.empty() && !second.ready.empty()) {
+                        same = same_frame(*sw.ready.front(), *first.ready.front(), layer == 0) &&
+                               same_frame(*sw.ready.front(), *second.ready.front(), layer == 0);
+                        sw.ready.pop_front(); first.ready.pop_front(); second.ready.pop_front();
                         ++compared[layer];
                     }
                 }
@@ -501,7 +506,7 @@ struct mvo_fel_context {
             available = compared[0] > 0;
         }
         const bool ok = same && compared[0] > 0 && compared[0] == compared[1];
-        decode_note = ok ? "décodage Vulkan Video vérifié (" + std::to_string(compared[0]) + " images)"
+        decode_note = ok ? "décodage Vulkan Video vérifié (2 × " + std::to_string(compared[0]) + " images)"
                     : available && compared[0] > 0 ? "décodage CPU (Vulkan Video différent du logiciel)"
                     : "décodage CPU (Vulkan Video indisponible)";
         return ok;

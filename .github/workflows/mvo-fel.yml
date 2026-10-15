@@ -46,6 +46,80 @@ jobs:
           path: mvo-fel/gpu-candidate.tar.gz
           if-no-files-found: error
 
+  windows_gpu_candidate:
+    # Même principe que Linux : binaire GPU construit ici, attesté ensuite sur matériel
+    # Windows (validate_gpu.py, contenu FEL réel) avant tout paquet publié.
+    if: github.event_name == 'workflow_dispatch' && inputs.prepare_gpu
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          install: >-
+            make nasm diffutils
+            mingw-w64-ucrt-x86_64-gcc mingw-w64-ucrt-x86_64-cmake
+            mingw-w64-ucrt-x86_64-ninja mingw-w64-ucrt-x86_64-python
+            mingw-w64-ucrt-x86_64-pkgconf mingw-w64-ucrt-x86_64-meson
+            mingw-w64-ucrt-x86_64-python-jinja
+      - uses: dtolnay/rust-toolchain@1.90.0
+        with:
+          targets: x86_64-pc-windows-gnu
+      - name: Préparer le GPU Windows (Vulkan, décodage Vulkan Video contrôlé)
+        shell: msys2 {0}
+        working-directory: mvo-fel
+        env:
+          CARGO_BUILD_TARGET: x86_64-pc-windows-gnu
+        run: |
+          export PATH="/c/Users/runneradmin/.cargo/bin:$PATH"
+          python scripts/build.py build-gpu --gpu --defer-gpu-tests
+          tar czf gpu-candidate-windows.tar.gz -C build-gpu plugin sources ffmpeg/config.h
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mvo-fel-gpu-candidate-windows
+          path: mvo-fel/gpu-candidate-windows.tar.gz
+          if-no-files-found: error
+
+  macos_gpu_probe:
+    # Sonde seulement : aucun contenu FEL réel ne peut valider le GPU ici. Le paquet macOS
+    # reste CPU ; GPU proposé en choix manuel si cette sonde passe (borne validée 15/10/2026).
+    if: github.event_name == 'workflow_dispatch' && inputs.prepare_gpu
+    runs-on: macos-14
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Dépendances (MoltenVK, chargeur Vulkan)
+        run: |
+          brew install cmake ninja nasm pkg-config molten-vk vulkan-loader vulkan-headers
+          python3 -m pip install meson jinja2
+      - uses: dtolnay/rust-toolchain@1.90.0
+      - name: Construire le GPU et sonder MoltenVK
+        working-directory: mvo-fel
+        run: |
+          set -o pipefail
+          python3 scripts/build.py build-gpu --gpu --defer-gpu-tests
+          export VK_ICD_FILENAMES="$(brew --prefix molten-vk)/etc/vulkan/icd.d/MoltenVK_icd.json"
+          export DYLD_FALLBACK_LIBRARY_PATH="$(brew --prefix vulkan-loader)/lib"
+          python3 - <<'PY' | tee probe.log
+          import ctypes, json
+          lib = ctypes.CDLL("build-gpu/plugin/libmvo_fel.dylib")
+          lib.mvo_fel_devices.restype = ctypes.c_size_t
+          lib.mvo_fel_devices.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
+          buffer = ctypes.create_string_buffer(65536)
+          lib.mvo_fel_devices(buffer, 65536)
+          print("GPU MoltenVK :", json.loads(buffer.value))
+          PY
+          ctest --test-dir build-gpu/plugin -R '^fel_gpu_reference$' --output-on-failure 2>&1 | tee -a probe.log
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: mvo-fel-gpu-probe-macos
+          path: mvo-fel/probe.log
+
   linux:
     runs-on: ubuntu-latest
     steps:

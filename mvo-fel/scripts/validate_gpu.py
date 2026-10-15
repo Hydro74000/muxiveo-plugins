@@ -45,7 +45,7 @@ def main() -> None:
     args.report.parent.mkdir(parents=True, exist_ok=True)
     report = {"schema": 2, "library_sha256": digest(args.library), "oracle_sha256": digest(args.oracle),
               "backend_source_sha256": digest(ROOT / "src/gpu_backend.c"),
-              "dependencies": json.loads((ROOT / "dependencies.json").read_text()),
+              "dependencies": json.loads((ROOT / "dependencies.json").read_text(encoding="utf-8")),
               "tolerance_pq12": 2, "samples": [], "passed": False}
     if args.direct_ffmpeg:
         report["direct"] = {"binary_sha256": digest(args.direct_ffmpeg),
@@ -59,7 +59,7 @@ def main() -> None:
             with log.open("w") as output:
                 subprocess.run([str(args.oracle.resolve()), str(clip.resolve()), "0", "3", "8", "validate"],
                                env=env, stdout=output, stderr=subprocess.STDOUT, check=True, timeout=180)
-            text = log.read_text()
+            text = log.read_text(encoding="utf-8", errors="replace")
             cpu = [float(v) for v in re.findall(r"max_delta_cpu_pq12=([0-9.e+-]+)", text)]
             oracle = [float(v) for v in re.findall(r"max_delta_kernel64_pq12=([0-9.e+-]+)", text)]
             if len(cpu) != 3 or len(oracle) != 3 or max(*cpu, *oracle) > 2:
@@ -73,16 +73,16 @@ def main() -> None:
             report["samples"].append({"device": device, "clip_sha256": digest(clip), "frames": 3,
                 "max_cpu_pq12": max(cpu), "max_reference_pq12": max(oracle), "log": name,
                 "producer": producer, "direct": direct})
-            args.report.write_text(json.dumps(report, ensure_ascii=False, indent=2)+"\n")
+            args.report.write_text(json.dumps(report, ensure_ascii=False, indent=2)+"\n", encoding="utf-8")
     if (digest(args.library) != report["library_sha256"] or digest(args.oracle) != report["oracle_sha256"]
             or digest(ROOT / "src/gpu_backend.c") != report["backend_source_sha256"]
-            or json.loads((ROOT / "dependencies.json").read_text()) != report["dependencies"]):
+            or json.loads((ROOT / "dependencies.json").read_text(encoding="utf-8")) != report["dependencies"]):
         raise RuntimeError("Le moteur ou ses sources ont changé pendant la validation")
     if args.direct_ffmpeg and (digest(args.direct_ffmpeg) != report["direct"]["binary_sha256"]
             or report["direct"]["filter_sources"] != {p.name: digest(p) for p in sorted((ROOT/'integrations/ffmpeg').glob('*.c'))}):
         raise RuntimeError("Le prototype direct a changé pendant la validation")
     report["passed"] = True
-    args.report.write_text(json.dumps(report, ensure_ascii=False, indent=2)+"\n")
+    args.report.write_text(json.dumps(report, ensure_ascii=False, indent=2)+"\n", encoding="utf-8")
     print(f"Validation stricte terminée : {args.report}", flush=True)
 
 

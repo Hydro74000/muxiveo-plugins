@@ -82,7 +82,8 @@ def validate_producer(lib: ctypes.CDLL, clip: Path, uuid: str, frame_bytes: int,
                 status = lib.mvo_fel_run(context, write_type(write), progress_type(lambda *_: None), None)
                 try:
                     process.stdin.close()
-                except BrokenPipeError:
+                except OSError:
+                    # Lecteur déjà sorti : EPIPE sous POSIX, EINVAL sous Windows.
                     pass
                 code = process.wait(timeout=15)
                 reader.join(timeout=15)
@@ -98,7 +99,8 @@ def validate_producer(lib: ctypes.CDLL, clip: Path, uuid: str, frame_bytes: int,
                 diagnostics.seek(0)
                 detail = diagnostics.read().decode("utf-8", errors="replace")
                 raise RuntimeError(f"Pixels de la bibliothèque différents de la référence : statut={status}, "
-                                   f"ffmpeg={code}, images={len(hashes)}, erreurs={errors}, {detail}")
+                                   f"ffmpeg={code}, images={len(hashes)}, moteur={backend!r}, "
+                                   f"empreintes={[h[:16] for h in hashes]}, erreurs={errors}, {detail}")
             return {"backend": backend, "frame_sha256": hashes}
     finally:
         lib.mvo_fel_destroy(context)

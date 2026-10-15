@@ -36,7 +36,7 @@ def build_gpu(build: Path, env: dict[str, str], jobs: int) -> Path:
          str(meson), str(placebo), f"--prefix={prefix}", "--libdir=lib", "--buildtype=release",
          "--default-library=static", "-Dprefer_static=true", "-Ddemos=false", "-Dtests=false",
          "-Dopengl=disabled", "-Dd3d11=disabled", "-Dvulkan=enabled", "-Dvk-proc-addr=disabled",
-         "-Dlibdovi=disabled", "-Dglslang=enabled", "-Dshaderc=disabled", "-Dlcms=disabled",
+         "-Dlibdovi=disabled", "-Dglslang=enabled", f"-Dvulkan-sdk={prefix}", "-Dshaderc=disabled", "-Dlcms=disabled",
          "-Dunwind=disabled", "-Dxxhash=disabled"], ROOT, local)
     run(["meson", "compile", "-C", str(meson), "-j", str(jobs)], ROOT, local)
     run(["meson", "install", "-C", str(meson)], ROOT, local)

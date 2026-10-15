@@ -94,6 +94,15 @@ class PackageValidationTests(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, "ABI glibc"):
                     package.check_glibc(self.library, "2.28")
 
+    def test_windows_dll_imports_only_system_libraries(self):
+        imports = "DLL Name: KERNEL32.dll\nDLL Name: api-ms-win-crt-runtime-l1-1-0.dll\nDLL Name: bcrypt.dll\n"
+        with patch.object(package.subprocess, "run", return_value=Mock(stdout=imports)):
+            package.check_windows_imports(self.library)
+        for foreign in ("libstdc++-6.dll", "vulkan-1.dll", "libwinpthread-1.dll"):
+            with patch.object(package.subprocess, "run", return_value=Mock(stdout=imports + "DLL Name: " + foreign)):
+                with self.assertRaisesRegex(RuntimeError, "non embarquées"):
+                    package.check_windows_imports(self.library)
+
 
 if __name__ == "__main__":
     unittest.main()

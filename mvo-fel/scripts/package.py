@@ -36,11 +36,11 @@ def load_capabilities(library: Path, validation: Path | None = None) -> dict:
     if capabilities.get("experimental"):
         if validation is None:
             raise RuntimeError("Le prototype Vulkan exige une attestation numérique de cette bibliothèque")
-        report = json.loads(validation.read_text())
+        report = json.loads(validation.read_text(encoding="utf-8"))
         if (report.get("schema") != 2 or report.get("passed") is not True or report.get("tolerance_pq12") != 2
                 or report.get("library_sha256") != digest(library)
                 or report.get("backend_source_sha256") != digest(ROOT / "src/gpu_backend.c")
-                or report.get("dependencies") != json.loads((ROOT / "dependencies.json").read_text())):
+                or report.get("dependencies") != json.loads((ROOT / "dependencies.json").read_text(encoding="utf-8"))):
             raise RuntimeError("Attestation GPU incompatible avec cette bibliothèque")
         scenes: dict[str, set[str]] = {}
         for sample in report.get("samples", []):
@@ -63,7 +63,7 @@ def load_capabilities(library: Path, validation: Path | None = None) -> dict:
 
 def check_direct(binary: Path, validation: Path) -> None:
     """Le filtre livré doit avoir produit les mêmes pixels que le renderer attesté."""
-    report = json.loads(validation.read_text())
+    report = json.loads(validation.read_text(encoding="utf-8"))
     direct = report.get("direct", {})
     sources = {p.name: digest(p) for p in sorted((ROOT/'integrations/ffmpeg').glob('*.c'))}
     if direct.get("binary_sha256") != digest(binary) or direct.get("filter_sources") != sources:
@@ -89,6 +89,21 @@ def check_glibc(binary: Path, maximum: str) -> None:
         raise RuntimeError(f"{binary.name} exige une ABI glibc au-delà de {maximum}")
 
 
+# Imports admis d'une DLL Windows autonome : système et UCRT (api-ms-win-*).
+WINDOWS_SYSTEM_DLLS = {"kernel32.dll", "msvcrt.dll", "ucrtbase.dll", "bcrypt.dll", "bcryptprimitives.dll",
+                       "ntdll.dll", "shlwapi.dll", "userenv.dll", "ws2_32.dll", "advapi32.dll", "ole32.dll",
+                       "user32.dll", "gdi32.dll", "shell32.dll"}
+
+
+def check_windows_imports(binary: Path) -> None:
+    """Refuse une DLL Windows dépendant d'une bibliothèque non système (MinGW, Vulkan...)."""
+    result = subprocess.run(["objdump", "-p", str(binary)], capture_output=True, text=True, check=True)
+    names = {name.lower() for name in re.findall(r"DLL Name: (\S+)", result.stdout)}
+    foreign = {n for n in names if n not in WINDOWS_SYSTEM_DLLS and not n.startswith("api-ms-win-")}
+    if foreign:
+        raise RuntimeError(f"Dépendances non embarquées dans {binary.name} : {sorted(foreign)}")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--library", type=Path, help="Bibliothèque à empaqueter, sinon build/plugin")
@@ -106,13 +121,16 @@ def main() -> None:
             raise RuntimeError("La vérification glibc concerne uniquement Linux")
         for binary in (library, *([args.direct_ffmpeg] if args.direct_ffmpeg else [])):
             check_glibc(binary, args.max_glibc)
-    if capabilities.get("experimental") and args.platform != "linux-x86_64":
-        raise RuntimeError("Le prototype GPU empaqueté est actuellement validé sur Linux x86_64 uniquement")
+    # macOS : aucune attestation sur contenu réel possible (runners de CI uniquement).
+    if capabilities.get("experimental") and args.platform not in {"linux-x86_64", "windows-x86_64"}:
+        raise RuntimeError("Le GPU empaqueté exige une attestation sur contenu réel (Linux, Windows)")
+    if capabilities.get("experimental") and args.platform == "windows-x86_64":
+        check_windows_imports(library)
     if args.direct_ffmpeg:
         if not capabilities.get("experimental") or args.platform != "linux-x86_64" or not args.validation:
             raise RuntimeError("Le transport direct exige un paquet GPU Linux attesté")
         check_direct(args.direct_ffmpeg, args.validation)
-    version = re.search(r"project\(mvo-fel VERSION ([\d.]+)", (ROOT / "CMakeLists.txt").read_text()).group(1)
+    version = re.search(r"project\(mvo-fel VERSION ([\d.]+)", (ROOT / "CMakeLists.txt").read_text(encoding="utf-8")).group(1)
     name = f"mvo-fel-{version}-{args.platform}" + ("-prototype" if capabilities.get("experimental") else "")
     destination = args.output / name
     destination.mkdir(parents=True, exist_ok=False)
@@ -143,11 +161,11 @@ def main() -> None:
             tar.add(args.build / "ffmpeg-direct/ffbuild/config.mak", arcname="configuration/ffmpeg-direct-config.mak")
     manifest = {"name": "mvo-fel", "version": version, "abi": 1, "platform": args.platform,
         "library": library.name, "capabilities": capabilities,
-        "dependencies": json.loads((ROOT / "dependencies.json").read_text()),
+        "dependencies": json.loads((ROOT / "dependencies.json").read_text(encoding="utf-8")),
         "files": {p.relative_to(destination).as_posix(): digest(p) for p in sorted(destination.rglob("*")) if p.is_file()}}
     if args.direct_ffmpeg:
         manifest["direct_ffmpeg"] = "ffmpeg-fel"
-    (destination / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
+    (destination / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
     if args.platform.startswith("windows"):
         with zipfile.ZipFile(args.output / f"{name}.zip", "w", zipfile.ZIP_DEFLATED) as archive:
             for path in sorted(destination.rglob("*")):
