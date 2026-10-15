@@ -372,7 +372,7 @@ Le [plan de continuation](docs/2026-10-15-plan-continuation.md) a été réalis�
   - décodage Vulkan Video contrôlé (2 × 48 images comparées au logiciel) ;
   - composition fusionnée en entiers exacts.
   - Écart PQ12 face au CPU ramené de 1,37 à 0,125 au maximum.
-- **CPU :** 0,7 → 10,4 i/s UHD (entiers exacts séparables, PQ vectorisée).
+- **CPU :** 0,7 → 8,1 i/s UHD (entiers exacts séparables, PQ et matrice en double vectorisées).
 - **Plateformes :**
   - GPU Windows attesté sur matériel réel ;
   - macOS : CPU, avec le GPU en choix manuel derrière une sonde CI ;

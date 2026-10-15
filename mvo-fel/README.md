@@ -32,7 +32,7 @@ Débit du plugin seul, 300 images UHD, sortie 10 bits finale (Ryzen 7800X3D) :
 |---|---:|---:|
 | RTX 4070 Ti SUPER | 12,3 i/s (callback Python, RGB) | 85–88 i/s |
 | iGPU AMD Raphael | ~14 i/s | 22,8 i/s |
-| CPU, 12 threads | 0,7 i/s | 10,4 i/s |
+| CPU, 12 threads | 0,7 i/s | 8,1 i/s |
 
 Les durées de workflow complètes (x265, NVEncC, FFmpeg/NVENC NUT et direct) sont
 consignées avec le plan de continuation.
@@ -60,9 +60,11 @@ consignées avec le plan de continuation.
   Le rééchantillonnage Spline16 se fait en entiers exacts : chroma BL et trois
   résiduels EL, avec zéro et signe du résiduel exacts. Viennent ensuite les
   shaders libplacebo NLQ/mapping/couleurs, puis la conversion de sortie.
-- **Rendu CPU** : même arithmétique entière, passes séparables, PQ float32
-  vectorisée (AVX2+FMA choisi à l'exécution, NEON sur arm64). Repli en double
-  pour une géométrie non rationnelle.
+- **Rendu CPU** : même arithmétique entière, passes séparables, PQ et matrice
+  LMS→RGB en double vectorisées (AVX2+FMA choisi à l'exécution, NEON sur arm64) :
+  identique à la référence en double sur les scènes réelles, ≤ 2 codes 16 bits sur
+  le domaine synthétique (le float32 dépassait la borne pour les couleurs saturées
+  lumineuses). Repli en double pour une géométrie non rationnelle.
 - **Décodage Vulkan Video** : au départ du job, 48 images par couche sont
   décodées deux fois sur le GPU et comparées au décodage logiciel. Au moindre
   écart, ou sans l'extension, le décodage reste sur CPU.

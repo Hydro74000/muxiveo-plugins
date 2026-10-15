@@ -13,12 +13,12 @@ void near(double actual, double expected, double tolerance = 1e-10) {
         std::exit(1);
     }
 }
-AVFrame *layer(int width, int height, std::mt19937 &random) {
+AVFrame *layer(int width, int height, std::mt19937 &random, int low = 0, int high = 1023) {
     AVFrame *frame = av_frame_alloc();
     frame->format = AV_PIX_FMT_YUV420P10LE; frame->width = width; frame->height = height;
     frame->chroma_location = AVCHROMA_LOC_TOPLEFT;
     if (av_frame_get_buffer(frame, 0) < 0) std::exit(1);
-    std::uniform_int_distribution<int> code(0, 1023);
+    std::uniform_int_distribution<int> code(low, high);
     for (int c = 0; c < 3; ++c)
         for (int y = 0; y < (c ? height/2 : height); ++y) {
             auto *row = reinterpret_cast<uint16_t *>(frame->data[c] + y*frame->linesize[c]);
@@ -27,18 +27,10 @@ AVFrame *layer(int width, int height, std::mt19937 &random) {
     return frame;
 }
 
-// Chemin entier séparable + PQ float face aux échantillonneurs en double : ≤ 2 codes 16 bits.
-void fast_matches_reference(AVDOVIMetadata &metadata) {
-    std::mt19937 random(7);
-    auto &mapping = *av_dovi_get_mapping(&metadata);
-    for (int c = 0; c < 3; ++c) {
-        auto &curve = mapping.curves[c];
-        curve.num_pivots = 3; curve.pivots[1] = 400; curve.pivots[2] = 1023;
-        curve.mapping_idc[1] = AV_DOVI_MAPPING_MMR;
-        curve.mmr_order[1] = 2; curve.mmr_constant[1] = 2000;
-        for (int k = 0; k < 2; ++k) for (int j = 0; j < 7; ++j) curve.mmr_coef[1][k][j] = 3000*(j+1)*(k ? -1 : 1);
-    }
-    AVFrame *bl = layer(64, 32, random), *el = layer(32, 16, random);
+// Écart maximal (codes 16 bits) du chemin rapide (entier séparable + PQ vectorisée) face aux
+// échantillonneurs et à la PQ de référence en double, sur des couches aléatoires.
+int fast_error(const AVDOVIMetadata &metadata, std::mt19937 &random, int low, int high) {
+    AVFrame *bl = layer(64, 32, random, low, high), *el = layer(32, 16, random, low, high);
     AVFrame *a = av_frame_alloc(), *b = av_frame_alloc();
     for (AVFrame *rgb : {a, b}) {
         rgb->format = AV_PIX_FMT_GBRP16LE; rgb->width = 64; rgb->height = 32;
@@ -55,8 +47,36 @@ void fast_matches_reference(AVDOVIMetadata &metadata) {
             for (int x = 0; x < 64; ++x)
                 worst = std::max(worst, std::abs(reinterpret_cast<const uint16_t *>(a->data[c] + y*a->linesize[c])[x] -
                                                  reinterpret_cast<const uint16_t *>(b->data[c] + y*b->linesize[c])[x]));
-    if (worst > 2) { std::cerr << "chemin rapide : " << worst << " codes 16 bits\n"; std::exit(1); }
     for (AVFrame *frame : {bl, el, a, b}) av_frame_free(&frame);
+    return worst;
+}
+
+// ≤ 2 codes 16 bits (0,125 code PQ12). Matrices identité : la matrice LMS→RGB fixe compense
+// des termes de l'ordre de 0,4 jusqu'à quelques 1e-5 (vert BT.2020 saturé vers 2000 cd/m²),
+// et la PQ amplifie fortement l'erreur absolue près de zéro (audit du 15/10/2026, graine 66).
+void fast_matches_reference(AVDOVIMetadata &metadata) {
+    for (unsigned seed = 1; seed <= 200; ++seed) {
+        std::mt19937 random(seed);
+        if (const int worst = fast_error(metadata, random, 64, 940); worst > 2) {
+            std::cerr << "chemin rapide, graine " << seed << " : " << worst << " codes 16 bits\n";
+            std::exit(1);
+        }
+    }
+    auto &mapping = *av_dovi_get_mapping(&metadata);
+    for (int c = 0; c < 3; ++c) {
+        auto &curve = mapping.curves[c];
+        curve.num_pivots = 3; curve.pivots[1] = 400; curve.pivots[2] = 1023;
+        curve.mapping_idc[1] = AV_DOVI_MAPPING_MMR;
+        curve.mmr_order[1] = 2; curve.mmr_constant[1] = 2000;
+        for (int k = 0; k < 2; ++k) for (int j = 0; j < 7; ++j) curve.mmr_coef[1][k][j] = 3000*(j+1)*(k ? -1 : 1);
+    }
+    for (unsigned seed = 1; seed <= 50; ++seed) {
+        std::mt19937 random(seed);
+        if (const int worst = fast_error(metadata, random, 0, 1023); worst > 2) {
+            std::cerr << "chemin rapide MMR, graine " << seed << " : " << worst << " codes 16 bits\n";
+            std::exit(1);
+        }
+    }
 }
 
 int main() {
