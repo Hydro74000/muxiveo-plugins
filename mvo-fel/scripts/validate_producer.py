@@ -6,14 +6,28 @@ import hashlib
 import subprocess
 import tempfile
 import threading
+from collections.abc import Callable
 from pathlib import Path
 
 
 def validate_producer(lib: ctypes.CDLL, clip: Path, uuid: str, frame_bytes: int,
-                      expected: list[str]) -> dict:
-    """Aucun intermédiaire vidéo ; FFmpeg sélectionne les images 0, 8 et 16."""
+                      expected: list[str]) -> tuple[dict, list[bytes]]:
+    """Aucun intermédiaire vidéo ; FFmpeg sélectionne les images 0, 8 et 16 (rendues aussi brutes)."""
     if not 0 < frame_bytes <= 8192*8192*6 or len(expected) != 3:
         raise ValueError("Dimensions ou nombre d'images de validation invalides")
+    backend, frames = producer_frames(lib, clip, uuid, frame_bytes, "gbrp16le")
+    hashes = [hashlib.sha256(frame).hexdigest() for frame in frames]
+    if hashes != expected:
+        raise RuntimeError(f"Pixels de la bibliothèque différents de la référence : moteur={backend!r}, "
+                           f"empreintes={[h[:16] for h in hashes]}")
+    return {"backend": backend, "frame_sha256": hashes}, frames
+
+
+def producer_frames(lib: ctypes.CDLL, clip: Path, uuid: str, frame_bytes: int, pixel_format: str,
+                    configure: Callable[[int], None] | None = None) -> tuple[str, list[bytes]]:
+    """Images 0, 8 et 16 du NUT livré, brutes ; ``configure`` règle le contexte avant le rendu."""
+    if not 0 < frame_bytes <= 8192*8192*6:
+        raise ValueError("Dimensions de validation invalides")
     write_type = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t)
     progress_type = ctypes.CFUNCTYPE(None, ctypes.c_void_p, ctypes.c_int64)
     lib.mvo_fel_create.argtypes = [ctypes.c_char_p, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int]
@@ -33,32 +47,32 @@ def validate_producer(lib: ctypes.CDLL, clip: Path, uuid: str, frame_bytes: int,
         raise RuntimeError("Création du producteur de validation impossible")
     try:
         if lib.mvo_fel_set_device(context, uuid.encode("ascii")):
-            raise RuntimeError("GPU de validation refusé")
-        hashes: list[str] = []
+            raise RuntimeError("Moteur de validation refusé")
+        if configure is not None:
+            configure(context)
+        frames: list[bytes] = []
         errors: list[str] = []
         expired = threading.Event()
         with tempfile.TemporaryFile() as diagnostics, subprocess.Popen([
             "ffmpeg", "-v", "error", "-nostdin", "-threads", "1", "-f", "nut", "-i", "pipe:0",
             "-map", "0:v:0", "-vf", r"select=eq(n\,0)+eq(n\,8)+eq(n\,16)",
             "-fps_mode", "passthrough", "-frames:v", "3", "-c:v", "rawvideo", "-threads", "1",
-            "-pix_fmt", "gbrp16le", "-f", "rawvideo", "pipe:1",
+            "-pix_fmt", pixel_format, "-f", "rawvideo", "pipe:1",
         ], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=diagnostics) as process:
             assert process.stdin is not None and process.stdout is not None
 
             def read() -> None:
                 try:
                     while True:
-                        remaining = frame_bytes
-                        sha = hashlib.sha256()
-                        while remaining:
-                            chunk = process.stdout.read(min(remaining, 1 << 20))
+                        frame = bytearray()
+                        while len(frame) < frame_bytes:
+                            chunk = process.stdout.read(min(frame_bytes - len(frame), 1 << 20))
                             if not chunk:
-                                if remaining != frame_bytes:
+                                if frame:
                                     errors.append("Image NUT tronquée")
                                 return
-                            sha.update(chunk)
-                            remaining -= len(chunk)
-                        hashes.append(sha.hexdigest())
+                            frame += chunk
+                        frames.append(bytes(frame))
                 except Exception as exc:
                     errors.append(str(exc))
 
@@ -95,12 +109,13 @@ def validate_producer(lib: ctypes.CDLL, clip: Path, uuid: str, frame_bytes: int,
                     process.kill()
                 process.wait()
                 reader.join()
-            if expired.is_set() or code or status not in {0, 2} or errors or hashes != expected or not backend.startswith("vulkan:"):
+            vulkan = uuid != "cpu"
+            if (expired.is_set() or code or status not in {0, 2} or errors or len(frames) != 3
+                    or backend.startswith("vulkan:") != vulkan):
                 diagnostics.seek(0)
                 detail = diagnostics.read().decode("utf-8", errors="replace")
-                raise RuntimeError(f"Pixels de la bibliothèque différents de la référence : statut={status}, "
-                                   f"ffmpeg={code}, images={len(hashes)}, moteur={backend!r}, "
-                                   f"empreintes={[h[:16] for h in hashes]}, erreurs={errors}, {detail}")
-            return {"backend": backend, "frame_sha256": hashes}
+                raise RuntimeError(f"Rendu de validation incomplet : statut={status}, ffmpeg={code}, "
+                                   f"images={len(frames)}, moteur={backend!r}, erreurs={errors}, {detail}")
+            return backend, frames
     finally:
         lib.mvo_fel_destroy(context)

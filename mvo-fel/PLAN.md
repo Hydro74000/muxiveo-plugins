@@ -380,6 +380,8 @@ Le [plan de continuation](docs/2026-10-15-plan-continuation.md) a été réalis�
 
 Restent avant une release générale :
 
+- attestation de schéma 3 de la bibliothèque définitive (Linux, Windows), mesures de
+  bout en bout, construction portable et paquet ;
 - publication de 0.2.0 puis épinglage dans Muxiveo (accord du mainteneur) ;
 - lecture P8.1 et repli HDR10 sur un téléviseur Dolby Vision ;
 - candidats CI Windows (MSYS2) et sonde macOS à exécuter ;

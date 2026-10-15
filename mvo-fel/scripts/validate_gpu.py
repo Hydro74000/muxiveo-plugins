@@ -8,10 +8,12 @@ import json
 import os
 import re
 import subprocess
+from functools import partial
 from pathlib import Path
 
 from validate_producer import validate_producer
 from validate_direct import validate_direct
+from validate_yuv import direct_options, p010_to_planar, validate_yuv
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -43,7 +45,7 @@ def main() -> None:
     if not devices:
         raise RuntimeError("Aucun GPU à valider")
     args.report.parent.mkdir(parents=True, exist_ok=True)
-    report = {"schema": 2, "library_sha256": digest(args.library), "oracle_sha256": digest(args.oracle),
+    report = {"schema": 3, "library_sha256": digest(args.library), "oracle_sha256": digest(args.oracle),
               "backend_source_sha256": digest(ROOT / "src/gpu_backend.c"),
               "dependencies": json.loads((ROOT / "dependencies.json").read_text(encoding="utf-8")),
               "tolerance_pq12": 2, "samples": [], "passed": False}
@@ -67,12 +69,21 @@ def main() -> None:
             pixels = re.findall(r"gpu_frame_bytes=(\d+) gpu_frame_sha256=([0-9a-f]{64})", text)
             if len(pixels) != 3 or len({size for size, _ in pixels}) != 1:
                 raise RuntimeError(f"Empreintes des images de référence absentes : {log}")
-            producer = validate_producer(lib, clip, device["uuid"], int(pixels[0][0]), [sha for _, sha in pixels])
-            direct = (validate_direct(args.direct_ffmpeg, args.library, clip, device["uuid"], int(pixels[0][0]),
-                                      [sha for _, sha in pixels]) if args.direct_ffmpeg else None)
+            producer, rgb = validate_producer(lib, clip, device["uuid"], int(pixels[0][0]), [sha for _, sha in pixels])
+            # Sorties finales Y'CbCr : conversion de référence en double à partir du RGB attesté.
+            yuv = validate_yuv(lib, clip, device["uuid"], rgb)
+            direct = None
+            if args.direct_ffmpeg:
+                direct = validate_direct(args.direct_ffmpeg, args.library, clip, device["uuid"], int(pixels[0][0]),
+                                         [sha for _, sha in pixels])
+                # P010 du filtre : mêmes octets que la sortie Y'CbCr 10 bits du producteur.
+                direct["yuv"] = [validate_direct(args.direct_ffmpeg, args.library, clip, device["uuid"],
+                    case["width"]*case["height"]*3, case["frame_sha256"], direct_options(case), "p010le",
+                    partial(p010_to_planar, width=case["width"], height=case["height"]))["frame_sha256"]
+                    for case in yuv]
             report["samples"].append({"device": device, "clip_sha256": digest(clip), "frames": 3,
                 "max_cpu_pq12": max(cpu), "max_reference_pq12": max(oracle), "log": name,
-                "producer": producer, "direct": direct})
+                "producer": producer, "yuv": yuv, "direct": direct})
             args.report.write_text(json.dumps(report, ensure_ascii=False, indent=2)+"\n", encoding="utf-8")
     if (digest(args.library) != report["library_sha256"] or digest(args.oracle) != report["oracle_sha256"]
             or digest(ROOT / "src/gpu_backend.c") != report["backend_source_sha256"]

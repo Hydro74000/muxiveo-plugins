@@ -21,13 +21,17 @@ class PackageValidationTests(unittest.TestCase):
         self.library.write_bytes(b"bibliotheque de test")
         self.validation = Path(self.temp.name) / "validation.json"
         self.report = {
-            "schema": 2, "passed": True, "tolerance_pq12": 2,
+            "schema": 3, "passed": True, "tolerance_pq12": 2,
             "library_sha256": package.digest(self.library),
             "backend_source_sha256": package.digest(package.ROOT / "src/gpu_backend.c"),
             "dependencies": json.loads((package.ROOT / "dependencies.json").read_text()),
             "samples": [{"device": {"uuid": "a"*32}, "clip_sha256": str(index)*64, "frames": 3,
                          "max_cpu_pq12": 1.0, "max_reference_pq12": 1.1,
-                         "producer": {"backend": "vulkan: test", "frame_sha256": ["b"*64]*3}}
+                         "producer": {"backend": "vulkan: test", "frame_sha256": ["b"*64]*3},
+                         "yuv": [{"chroma": "topleft", "dither": "none", "crop": [2, 4, 6, 8], "max_code10": .5,
+                                  "frame_sha256": ["d"*64]*3},
+                                 {"chroma": "left", "dither": "blue", "crop": [0, 0, 0, 0], "max_code10": .9999,
+                                  "frame_sha256": ["e"*64]*3}]}
                         for index in range(3)],
         }
         lib = Mock()
@@ -69,6 +73,16 @@ class PackageValidationTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "PQ12"):
             self.load()
 
+    def test_final_yuv_outputs_are_required(self):
+        self.report["samples"][0]["yuv"].pop()
+        with self.assertRaisesRegex(RuntimeError, "Y'CbCr"):
+            self.load()
+
+    def test_yuv_rounding_is_not_relaxed(self):
+        self.report["samples"][1]["yuv"][0]["max_code10"] = .6
+        with self.assertRaisesRegex(RuntimeError, "Y'CbCr"):
+            self.load()
+
     def test_direct_binary_and_pixels_are_required(self):
         binary = self.library.with_name("ffmpeg-fel")
         binary.write_bytes(b"filtre de test")
@@ -76,9 +90,15 @@ class PackageValidationTests(unittest.TestCase):
             "filter_sources": {p.name: package.digest(p) for p in sorted((package.ROOT/'integrations/ffmpeg').glob('*.c'))}}
         for sample in self.report["samples"]:
             sample["direct"] = {"transport": "vulkan", "frames_read": 17,
-                                "frame_sha256": sample["producer"]["frame_sha256"]}
+                                "frame_sha256": sample["producer"]["frame_sha256"],
+                                "yuv": [case["frame_sha256"] for case in sample["yuv"]]}
         self.load()
         package.check_direct(binary, self.validation)
+        self.report["samples"][0]["direct"]["yuv"][1] = ["f"*64]*3
+        self.load()
+        with self.assertRaisesRegex(RuntimeError, "Pixels"):
+            package.check_direct(binary, self.validation)
+        self.report["samples"][0]["direct"]["yuv"][1] = self.report["samples"][0]["yuv"][1]["frame_sha256"]
         self.report["samples"][0]["direct"]["frame_sha256"] = ["c"*64]*3
         self.load()
         with self.assertRaisesRegex(RuntimeError, "Pixels"):

@@ -4,11 +4,15 @@ Extension facultative de Muxiveo. Le moteur reconstruit l'apport de la couche FE
 dans les pixels avant les filtres, le tone mapping, l'interpolation et l'encodage,
 indépendamment de la conservation du RPU en sortie.
 
-**Préversion publiée : `mvo-fel-v0.1.0`.** La version 0.2.0 (lots 1 à 9 du
-[plan de continuation](docs/2026-10-15-plan-continuation.md)) est prête dans le
-dépôt ; sa publication et son épinglage dans Muxiveo attendent l'accord du
-mainteneur. La lecture sur matériel Dolby Vision reste à valider avant une
-release générale.
+**Préversion publiée : `mvo-fel-v0.1.0`.** La version 0.2.0 est en cours de
+finalisation dans le dépôt : les lots 1 à 9 du
+[plan de continuation](docs/2026-10-15-plan-continuation.md) sont réalisés et les
+défauts de l'[audit du 15/10/2026](docs/2026-10-15-audit-continuation.md) corrigés
+([réponse](docs/2026-10-15-reponse-audit.md)). Restent l'attestation de la
+bibliothèque définitive (Linux et Windows), les mesures de bout en bout, la
+construction portable et le paquet ; puis la publication et l'épinglage dans
+Muxiveo, qui attendent l'accord du mainteneur. La lecture sur matériel Dolby
+Vision reste à valider avant une release générale.
 
 Dans Encodage → HDR → Dolby Vision, la case reste **décochée par défaut pour tous
 les profils, P5/P7 compris**. Seule une activation explicite demande la
@@ -24,7 +28,11 @@ ou une source sans EL donnent une opération sans effet annoncée au journal.
 | macOS arm64 | CPU ; GPU MoltenVK en choix manuel seulement | CPU | CI uniquement : sonde non bloquante |
 
 Écart maximal sur toutes les attestations : 0,125 code PQ12 face au CPU et 0,107
-face à l'oracle `kernel64`, pour une limite de 2.
+face à l'oracle `kernel64`, pour une limite de 2. Cette borne GPU est mesurée sur
+contenu réel : les shaders calculent en float32, comme libplacebo, et sur le
+domaine synthétique une composante proche de zéro dans une couleur saturée très
+lumineuse peut la dépasser. Le CPU calcule la PQ et les matrices en double et
+respecte la borne sur tout le domaine testé (≤ 2 codes 16 bits face à la référence).
 
 Débit du plugin seul, 300 images UHD, sortie 10 bits finale (Ryzen 7800X3D) :
 
@@ -171,9 +179,13 @@ python3 scripts/package.py linux-x86_64 build build/dist \
 Il utilise aussi le FFmpeg de validation pour lire en pipe le NUT produit par
 la bibliothèque exacte : les images 0, 8 et 16 doivent avoir les mêmes
 empreintes GBRP16LE que le renderer comparé aux références CPU et `kernel64`.
-Aucun intermédiaire vidéo n'est écrit. L'attestation de schéma 2 contient ces
-empreintes et les SHA-256 du moteur, des sources et des dépendances ; le
-schéma 1, qui testait seulement le renderer séparé, n'est plus accepté.
+Aucun intermédiaire vidéo n'est écrit. Les sorties finales Y'CbCr 4:2:0 10 bits
+du même NUT sont ensuite comparées à une conversion de référence en double
+(numpy), recalculée depuis ce RGB attesté : position chroma `topleft` recadrée
+sans tramage (arrondi exact, ≤ 0,5 code), puis `left` avec le tramage livré
+(< 1 code). L'attestation de schéma 3 contient ces empreintes, ces écarts et les
+SHA-256 du moteur, des sources et des dépendances ; les schémas 1 et 2 ne sont
+plus acceptés.
 Le packaging refuse un paquet GPU sans attestation valide. Il est autorisé sur
 Linux et Windows ; macOS reste CPU, faute de contenu réel en CI. Le paquet est
 autonome hors pilote graphique : `package.py` vérifie les dépendances ELF, ou les
@@ -196,7 +208,9 @@ python3 scripts/package.py linux-x86_64 build build/dist \
 
 L'attestation vérifie aussi les images Vulkan produites par ce binaire exact,
 après lecture de 17 images, et refuse une différence d'empreinte avec le renderer
-de référence aux images 0/8/16. Le paquet contient le binaire `ffmpeg-fel`, ses
+de référence aux images 0/8/16. Les images P010 finales du filtre (position
+chroma, recadrage, tramage) doivent être identiques, octet pour octet, aux sorties
+Y'CbCr attestées du producteur. Le paquet contient le binaire `ffmpeg-fel`, ses
 sources et configurations, les en-têtes NVIDIA MIT épinglés et leurs notices.
 Muxiveo ne l'utilise que si le manifeste du plugin l'annonce et que le workflow
 est compatible. Sinon, la reconstruction FEL continue par NUT.

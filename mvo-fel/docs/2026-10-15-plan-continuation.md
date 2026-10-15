@@ -163,6 +163,13 @@ Remarque sur les formats :
   - **Règle complète** : tout étage qui modifie les pixels impose 16 bits, y
     compris les `--vpp-*` de NVEncC, le redimensionnement matériel et le
     `scale_cuda`/`scale_vaapi` de conversion.
+    *Amendée après l'audit du 15/10* ([réponse](2026-10-15-reponse-audit.md)) :
+    la règle livrée n'examine que les filtres **avant** l'upload matériel. Les
+    filtres matériels et VPP en aval reçoivent l'image 10 bits finale, comme ils
+    recevaient avant le lot 4 la réduction 10 bits insérée avant l'upload : le
+    point de quantification est inchangé. Un upload 16 bits doublerait le
+    transfert, sans gain établi (`scale_cuda` ramène le P016 en P010 sans
+    tramage).
   - **L'error diffusion se parallélise mal sur GPU.** Choisir entre bruit bleu
     et ordonné sur mesure : débit à CRF constant et métriques.
 - Critère de sortie : qualité finale ≥ parcours actuel (PSNR, SSIM, ΔE ITP sur

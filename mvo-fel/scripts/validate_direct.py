@@ -5,6 +5,7 @@ import hashlib
 import subprocess
 import tempfile
 import threading
+from collections.abc import Callable
 from pathlib import Path
 
 
@@ -14,19 +15,22 @@ def escaped(value: str) -> str:
 
 
 def validate_direct(binary: Path, library: Path, clip: Path, uuid: str,
-                    frame_bytes: int, expected: list[str]) -> dict:
+                    frame_bytes: int, expected: list[str], options: str = '', download: str = 'gbrp16le',
+                    transform: Callable[[bytes], bytes] | None = None) -> dict:
+    """Images 0, 8 et 16 du filtre, brutes au format ``download`` (ex. P010 recadré avec ``options``) ;
+    ``transform`` les réécrit avant l'empreinte (swscale n'est pas sans perte de P010 vers 10 bits planaire)."""
     if not 0 < frame_bytes <= 8192*8192*6 or len(expected) != 3:
         raise ValueError('Dimensions ou nombre d’images invalides')
     uuid = f'{uuid[:8]}-{uuid[8:12]}-{uuid[12:16]}-{uuid[16:20]}-{uuid[20:]}'
-    graph = (f'mvo_fel=source={escaped(str(clip.resolve()))}:library={escaped(str(library.resolve()))}:threads=6,'
-             'hwdownload,format=gbrp16le[v]')
+    graph = (f'mvo_fel=source={escaped(str(clip.resolve()))}:library={escaped(str(library.resolve()))}:threads=6'
+             f'{options},hwdownload,format={download}[v]')
     hashes = []
     expired = threading.Event()
     with tempfile.TemporaryFile() as diagnostics, subprocess.Popen([
         str(binary.resolve()), '-v', 'error', '-nostdin', '-init_hw_device',
         f'vulkan=fel:{uuid},disable_multiplane=1', '-filter_hw_device', 'fel',
         '-filter_complex', graph, '-map', '[v]', '-frames:v', '17', '-fps_mode', 'passthrough',
-        '-c:v', 'rawvideo', '-threads', '1', '-pix_fmt', 'gbrp16le', '-f', 'rawvideo', 'pipe:1',
+        '-c:v', 'rawvideo', '-threads', '1', '-pix_fmt', download, '-f', 'rawvideo', 'pipe:1',
     ], stdout=subprocess.PIPE, stderr=diagnostics) as process:
         assert process.stdout is not None
 
@@ -39,16 +43,16 @@ def validate_direct(binary: Path, library: Path, clip: Path, uuid: str,
         try:
             for index in range(17):
                 remaining = frame_bytes
-                sha = hashlib.sha256()
+                frame = bytearray()
                 while remaining:
                     chunk = process.stdout.read(min(remaining, 1 << 20))
                     if not chunk:
                         raise RuntimeError(f'Image directe {index} tronquée')
                     if index in (0, 8, 16):
-                        sha.update(chunk)
+                        frame += chunk
                     remaining -= len(chunk)
                 if index in (0, 8, 16):
-                    hashes.append(sha.hexdigest())
+                    hashes.append(hashlib.sha256(transform(bytes(frame)) if transform else frame).hexdigest())
             code = process.wait(timeout=15)
         finally:
             timer.cancel()
