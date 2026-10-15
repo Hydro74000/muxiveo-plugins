@@ -26,6 +26,10 @@ def load(path: Path):
     lib.mvo_fel_run_fd.restype = c.c_int
     lib.mvo_fel_set_output.argtypes = [c.c_void_p, c.c_char_p, c.c_char_p, c.c_char_p]
     lib.mvo_fel_set_output.restype = c.c_int
+    lib.mvo_fel_set_crop.argtypes = [c.c_void_p, *([c.c_int] * 4)]
+    lib.mvo_fel_set_crop.restype = c.c_int
+    lib.mvo_fel_set_timestamps.argtypes = [c.c_void_p, c.c_char_p]
+    lib.mvo_fel_set_timestamps.restype = c.c_int
     lib.mvo_fel_set_start.argtypes = [c.c_void_p, c.c_int64]
     lib.mvo_fel_set_start.restype = c.c_int
     for name in ("mvo_fel_cancel", "mvo_fel_destroy"):
@@ -104,13 +108,15 @@ def yuv_output(lib, fixture: Path) -> None:
         assert lib.mvo_fel_set_output(handle, name.encode(), b"diagonal", b"blue") == -1
         assert lib.mvo_fel_set_output(handle, name.encode(), b"topleft", b"random") == -1
         assert lib.mvo_fel_set_output(handle, name.encode(), b"topleft", b"blue") == 0
+        assert lib.mvo_fel_set_crop(handle, 1, 0, 0, 0) == -1
+        assert lib.mvo_fel_set_crop(handle, 0, 8, 2, 8) == 0
         received = bytearray()
         result = lib.mvo_fel_run(handle, WRITE(lambda _o, p, n: received.extend(c.string_at(p, n)) or 0),
                                  PROGRESS(lambda *_: None), None)
         assert result == 0, (name, lib.mvo_fel_error(handle))
         assert lib.mvo_fel_set_output(handle, name.encode(), b"topleft", b"blue") == -1
         lib.mvo_fel_destroy(handle)
-        frame = 256*144*3//2*depth
+        frame = 254*128*3//2*depth
         assert 12*frame < len(received) < 12*frame + 4096, (name, len(received))
 
 

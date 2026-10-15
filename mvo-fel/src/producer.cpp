@@ -252,6 +252,8 @@ struct mvo_fel_context {
     AVBufferPool *pool = nullptr;
     // Format produit : RGB PQ 16 bits par défaut, Y'CbCr 4:2:0 final ou 16 bits sur demande.
     fel_output output_format{FEL_OUT_GBRP16, FEL_DITHER_BLUE, AVCHROMA_LOC_LEFT, 0, 0, 0, 0};
+    // Marges retirées des images Y'CbCr (gauche, haut, droite, bas), paires.
+    std::array<int, 4> crop{};
     int width = 0, height = 0, packet_size = 0;
     std::unique_ptr<RowPool> rows;
 #ifdef MVO_FEL_VULKAN_PROTOTYPE
@@ -270,6 +272,9 @@ struct mvo_fel_context {
     bool pulling = false;
     // Seek : cible en base de temps de la piste, ou nombre d'images ignorées (HEVC brut).
     int64_t start_us = 0, target = AV_NOPTS_VALUE, skip = 0, skipped = 0;
+    // Horodatages relatifs à la première image produite (comme FFmpeg en entrée d'un NUT).
+    bool rebase_first = false;
+    int64_t first_pts = AV_NOPTS_VALUE;
     // Mode pull : décodage anticipé sur un thread, une image rendue par appel.
     std::unique_ptr<Channel<std::unique_ptr<Job>>> prefetched;
     std::thread prefetcher;
@@ -435,7 +440,11 @@ struct mvo_fel_context {
             if (base->width <= 0 || base->height <= 0 || base->width > 8192 || base->height > 8192)
                 throw Failure("Dimensions source invalides");
             const auto timebase = raw ? av_inv_q(fps) : stream->time_base;
-            const auto pts = output_pts(*base);
+            auto pts = output_pts(*base);
+            if (rebase_first) {
+                if (first_pts == AV_NOPTS_VALUE) first_pts = pts;
+                pts -= first_pts;
+            }
             if (last_pts != AV_NOPTS_VALUE && pts <= last_pts)
                 throw Failure("Horodatages de présentation non croissants");
             last_pts = pts;
@@ -478,28 +487,31 @@ struct mvo_fel_context {
         check_cancelled();
         const AVFrame &base = *job.base;
         const bool yuv = output_format.format != FEL_OUT_GBRP16;
+        if (!yuv && (crop[0] | crop[1] | crop[2] | crop[3])) throw Failure("Recadrage réservé aux sorties Y'CbCr");
         if (!width) {
             width = base.width; height = base.height;
             if (yuv && (width % 2 || height % 2)) throw Failure("Dimensions impaires incompatibles avec le 4:2:0");
-            output_format.crop_x = output_format.crop_y = 0;
-            output_format.width = width; output_format.height = height;
-            packet_size = av_image_get_buffer_size(pixel_format(), width, height, 1);
+            output_format.crop_x = crop[0]; output_format.crop_y = crop[1];
+            output_format.width = width - crop[0] - crop[2]; output_format.height = height - crop[1] - crop[3];
+            if (output_format.width <= 0 || output_format.height <= 0) throw Failure("Recadrage plus grand que l'image");
+            packet_size = av_image_get_buffer_size(pixel_format(), output_format.width, output_format.height, 1);
             check(packet_size, "Taille image");
             // Tampons réutilisés : ni allocation ni défauts de page de 49,8 Mo par image UHD.
             pool = av_buffer_pool_init(static_cast<size_t>(packet_size), nullptr);
             if (!pool) throw std::bad_alloc();
             rgb = frame();
-            rgb->format = pixel_format(); rgb->width = width; rgb->height = height;
+            rgb->format = pixel_format(); rgb->width = output_format.width; rgb->height = output_format.height;
         }
         if (base.width != width || base.height != height)
             throw Failure("Changement de dimensions pendant la reconstruction");
-        auto out = std::unique_ptr<Rendered>(new Rendered{packet(), width, height, job.timebase});
+        auto out = std::unique_ptr<Rendered>(new Rendered{packet(), output_format.width, output_format.height,
+                                                          job.timebase});
         out->packet->buf = av_buffer_pool_get(pool);
         if (!out->packet->buf) throw std::bad_alloc();
         out->packet->data = out->packet->buf->data;
         out->packet->size = packet_size;
         check(av_image_fill_arrays(rgb->data, rgb->linesize, out->packet->data,
-            pixel_format(), width, height, 1), "Plans du paquet");
+            pixel_format(), output_format.width, output_format.height, 1), "Plans du paquet");
         {
             Timer pixels(timing[4]);
 #ifdef MVO_FEL_VULKAN_PROTOTYPE
@@ -541,10 +553,11 @@ struct mvo_fel_context {
                     muxiveo::fel::reconstruct_rows(bs, es, job.mapping, *target, index*block,
                                                    std::min(height, (index+1)*block));
                 });
-                if (yuv) rows->run((height/2 + block - 1) / block, [&](int index) {
+                const int chroma_rows = output_format.height/2;
+                if (yuv) rows->run((chroma_rows + block - 1) / block, [&](int index) {
                     check_cancelled();
                     muxiveo::fel::convert_rows(*scratch, *rgb, output_format, index*block,
-                                               std::min(height/2, (index+1)*block));
+                                               std::min(chroma_rows, (index+1)*block));
                 });
             }
         }
@@ -655,9 +668,9 @@ struct mvo_fel_context {
 uint32_t mvo_fel_abi_version() { return MVO_FEL_ABI; }
 const char *mvo_fel_capabilities() {
 #ifdef MVO_FEL_VULKAN_PROTOTYPE
-    return "{\"abi\":1,\"version\":\"" MVO_FEL_VERSION "\",\"transport\":\"nut\",\"pixel_format\":\"gbrp16le\",\"cpu\":true,\"backend\":\"vulkan-prototype\",\"statistics\":1,\"device_selection\":1,\"seek\":1,\"fd_output\":1,\"output_formats\":[\"gbrp16le\",\"yuv420p16le\",\"yuv420p10le\",\"yuv420p\"],\"dithers\":[\"none\",\"ordered\",\"blue\"],\"direct_formats\":[\"p010\"],\"experimental\":true}";
+    return "{\"abi\":1,\"version\":\"" MVO_FEL_VERSION "\",\"transport\":\"nut\",\"pixel_format\":\"gbrp16le\",\"cpu\":true,\"backend\":\"vulkan-prototype\",\"statistics\":1,\"device_selection\":1,\"seek\":1,\"fd_output\":1,\"timestamps\":[\"source\",\"zero\"],\"crop\":1,\"output_formats\":[\"gbrp16le\",\"yuv420p16le\",\"yuv420p10le\",\"yuv420p\"],\"dithers\":[\"none\",\"ordered\",\"blue\"],\"direct_formats\":[\"p010\"],\"experimental\":true}";
 #else
-    return "{\"abi\":1,\"version\":\"" MVO_FEL_VERSION "\",\"transport\":\"nut\",\"pixel_format\":\"gbrp16le\",\"cpu\":true,\"statistics\":1,\"device_selection\":1,\"seek\":1,\"fd_output\":1,\"output_formats\":[\"gbrp16le\",\"yuv420p16le\",\"yuv420p10le\",\"yuv420p\"],\"dithers\":[\"none\",\"ordered\",\"blue\"]}";
+    return "{\"abi\":1,\"version\":\"" MVO_FEL_VERSION "\",\"transport\":\"nut\",\"pixel_format\":\"gbrp16le\",\"cpu\":true,\"statistics\":1,\"device_selection\":1,\"seek\":1,\"fd_output\":1,\"timestamps\":[\"source\",\"zero\"],\"crop\":1,\"output_formats\":[\"gbrp16le\",\"yuv420p16le\",\"yuv420p10le\",\"yuv420p\"],\"dithers\":[\"none\",\"ordered\",\"blue\"]}";
 #endif
 }
 int mvo_fel_classify(const uint8_t *nal, size_t size) {
@@ -722,6 +735,19 @@ int mvo_fel_set_output(mvo_fel_context *p, const char *format, const char *chrom
     const int location = chroma_from_name(chroma), mode = dither_from_name(dither);
     if (value < 0 || location < 0 || mode < 0) return -1;
     p->output_format.format = value; p->output_format.chroma = location; p->output_format.dither = mode;
+    return 0;
+}
+int mvo_fel_set_crop(mvo_fel_context *p, int left, int top, int right, int bottom) {
+    if (!p || p->started || left < 0 || top < 0 || right < 0 || bottom < 0 ||
+        (left | top | right | bottom) & 1 || std::max({left, top, right, bottom}) > 8192) return -1;
+    p->crop = {left, top, right, bottom};
+    return 0;
+}
+int mvo_fel_set_timestamps(mvo_fel_context *p, const char *mode) {
+    if (!p || p->started || !mode) return -1;
+    const std::string value(mode);
+    if (value != "source" && value != "zero") return -1;
+    p->rebase_first = value == "zero";
     return 0;
 }
 int mvo_fel_set_start(mvo_fel_context *p, int64_t start_us) {

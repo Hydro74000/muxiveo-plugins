@@ -19,3 +19,5 @@ _mvo_fel_set_start
 _mvo_fel_run_fd
 _mvo_fel_set_output
 _mvo_fel_vulkan_configure
+_mvo_fel_set_timestamps
+_mvo_fel_set_crop

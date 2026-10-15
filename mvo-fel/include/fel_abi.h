@@ -43,6 +43,14 @@ MVO_FEL_EXPORT int mvo_fel_set_start(mvo_fel_context *, int64_t start_us);
  * gbrp16le (défaut, RGB PQ), ou Y'CbCr BT.2020nc limité 4:2:0 yuv420p16le / yuv420p10le /
  * yuv420p, sous-échantillonné au point chroma (noms FFmpeg : left, topleft...) et quantifié
  * avec le tramage déterministe demandé (none, ordered, blue ; capabilities.dithers). */
+/* Extension additive ABI 1 ; modes listés par capabilities.timestamps. Avant run :
+ * "source" (défaut) garde les PTS de la piste ; "zero" les rend relatifs à la première
+ * image produite, comme FFmpeg le fait à l'entrée d'un NUT (alimentation directe d'un
+ * encodeur sans étage FFmpeg intermédiaire). */
+/* Extension additive ABI 1 ; capabilities.crop. Avant run : marges paires retirées des
+ * images Y'CbCr produites (pas du RGB), la grille chroma restant celle de la source. */
+MVO_FEL_EXPORT int mvo_fel_set_crop(mvo_fel_context *, int left, int top, int right, int bottom);
+MVO_FEL_EXPORT int mvo_fel_set_timestamps(mvo_fel_context *, const char *mode);
 MVO_FEL_EXPORT int mvo_fel_set_output(mvo_fel_context *, const char *pixel_format,
     const char *chroma_location, const char *dither);
 /* Mesures locales après run ; pipe_s est inclus dans nut_s. */
