@@ -39,6 +39,12 @@ MVO_FEL_EXPORT const char *mvo_fel_backend(const mvo_fel_context *);
  * uniquement : première image produite à start_us du début du fichier (sémantique
  * -ss d'entrée de FFmpeg), horodatages de sortie relatifs à ce point. */
 MVO_FEL_EXPORT int mvo_fel_set_start(mvo_fel_context *, int64_t start_us);
+/* Extension additive ABI 1 ; formats listés par capabilities.output_formats. Avant run :
+ * gbrp16le (défaut, RGB PQ), ou Y'CbCr BT.2020nc limité 4:2:0 yuv420p16le / yuv420p10le /
+ * yuv420p, sous-échantillonné au point chroma (noms FFmpeg : left, topleft...) et quantifié
+ * avec le tramage déterministe demandé (none, ordered, blue ; capabilities.dithers). */
+MVO_FEL_EXPORT int mvo_fel_set_output(mvo_fel_context *, const char *pixel_format,
+    const char *chroma_location, const char *dither);
 /* Mesures locales après run ; pipe_s est inclus dans nut_s. */
 MVO_FEL_EXPORT const char *mvo_fel_statistics(mvo_fel_context *);
 MVO_FEL_EXPORT int mvo_fel_run(mvo_fel_context *, mvo_fel_write, mvo_fel_progress, void *);

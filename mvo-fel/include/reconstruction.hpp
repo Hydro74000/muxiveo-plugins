@@ -5,6 +5,7 @@
 #include <array>
 #include <cstdint>
 #include <vector>
+#include "output_format.h"
 extern "C" {
 #include <libavutil/dovi_meta.h>
 #include <libavutil/frame.h>
@@ -61,4 +62,7 @@ void reconstruct_rows(const FrameSampler &bl, const FrameSampler &el, const Mapp
                       AVFrame &rgb, int first_row, int last_row);
 void reconstruct_rows(const AVFrame &bl, const AVFrame &el, const Mapping &mapping,
                       AVFrame &rgb, int first_row, int last_row);
+// RGB PQ 16 bits (gbrp16le) vers Y'CbCr 4:2:0 limité : lignes chroma [first, last) et
+// les deux lignes luma de chacune. Même calcul que le backend GPU, en double.
+void convert_rows(const AVFrame &rgb, AVFrame &yuv, const fel_output &output, int first, int last);
 }

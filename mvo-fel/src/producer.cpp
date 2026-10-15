@@ -2,6 +2,7 @@
 #include "fel_abi.h"
 #include "fel_direct_abi.h"
 #include "reconstruction.hpp"
+#include "output_format.h"
 #include <algorithm>
 #include <atomic>
 #include <array>
@@ -49,6 +50,8 @@ int fel_gpu_render(void *, const AVDOVIMetadata *, const AVFrame *, const AVFram
 int fel_gpu_render_planar(void *, const AVDOVIMetadata *, const AVFrame *, const AVFrame *, AVFrame *);
 void *fel_gpu_import(const void *, int, int);
 int fel_gpu_render_vulkan(void *, const AVDOVIMetadata *, const AVFrame *, const AVFrame *, AVFrame *);
+int fel_gpu_render_yuv(void *, const AVDOVIMetadata *, const AVFrame *, const AVFrame *, const fel_output *, AVFrame *);
+void fel_gpu_configure(void *, const fel_output *);
 #endif
 }
 
@@ -245,8 +248,10 @@ struct mvo_fel_context {
     AVIOContext *io = nullptr;
     AVStream *stream = nullptr, *out_stream = nullptr;
     Layer bl, el;
-    Frame rgb;
+    Frame rgb, scratch;
     AVBufferPool *pool = nullptr;
+    // Format produit : RGB PQ 16 bits par défaut, Y'CbCr 4:2:0 final ou 16 bits sur demande.
+    fel_output output_format{FEL_OUT_GBRP16, FEL_DITHER_BLUE, AVCHROMA_LOC_LEFT, 0, 0, 0, 0};
     int width = 0, height = 0, packet_size = 0;
     std::unique_ptr<RowPool> rows;
 #ifdef MVO_FEL_VULKAN_PROTOTYPE
@@ -360,6 +365,14 @@ struct mvo_fel_context {
         if (raw) return emitted;
         return target == AV_NOPTS_VALUE ? base.pts : base.pts - target;
     }
+    AVPixelFormat pixel_format() const {
+        switch (output_format.format) {
+        case FEL_OUT_YUV420P16: return AV_PIX_FMT_YUV420P16LE;
+        case FEL_OUT_YUV420P10: return AV_PIX_FMT_YUV420P10LE;
+        case FEL_OUT_YUV420P8: return AV_PIX_FMT_YUV420P;
+        default: return AV_PIX_FMT_GBRP16LE;
+        }
+    }
     void open_output(int w, int h) {
         check(avformat_alloc_output_context2(&output, nullptr, "nut", nullptr), "Création NUT");
         auto *buffer = static_cast<uint8_t *>(av_malloc(65536));
@@ -376,20 +389,22 @@ struct mvo_fel_context {
         out_stream->time_base = raw ? av_inv_q(fps) : stream->time_base;
         out_stream->avg_frame_rate = fps;
         auto *p = out_stream->codecpar;
+        const bool yuv = output_format.format != FEL_OUT_GBRP16;
         p->codec_type = AVMEDIA_TYPE_VIDEO;
         p->codec_id = AV_CODEC_ID_RAWVIDEO;
-        p->format = AV_PIX_FMT_GBRP16LE;
-        p->codec_tag = avcodec_pix_fmt_to_codec_tag(AV_PIX_FMT_GBRP16LE);
+        p->format = pixel_format();
+        p->codec_tag = avcodec_pix_fmt_to_codec_tag(pixel_format());
         p->width = w; p->height = h;
-        p->color_range = AVCOL_RANGE_JPEG;
+        p->color_range = yuv ? AVCOL_RANGE_MPEG : AVCOL_RANGE_JPEG;
         p->color_primaries = AVCOL_PRI_BT2020;
         p->color_trc = AVCOL_TRC_SMPTE2084;
-        p->color_space = AVCOL_SPC_RGB;
+        p->color_space = yuv ? AVCOL_SPC_BT2020_NCL : AVCOL_SPC_RGB;
+        if (yuv) p->chroma_location = static_cast<AVChromaLocation>(output_format.chroma);
         // NUT conserve ces tags ; le consommateur pose aussi setparams sur les images.
         av_dict_set(&out_stream->metadata, "color_primaries", "bt2020", 0);
         av_dict_set(&out_stream->metadata, "color_transfer", "smpte2084", 0);
-        av_dict_set(&out_stream->metadata, "color_space", "gbr", 0);
-        av_dict_set(&out_stream->metadata, "color_range", "pc", 0);
+        av_dict_set(&out_stream->metadata, "color_space", yuv ? "bt2020nc" : "gbr", 0);
+        av_dict_set(&out_stream->metadata, "color_range", yuv ? "tv" : "pc", 0);
         check(avformat_write_header(output, nullptr), "En-tête NUT");
     }
     std::string device = "auto", backend = "cpu";
@@ -462,15 +477,19 @@ struct mvo_fel_context {
     std::unique_ptr<Rendered> render(Job &job) {
         check_cancelled();
         const AVFrame &base = *job.base;
+        const bool yuv = output_format.format != FEL_OUT_GBRP16;
         if (!width) {
             width = base.width; height = base.height;
-            packet_size = av_image_get_buffer_size(AV_PIX_FMT_GBRP16LE, width, height, 1);
+            if (yuv && (width % 2 || height % 2)) throw Failure("Dimensions impaires incompatibles avec le 4:2:0");
+            output_format.crop_x = output_format.crop_y = 0;
+            output_format.width = width; output_format.height = height;
+            packet_size = av_image_get_buffer_size(pixel_format(), width, height, 1);
             check(packet_size, "Taille image");
             // Tampons réutilisés : ni allocation ni défauts de page de 49,8 Mo par image UHD.
             pool = av_buffer_pool_init(static_cast<size_t>(packet_size), nullptr);
             if (!pool) throw std::bad_alloc();
             rgb = frame();
-            rgb->format = AV_PIX_FMT_GBRP16LE; rgb->width = width; rgb->height = height;
+            rgb->format = pixel_format(); rgb->width = width; rgb->height = height;
         }
         if (base.width != width || base.height != height)
             throw Failure("Changement de dimensions pendant la reconstruction");
@@ -480,7 +499,7 @@ struct mvo_fel_context {
         out->packet->data = out->packet->buf->data;
         out->packet->size = packet_size;
         check(av_image_fill_arrays(rgb->data, rgb->linesize, out->packet->data,
-            AV_PIX_FMT_GBRP16LE, width, height, 1), "Plans du paquet RGB");
+            pixel_format(), width, height, 1), "Plans du paquet");
         {
             Timer pixels(timing[4]);
 #ifdef MVO_FEL_VULKAN_PROTOTYPE
@@ -495,19 +514,37 @@ struct mvo_fel_context {
                 }
             }
             if (gpu_prototype) {
-                if (!fel_gpu_render_planar(gpu_prototype, job.metadata, job.base.get(), job.enhancement.get(), rgb.get()))
-                    throw Failure("Échec de reconstruction du prototype Vulkan");
+                const bool ok = yuv
+                    ? fel_gpu_render_yuv(gpu_prototype, job.metadata, job.base.get(), job.enhancement.get(),
+                                         &output_format, rgb.get())
+                    : fel_gpu_render_planar(gpu_prototype, job.metadata, job.base.get(), job.enhancement.get(), rgb.get());
+                if (!ok) throw Failure("Échec de reconstruction du prototype Vulkan");
             } else
 #endif
             {
                 if (!rows) rows = std::make_unique<RowPool>(std::max(1, threads - 2*std::max(1, threads/3)));
+                // Y'CbCr : reconstruction RGB 16 bits intermédiaire, puis conversion par lignes chroma.
+                AVFrame *target = rgb.get();
+                if (yuv) {
+                    if (!scratch) {
+                        scratch = frame();
+                        scratch->format = AV_PIX_FMT_GBRP16LE; scratch->width = width; scratch->height = height;
+                        check(av_frame_get_buffer(scratch.get(), 0), "Image RGB intermédiaire");
+                    }
+                    target = scratch.get();
+                }
                 const muxiveo::fel::FrameSampler bs(base, width, height, false);
                 const muxiveo::fel::FrameSampler es(*job.enhancement, width, height, true);
                 constexpr int block = 8;
                 rows->run((height + block - 1) / block, [&](int index) {
                     check_cancelled();
-                    muxiveo::fel::reconstruct_rows(bs, es, job.mapping, *rgb, index*block,
+                    muxiveo::fel::reconstruct_rows(bs, es, job.mapping, *target, index*block,
                                                    std::min(height, (index+1)*block));
+                });
+                if (yuv) rows->run((height/2 + block - 1) / block, [&](int index) {
+                    check_cancelled();
+                    muxiveo::fel::convert_rows(*scratch, *rgb, output_format, index*block,
+                                               std::min(height/2, (index+1)*block));
                 });
             }
         }
@@ -618,9 +655,9 @@ struct mvo_fel_context {
 uint32_t mvo_fel_abi_version() { return MVO_FEL_ABI; }
 const char *mvo_fel_capabilities() {
 #ifdef MVO_FEL_VULKAN_PROTOTYPE
-    return "{\"abi\":1,\"version\":\"" MVO_FEL_VERSION "\",\"transport\":\"nut\",\"pixel_format\":\"gbrp16le\",\"cpu\":true,\"backend\":\"vulkan-prototype\",\"statistics\":1,\"device_selection\":1,\"seek\":1,\"fd_output\":1,\"experimental\":true}";
+    return "{\"abi\":1,\"version\":\"" MVO_FEL_VERSION "\",\"transport\":\"nut\",\"pixel_format\":\"gbrp16le\",\"cpu\":true,\"backend\":\"vulkan-prototype\",\"statistics\":1,\"device_selection\":1,\"seek\":1,\"fd_output\":1,\"output_formats\":[\"gbrp16le\",\"yuv420p16le\",\"yuv420p10le\",\"yuv420p\"],\"dithers\":[\"none\",\"ordered\",\"blue\"],\"direct_formats\":[\"p010\"],\"experimental\":true}";
 #else
-    return "{\"abi\":1,\"version\":\"" MVO_FEL_VERSION "\",\"transport\":\"nut\",\"pixel_format\":\"gbrp16le\",\"cpu\":true,\"statistics\":1,\"device_selection\":1,\"seek\":1,\"fd_output\":1}";
+    return "{\"abi\":1,\"version\":\"" MVO_FEL_VERSION "\",\"transport\":\"nut\",\"pixel_format\":\"gbrp16le\",\"cpu\":true,\"statistics\":1,\"device_selection\":1,\"seek\":1,\"fd_output\":1,\"output_formats\":[\"gbrp16le\",\"yuv420p16le\",\"yuv420p10le\",\"yuv420p\"],\"dithers\":[\"none\",\"ordered\",\"blue\"]}";
 #endif
 }
 int mvo_fel_classify(const uint8_t *nal, size_t size) {
@@ -666,6 +703,27 @@ int mvo_fel_set_device(mvo_fel_context *p, const char *device) {
     return 0;
 }
 const char *mvo_fel_backend(const mvo_fel_context *p) { return p ? p->backend.c_str() : ""; }
+namespace {
+int chroma_from_name(const char *name) {
+    const int value = name ? av_chroma_location_from_name(name) : -1;
+    return value >= AVCHROMA_LOC_LEFT && value <= AVCHROMA_LOC_BOTTOM ? value : -1;
+}
+int dither_from_name(const char *name) {
+    const std::string value(name ? name : "");
+    return value == "none" ? FEL_DITHER_NONE : value == "ordered" ? FEL_DITHER_ORDERED
+         : value == "blue" ? FEL_DITHER_BLUE : -1;
+}
+}
+int mvo_fel_set_output(mvo_fel_context *p, const char *format, const char *chroma, const char *dither) {
+    if (!p || p->started || !format) return -1;
+    const std::string name(format);
+    const int value = name == "gbrp16le" ? FEL_OUT_GBRP16 : name == "yuv420p16le" ? FEL_OUT_YUV420P16
+                    : name == "yuv420p10le" ? FEL_OUT_YUV420P10 : name == "yuv420p" ? FEL_OUT_YUV420P8 : -1;
+    const int location = chroma_from_name(chroma), mode = dither_from_name(dither);
+    if (value < 0 || location < 0 || mode < 0) return -1;
+    p->output_format.format = value; p->output_format.chroma = location; p->output_format.dither = mode;
+    return 0;
+}
 int mvo_fel_set_start(mvo_fel_context *p, int64_t start_us) {
     if (!p || p->started || start_us < 0) return -1;
     p->start_us = start_us;
@@ -762,6 +820,20 @@ int mvo_fel_vulkan_render(void *gpu,const void *md,const void *bl,const void *el
     return fel_gpu_render_vulkan(gpu,static_cast<const AVDOVIMetadata*>(md),
         static_cast<const AVFrame*>(bl),static_cast<const AVFrame*>(el),static_cast<AVFrame*>(output)) ? 0 : -1;
 #else
+    return -1;
+#endif
+}
+int mvo_fel_vulkan_configure(void *gpu, const char *chroma, const char *dither, int crop_x, int crop_y,
+                             int width, int height) {
+#ifdef MVO_FEL_VULKAN_PROTOTYPE
+    const int location = chroma_from_name(chroma), mode = dither_from_name(dither);
+    if (!gpu || location < 0 || mode < 0 || crop_x < 0 || crop_y < 0 || width <= 0 || height <= 0 ||
+        (crop_x | crop_y | width | height) & 1) return -1;
+    const fel_output output{FEL_OUT_P010, mode, location, crop_x, crop_y, width, height};
+    fel_gpu_configure(gpu, &output);
+    return 0;
+#else
+    (void)gpu; (void)chroma; (void)dither; (void)crop_x; (void)crop_y; (void)width; (void)height;
     return -1;
 #endif
 }

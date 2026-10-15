@@ -8,6 +8,7 @@
 #include <libplacebo/utils/libav.h>
 #include <libavutil/hwcontext_vulkan.h>
 #include <stdio.h>
+#include "output_format.h"
 #include <math.h>
 #include <string.h>
 #include <inttypes.h>
@@ -23,6 +24,9 @@ struct fel_gpu {
     pl_tex axes[3][6];
     int axis_w[3], axis_h[3], axis_loc[3];
     int width, height;
+    pl_tex dither;
+    int dither_mode;
+    struct fel_output output;   /* sortie Vulkan directe (fel_gpu_configure) */
 };
 
 int fel_gpu_device_name(void *context, char *buffer, size_t capacity)
@@ -51,6 +55,7 @@ void fel_gpu_destroy(void *context)
         for (int i = 0; i < 12; ++i) pl_shader_obj_destroy(&p->lut[i]);
         pl_tex_destroy(p->vk->gpu, &p->target);
         for (int c=0;c<3;++c) pl_tex_destroy(p->vk->gpu, &p->planar[c]);
+        pl_tex_destroy(p->vk->gpu, &p->dither);
     }
     pl_dispatch_destroy(&p->dispatch);
     pl_vulkan_destroy(&p->vk);
@@ -318,6 +323,120 @@ int fel_gpu_render_planar(void *context, const AVDOVIMetadata *metadata,
     return ok;
 }
 
+/* Seuils de tramage identiques au CPU (fel_dither_threshold), en texture 64×64. */
+static int prepare_dither(struct fel_gpu *p, int mode)
+{
+    if (p->dither && p->dither_mode == mode) return 1;
+    pl_fmt fmt = pl_find_fmt(p->vk->gpu, PL_FMT_FLOAT, 1, 32, 32, PL_FMT_CAP_SAMPLEABLE);
+    float data[64*64];
+    if (!fmt) return 0;
+    for (int y = 0; y < 64; ++y)
+        for (int x = 0; x < 64; ++x) data[y*64+x] = (float)fel_dither_threshold(mode, x, y);
+    if (!pl_tex_recreate(p->vk->gpu, &p->dither, pl_tex_params(.w = 64, .h = 64, .format = fmt,
+            .sampleable = true, .host_writable = true)) ||
+        !pl_tex_upload(p->vk->gpu, pl_tex_transfer_params(.tex = p->dither, .ptr = data))) return 0;
+    p->dither_mode = mode;
+    return 1;
+}
+
+static int dispatch(struct fel_gpu *p, pl_tex target, const char *body, int w, int h)
+{
+    const struct pl_shader_desc descriptors[2] = {
+        {.desc = {.name = "fel_rgb", .type = PL_DESC_SAMPLED_TEX}, .binding = {.object = p->target}},
+        {.desc = {.name = "fel_threshold", .type = PL_DESC_SAMPLED_TEX}, .binding = {.object = p->dither}},
+    };
+    pl_shader sh = pl_dispatch_begin(p->dispatch);
+    int ok = pl_shader_custom(sh, &(struct pl_custom_shader){.body = body, .input = PL_SHADER_SIG_NONE,
+        .output = PL_SHADER_SIG_COLOR, .descriptors = descriptors, .num_descriptors = 2,
+        .output_w = w, .output_h = h});
+    ok = ok && pl_dispatch_finish(p->dispatch, pl_dispatch_params(.shader = &sh, .target = target));
+    pl_dispatch_abort(p->dispatch, &sh);
+    return ok;
+}
+
+/* Y'CbCr BT.2020nc limité, 4:2:0 bilinéaire au point chroma, quantification tramée :
+ * mêmes formules que convert_rows (CPU). Entiers écrits avec +0,25 : exacts que le
+ * pilote arrondisse au plus proche ou vers zéro. v = NULL : chroma entrelacée (P010). */
+static int convert(struct fel_gpu *p, const struct fel_output *o, pl_tex y, pl_tex u, pl_tex v)
+{
+    /* Constantes en expressions entières : snprintf("%g") suit LC_NUMERIC (virgule
+     * décimale sous une locale française) et casserait le GLSL. */
+    const int depth = fel_output_depth(o->format);
+    const int scale = 1 << (depth - 8), maximum = (1 << depth) - 1;
+    const int numerator = o->format == FEL_OUT_P010 ? 64 : 1, denominator = depth == 8 ? 255 : 65535;
+    double ox, oy;
+    int wx[4], wy[4], fx, fy;
+    char body[4096];
+    if (!depth || !prepare_dither(p, o->dither)) return 0;
+    fel_chroma_offset(o->chroma, &ox, &oy);
+    fx = ox >= 1 ? 0 : -1; fy = oy >= 1 ? 0 : -1;
+    /* Poids bilinéaires en seizièmes exacts (0, 2, 4, 6 ou 8). */
+    for (int k = 0; k < 4; ++k) {
+        wx[k] = (int)lround(16 * fmax(0.0, 1 - fabs(fx + k - ox) / 2) / 2);
+        wy[k] = (int)lround(16 * fmax(0.0, 1 - fabs(fy + k - oy) / 2) / 2);
+    }
+    snprintf(body, sizeof(body),
+        "const float U = %d.0/%d.0, B = 0.25/%d.0;"
+        "ivec2 xy = ivec2(gl_FragCoord.xy);"
+        "vec3 c = texelFetch(fel_rgb, xy + ivec2(%d, %d), 0).rgb;"
+        "float l = dot(c, vec3(0.2627, 0.678, 0.0593));"
+        "float k = clamp(floor((219.0*l + 16.0)*%d.0 + texelFetch(fel_threshold, xy & 63, 0).r), 0.0, %d.0);"
+        "color = vec4(k*U + B, 0.0, 0.0, 1.0);",
+        numerator, denominator, denominator, o->crop_x, o->crop_y, scale, maximum);
+    if (!dispatch(p, y, body, o->width, o->height)) return 0;
+    for (int plane = 0; plane < (v ? 2 : 1); ++plane) {
+        const char *store = !v ? "color = vec4(qb*U + B, qr*U + B, 0.0, 1.0);"
+                          : plane == 0 ? "color = vec4(qb*U + B, 0.0, 0.0, 1.0);" : "color = vec4(qr*U + B, 0.0, 0.0, 1.0);";
+        snprintf(body, sizeof(body),
+            "const float U = %d.0/%d.0, B = 0.25/%d.0;"
+            "const float WX[4] = float[4](%d.0/16.0, %d.0/16.0, %d.0/16.0, %d.0/16.0);"
+            "const float WY[4] = float[4](%d.0/16.0, %d.0/16.0, %d.0/16.0, %d.0/16.0);"
+            "ivec2 ij = ivec2(gl_FragCoord.xy);"
+            "vec3 s = vec3(0.0);"
+            "for (int b = 0; b < 4; b++) for (int a = 0; a < 4; a++) {"
+            "  float w = WX[a]*WY[b]; if (w == 0.0) continue;"
+            "  ivec2 q = clamp(ivec2(%d + 2*ij.x + %d + a, %d + 2*ij.y + %d + b), ivec2(0), ivec2(%d, %d));"
+            "  s += w*texelFetch(fel_rgb, q, 0).rgb; }"
+            "float l = dot(s, vec3(0.2627, 0.678, 0.0593));"
+            "float qb = clamp(floor((224.0*((s.b - l)/1.8814) + 128.0)*%d.0 + texelFetch(fel_threshold, (ij + ivec2(21, 11)) & 63, 0).r), 0.0, %d.0);"
+            "float qr = clamp(floor((224.0*((s.r - l)/1.4746) + 128.0)*%d.0 + texelFetch(fel_threshold, (ij + ivec2(43, 37)) & 63, 0).r), 0.0, %d.0);"
+            "%s",
+            numerator, denominator, denominator, wx[0], wx[1], wx[2], wx[3], wy[0], wy[1], wy[2], wy[3],
+            o->crop_x, fx, o->crop_y, fy, p->width - 1, p->height - 1,
+            scale, maximum, scale, maximum, store);
+        if (!dispatch(p, plane == 0 ? u : v, body, o->width / 2, o->height / 2)) return 0;
+    }
+    return 1;
+}
+
+/* Sortie NUT Y'CbCr planaire : reconstruction, conversion et rapatriement des plans. */
+int fel_gpu_render_yuv(void *context, const AVDOVIMetadata *metadata, const AVFrame *bl,
+                       const AVFrame *el, const struct fel_output *o, AVFrame *output)
+{
+    struct fel_gpu *p = context;
+    const int depth = fel_output_depth(o->format);
+    pl_fmt fmt = pl_find_fmt(p->vk->gpu, PL_FMT_UNORM, 1, depth == 8 ? 8 : 16, depth == 8 ? 8 : 16,
+                             PL_FMT_CAP_RENDERABLE | PL_FMT_CAP_HOST_READABLE);
+    int ok = fmt && depth && o->format != FEL_OUT_P010 && render_target(p, metadata, bl, el);
+    for (int c = 0; c < 3 && ok; ++c)
+        ok = pl_tex_recreate(p->vk->gpu, &p->planar[c], pl_tex_params(.w = c ? o->width/2 : o->width,
+            .h = c ? o->height/2 : o->height, .format = fmt, .renderable = true, .host_readable = true));
+    ok = ok && convert(p, o, p->planar[0], p->planar[1], p->planar[2]);
+    for (int c = 0; c < 3 && ok; ++c)
+        ok = pl_tex_download(p->vk->gpu, pl_tex_transfer_params(.tex = p->planar[c],
+            .ptr = output->data[c], .row_pitch = output->linesize[c],
+            .callback = p->vk->gpu->limits.callbacks ? downloaded : NULL));
+    /* Les tampons appartiennent au paquet ; même une erreur attend les DMA lancés. */
+    pl_gpu_finish(p->vk->gpu);
+    return ok;
+}
+
+void fel_gpu_configure(void *context, const struct fel_output *o)
+{
+    struct fel_gpu *p = context;
+    p->output = *o;
+}
+
 size_t fel_gpu_devices(char *buffer, size_t capacity)
 {
     PFN_vkGetInstanceProcAddr proc=fel_vk_get_proc_addr();
@@ -424,13 +543,23 @@ int fel_gpu_render_vulkan(void *context,const AVDOVIMetadata *metadata,
                           const AVFrame *bl,const AVFrame *el,AVFrame *output)
 {
     struct fel_gpu *p=context;
-    if(output->format!=AV_PIX_FMT_VULKAN || output->width!=p->width || output->height!=p->height ||
-       bl->width!=p->width || bl->height!=p->height || !output->hw_frames_ctx)return 0;
+    if(output->format!=AV_PIX_FMT_VULKAN || bl->width!=p->width || bl->height!=p->height || !output->hw_frames_ctx)return 0;
     const AVHWFramesContext *frames=(const AVHWFramesContext*)output->hw_frames_ctx->data;
-    if(frames->sw_format!=AV_PIX_FMT_GBRP16LE)return 0;
+    const int p010=frames->sw_format==AV_PIX_FMT_P010;
+    if(frames->sw_format!=AV_PIX_FMT_GBRP16LE && !p010)return 0;
     if(!render_target(p,metadata,bl,el))return 0;
     struct pl_frame target={0};
     if(!pl_map_avframe_ex(p->vk->gpu,&target,&(struct pl_avframe_params){.frame=output}))return 0;
+    if(p010) {
+        /* Image finale tramée par le plugin : ni filtre libplacebo ni second tramage. */
+        int ok=target.num_planes==2 && p->output.format==FEL_OUT_P010 &&
+               (!target.acquire || target.acquire(p->vk->gpu,&target));
+        ok=ok && convert(p,&p->output,target.planes[0].texture,target.planes[1].texture,NULL);
+        if(target.release)target.release(p->vk->gpu,&target);
+        pl_gpu_flush(p->vk->gpu);
+        pl_unmap_avframe(p->vk->gpu,&target);
+        return ok;
+    }
     int ok=target.num_planes==3 && (!target.acquire || target.acquire(p->vk->gpu,&target));
     struct pl_shader_desc source={.desc={.name="rgb",.type=PL_DESC_SAMPLED_TEX},.binding={.object=p->target}};
     const char *body[]={"color=vec4(texelFetch(rgb,ivec2(gl_FragCoord.xy),0).g,0.0,0.0,1.0);",

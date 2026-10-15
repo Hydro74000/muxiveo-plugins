@@ -24,6 +24,8 @@ def load(path: Path):
     lib.mvo_fel_error.restype = c.c_char_p
     lib.mvo_fel_run_fd.argtypes = [c.c_void_p, c.c_ssize_t, PROGRESS, c.c_void_p]
     lib.mvo_fel_run_fd.restype = c.c_int
+    lib.mvo_fel_set_output.argtypes = [c.c_void_p, c.c_char_p, c.c_char_p, c.c_char_p]
+    lib.mvo_fel_set_output.restype = c.c_int
     lib.mvo_fel_set_start.argtypes = [c.c_void_p, c.c_int64]
     lib.mvo_fel_set_start.restype = c.c_int
     for name in ("mvo_fel_cancel", "mvo_fel_destroy"):
@@ -86,7 +88,30 @@ def smoke(library: Path, fixture: Path, output: Path | None = None, device: str 
             if sink:
                 sink.close()
     fd_output(lib, fixture)
-    print("ABI, NUT, 12 images/B-frames, seek, descripteur, fermeture aval, annulation, piste invalide et erreur de lecture : OK")
+    yuv_output(lib, fixture)
+    print("ABI, NUT, 12 images/B-frames, seek, descripteur, Y'CbCr, fermeture aval, annulation, piste invalide et erreur de lecture : OK")
+
+
+def yuv_output(lib, fixture: Path) -> None:
+    """Sorties Y'CbCr 4:2:0 : taille des images, refus des valeurs inconnues ou tardives."""
+    lib.mvo_fel_set_device.argtypes = [c.c_void_p, c.c_char_p]
+    lib.mvo_fel_set_device.restype = c.c_int
+    for (name, depth), device in ((formats, engine) for formats in (("yuv420p16le", 2), ("yuv420p10le", 2), ("yuv420p", 1))
+                                  for engine in (b"cpu", b"auto")):
+        handle = lib.mvo_fel_create(str(fixture.resolve()).encode(), 0, 2, 24000, 1001)
+        assert lib.mvo_fel_set_device(handle, device) == 0
+        assert lib.mvo_fel_set_output(handle, b"rgb48", b"topleft", b"blue") == -1
+        assert lib.mvo_fel_set_output(handle, name.encode(), b"diagonal", b"blue") == -1
+        assert lib.mvo_fel_set_output(handle, name.encode(), b"topleft", b"random") == -1
+        assert lib.mvo_fel_set_output(handle, name.encode(), b"topleft", b"blue") == 0
+        received = bytearray()
+        result = lib.mvo_fel_run(handle, WRITE(lambda _o, p, n: received.extend(c.string_at(p, n)) or 0),
+                                 PROGRESS(lambda *_: None), None)
+        assert result == 0, (name, lib.mvo_fel_error(handle))
+        assert lib.mvo_fel_set_output(handle, name.encode(), b"topleft", b"blue") == -1
+        lib.mvo_fel_destroy(handle)
+        frame = 256*144*3//2*depth
+        assert 12*frame < len(received) < 12*frame + 4096, (name, len(received))
 
 
 def fd_output(lib, fixture: Path) -> None:

@@ -2,6 +2,7 @@
 // Adaptation CPU : libplacebo, colorspace.c, shaders/colorspace.c, filters.c
 // et utils/libav_internal.h. Révision et attributions dans NOTICES.md.
 #include "reconstruction.hpp"
+#include "blue_noise.h"
 #include <algorithm>
 #include <cmath>
 #include <limits>
@@ -291,5 +292,79 @@ void reconstruct_rows(const AVFrame &bl, const AVFrame &el, const Mapping &mappi
                       AVFrame &rgb, int first_row, int last_row) {
     reconstruct_rows(FrameSampler(bl, bl.width, bl.height, false),
                      FrameSampler(el, bl.width, bl.height, true), mapping, rgb, first_row, last_row);
+}
+namespace {
+constexpr double kr = 0.2627, kb = 0.0593, kg = 1 - kr - kb;
+double code(const AVFrame &rgb, int plane, int x, int y) {
+    const auto *p = rgb.data[plane] + y*rgb.linesize[plane] + 2*x;
+    return (p[0] | (p[1] << 8)) / 65535.0;
+}
+// gbrp16le : plan 0 = G, 1 = B, 2 = R.
+Vec rgb_at(const AVFrame &rgb, int x, int y) {
+    x = std::clamp(x, 0, rgb.width-1); y = std::clamp(y, 0, rgb.height-1);
+    return {code(rgb, 2, x, y), code(rgb, 0, x, y), code(rgb, 1, x, y)};
+}
+void store(AVFrame &yuv, int plane, int x, int y, unsigned value, int depth) {
+    auto *p = yuv.data[plane] + y*yuv.linesize[plane];
+    if (depth == 8) { p[x] = static_cast<uint8_t>(value); return; }
+    p[2*x] = value & 255; p[2*x+1] = static_cast<uint8_t>(value >> 8);
+}
+unsigned quantize(double value, double threshold, int depth) {
+    const double maximum = (1u << depth) - 1;
+    return static_cast<unsigned>(std::clamp(std::floor(value + threshold), 0.0, maximum));
+}
+// Poids bilinéaires (triangle étiré ×2) autour du centre 2i+offset.
+void taps(double offset, std::array<double, 4> &weights, int &first) {
+    first = offset >= 1 ? 0 : -1;
+    for (int k = 0; k < 4; ++k) {
+        const double d = std::abs(first + k - offset);
+        weights[k] = std::max(0.0, 1 - d/2) / 2;
+    }
+}
+}
+}
+
+extern "C" double fel_dither_threshold(int dither, int x, int y) {
+    static const uint8_t bayer[8][8] = {
+        {0,32,8,40,2,34,10,42},{48,16,56,24,50,18,58,26},{12,44,4,36,14,46,6,38},{60,28,52,20,62,30,54,22},
+        {3,35,11,43,1,33,9,41},{51,19,59,27,49,17,57,25},{15,47,7,39,13,45,5,37},{63,31,55,23,61,29,53,21}};
+    if (dither == FEL_DITHER_ORDERED) return (bayer[y & 7][x & 7] + 0.5) / 64;
+    if (dither == FEL_DITHER_BLUE) return (fel_blue_noise[(y & 63)*64 + (x & 63)] + 0.5) / 4096;
+    return 0.5;
+}
+
+namespace muxiveo::fel {
+void convert_rows(const AVFrame &rgb, AVFrame &yuv, const fel_output &output, int first, int last) {
+    const int depth = fel_output_depth(output.format);
+    const double scale = std::ldexp(1.0, depth - 8);
+    double ox, oy;
+    fel_chroma_offset(output.chroma, &ox, &oy);
+    std::array<double, 4> wx{}, wy{};
+    int fx, fy;
+    taps(ox, wx, fx); taps(oy, wy, fy);
+    for (int j = first; j < last; ++j) {
+        for (int dy = 0; dy < 2; ++dy) {
+            const int y = 2*j + dy;
+            for (int x = 0; x < output.width; ++x) {
+                const Vec c = rgb_at(rgb, output.crop_x + x, output.crop_y + y);
+                const double luma = kr*c[0] + kg*c[1] + kb*c[2];
+                store(yuv, 0, x, y, quantize((219*luma + 16)*scale,
+                      fel_dither_threshold(output.dither, x, y), depth), depth);
+            }
+        }
+        for (int i = 0; i < output.width/2; ++i) {
+            Vec sum{};
+            for (int b = 0; b < 4; ++b) for (int a = 0; a < 4; ++a) {
+                const double w = wx[a]*wy[b];
+                if (w == 0) continue;
+                const Vec c = rgb_at(rgb, output.crop_x + 2*i + fx + a, output.crop_y + 2*j + fy + b);
+                for (int k = 0; k < 3; ++k) sum[k] += w*c[k];
+            }
+            const double luma = kr*sum[0] + kg*sum[1] + kb*sum[2];
+            const double cb = (sum[2] - luma) / (2*(1 - kb)), cr = (sum[0] - luma) / (2*(1 - kr));
+            store(yuv, 1, i, j, quantize((224*cb + 128)*scale, fel_dither_threshold(output.dither, i+21, j+11), depth), depth);
+            store(yuv, 2, i, j, quantize((224*cr + 128)*scale, fel_dither_threshold(output.dither, i+43, j+37), depth), depth);
+        }
+    }
 }
 }

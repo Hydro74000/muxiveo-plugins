@@ -16,6 +16,10 @@ MVO_FEL_EXPORT int mvo_fel_next_layers(mvo_fel_context *, mvo_fel_layers, void *
 MVO_FEL_EXPORT void *mvo_fel_vulkan_create(const void *device, int width, int height);
 MVO_FEL_EXPORT int mvo_fel_vulkan_render(void *, const void *metadata,
     const void *bl, const void *el, void *output_frame);
+/* Sortie P010 finale (capabilities.direct_formats) : zone [crop, crop+taille) paire,
+ * position chroma et tramage comme mvo_fel_set_output. Avant le premier rendu. */
+MVO_FEL_EXPORT int mvo_fel_vulkan_configure(void *, const char *chroma_location, const char *dither,
+    int crop_x, int crop_y, int width, int height);
 MVO_FEL_EXPORT void mvo_fel_vulkan_destroy(void *);
 #ifdef __cplusplus
 }
