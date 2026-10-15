@@ -124,7 +124,8 @@ def main() -> None:
     # macOS : aucune attestation sur contenu réel possible (runners de CI uniquement).
     if capabilities.get("experimental") and args.platform not in {"linux-x86_64", "windows-x86_64"}:
         raise RuntimeError("Le GPU empaqueté exige une attestation sur contenu réel (Linux, Windows)")
-    if capabilities.get("experimental") and args.platform == "windows-x86_64":
+    # DLL autonome (CPU comme GPU, liées en -static) : imports PE système uniquement.
+    if args.platform == "windows-x86_64":
         check_windows_imports(library)
     if args.direct_ffmpeg:
         if not capabilities.get("experimental") or args.platform != "linux-x86_64" or not args.validation:
@@ -142,7 +143,8 @@ def main() -> None:
     shutil.copy2(ROOT / "dependencies.json", destination)
     if capabilities.get("experimental"):
         shutil.copy2(args.validation, destination / "gpu-validation.json")
-        # Refuser toute dépendance dynamique non système dans le prototype autonome.
+    if capabilities.get("experimental") and args.platform == "linux-x86_64":
+        # Refuser toute dépendance dynamique non système dans le prototype autonome (ELF ; PE contrôlé plus haut).
         allowed = {"libc.so.6", "libm.so.6", "libgcc_s.so.1", "libdl.so.2", "libpthread.so.0", "ld-linux-x86-64.so.2"}
         for executable in (library, *([args.direct_ffmpeg] if args.direct_ffmpeg else [])):
             result = subprocess.run(["readelf", "-d", str(executable)], capture_output=True, text=True, check=True)

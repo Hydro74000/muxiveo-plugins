@@ -3,6 +3,7 @@ import importlib.util
 import json
 import tempfile
 import unittest
+import zipfile
 from pathlib import Path
 from unittest.mock import Mock, patch
 
@@ -102,6 +103,58 @@ class PackageValidationTests(unittest.TestCase):
             with patch.object(package.subprocess, "run", return_value=Mock(stdout=imports + "DLL Name: " + foreign)):
                 with self.assertRaisesRegex(RuntimeError, "non embarquées"):
                     package.check_windows_imports(self.library)
+
+
+class WindowsPackageTests(unittest.TestCase):
+    """Parcours complet de main() pour une DLL GPU Windows attestée, sur une racine factice."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        work = Path(self.temp.name)
+        self.root = work / "mvo-fel"
+        (self.root / "LICENSES").mkdir(parents=True)
+        (self.root / "LICENSES/MIT.txt").write_text("MIT")
+        (self.root / "CMakeLists.txt").write_text("project(mvo-fel VERSION 9.8.7 LANGUAGES C CXX)")
+        (self.root / "NOTICES.md").write_text("avis")
+        (self.root / "dependencies.json").write_text("{}")
+        self.build = work / "build"
+        (self.build / "plugin").mkdir(parents=True)
+        (self.build / "sources").mkdir()
+        (self.build / "ffmpeg").mkdir()
+        (self.build / "ffmpeg/config.h").write_text("/* config */")
+        (self.build / "plugin/mvo_fel.dll").write_bytes(b"MZ dll de test")
+        self.validation = work / "validation.json"
+        self.validation.write_text("{}")
+        self.output = work / "dist"
+        self.calls = []
+
+    def run_main(self, imports):
+        def run(command, **kwargs):
+            self.calls.append(command[0])
+            if command[0] == "readelf":
+                raise AssertionError("readelf appelé sur une DLL PE")
+            return Mock(stdout=imports)
+        argv = ["package.py", "windows-x86_64", str(self.build), str(self.output), "--validation", str(self.validation)]
+        with patch.object(package, "ROOT", self.root), patch.object(package.sys, "argv", argv), \
+                patch.object(package, "load_capabilities", return_value={"experimental": True}), \
+                patch.object(package.subprocess, "run", side_effect=run):
+            package.main()
+
+    def test_gpu_dll_is_packaged_without_elf_checks(self):
+        self.run_main("DLL Name: KERNEL32.dll\nDLL Name: bcrypt.dll\n")
+        self.assertEqual(self.calls[0], "objdump")
+        self.assertNotIn("readelf", self.calls)
+        name = "mvo-fel-9.8.7-windows-x86_64-prototype"
+        with zipfile.ZipFile(self.output / f"{name}.zip") as archive:
+            files = set(archive.namelist())
+        for expected in ("mvo_fel.dll", "gpu-validation.json", "manifest.json", "sources.tar.gz"):
+            self.assertIn(f"{name}/{expected}", files)
+
+    def test_foreign_dll_import_stops_packaging(self):
+        with self.assertRaisesRegex(RuntimeError, "non embarquées"):
+            self.run_main("DLL Name: KERNEL32.dll\nDLL Name: vulkan-1.dll\n")
+        self.assertFalse(self.output.exists())
 
 
 if __name__ == "__main__":
