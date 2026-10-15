@@ -22,6 +22,8 @@ def load(path: Path):
     lib.mvo_fel_run.restype = c.c_int
     lib.mvo_fel_error.argtypes = [c.c_void_p]
     lib.mvo_fel_error.restype = c.c_char_p
+    lib.mvo_fel_set_start.argtypes = [c.c_void_p, c.c_int64]
+    lib.mvo_fel_set_start.restype = c.c_int
     for name in ("mvo_fel_cancel", "mvo_fel_destroy"):
         getattr(lib, name).argtypes = [c.c_void_p]
         getattr(lib, name).restype = None
@@ -30,11 +32,17 @@ def load(path: Path):
 
 def smoke(library: Path, fixture: Path, output: Path | None = None, device: str = "auto") -> None:
     lib = load(library)
-    for mode, expected in (("normal", 0), ("closed", 2), ("cancel", 3), ("bad_stream", 1), ("missing_source", 4)):
+    assert json.loads(lib.mvo_fel_capabilities()).get("seek") == 1
+    for mode, expected in (("normal", 0), ("seek", 0), ("closed", 2), ("cancel", 3), ("bad_stream", 1),
+                           ("missing_source", 4)):
         path = fixture.with_name("missing-source.hevc") if mode == "missing_source" else fixture
         handle = lib.mvo_fel_create(str(path.resolve()).encode(), 999 if mode == "bad_stream" else 0,
                                     2, 24000, 1001)
         assert handle
+        if mode == "seek":
+            # Cinq images à 24000/1001 : la sixième est la première produite.
+            assert lib.mvo_fel_set_start(handle, 5*1001*1000000//24000) == 0
+            assert lib.mvo_fel_set_start(handle, -1) == -1
         if device != "auto":
             lib.mvo_fel_set_device.argtypes = [c.c_void_p, c.c_char_p]
             lib.mvo_fel_set_device.restype = c.c_int
@@ -64,6 +72,9 @@ def smoke(library: Path, fixture: Path, output: Path | None = None, device: str 
         try:
             result = lib.mvo_fel_run(handle, WRITE(write), PROGRESS(progress), None)
             assert result == expected, (mode, result, lib.mvo_fel_error(handle))
+            if mode == "seek":
+                assert frames == 7, frames
+                assert lib.mvo_fel_set_start(handle, 0) == -1
             if mode == "normal":
                 assert frames == 12, frames
                 assert header.startswith(b"nut/multimedia container\x00"), header
@@ -72,7 +83,7 @@ def smoke(library: Path, fixture: Path, output: Path | None = None, device: str 
             lib.mvo_fel_destroy(handle)
             if sink:
                 sink.close()
-    print("ABI, NUT, 12 images/B-frames, fermeture aval, annulation, piste invalide et erreur de lecture : OK")
+    print("ABI, NUT, 12 images/B-frames, seek, fermeture aval, annulation, piste invalide et erreur de lecture : OK")
 
 
 if __name__ == "__main__":

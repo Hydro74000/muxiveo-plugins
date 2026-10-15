@@ -144,6 +144,8 @@ struct mvo_fel_context {
     std::string statistics;
     mvo_fel_layers layers = nullptr;
     bool pulling = false, drained = false;
+    // Seek : cible en base de temps de la piste, ou nombre d'images ignorées (HEVC brut).
+    int64_t start_us = 0, target = AV_NOPTS_VALUE, skip = 0, skipped = 0;
 
     mvo_fel_context(const char *path, int index, int count, AVRational rate)
         : source(path), stream_index(index), threads(std::clamp(count, 1, 16)), fps(rate) {}
@@ -174,9 +176,12 @@ struct mvo_fel_context {
         if (!input) throw std::bad_alloc();
         input->interrupt_callback = {interrupt, this};
         check(avformat_open_input(&input, source.c_str(), nullptr, nullptr), "Ouverture source", MVO_FEL_INPUT_ERROR);
-        check(avformat_find_stream_info(input, nullptr), "Inspection source", MVO_FEL_INPUT_ERROR);
         if (stream_index < 0 || static_cast<unsigned>(stream_index) >= input->nb_streams)
             throw Failure("Piste source absente");
+        // Seule la piste reconstruite est analysée puis lue : ni audio ni sous-titres décodés.
+        for (unsigned i = 0; i < input->nb_streams; ++i)
+            if (static_cast<int>(i) != stream_index) input->streams[i]->discard = AVDISCARD_ALL;
+        check(avformat_find_stream_info(input, nullptr), "Inspection source", MVO_FEL_INPUT_ERROR);
         stream = input->streams[stream_index];
         if (stream->codecpar->codec_id != AV_CODEC_ID_HEVC) throw Failure("La source FEL doit être HEVC");
         raw = std::string(input->iformat->name) == "hevc";
@@ -185,6 +190,33 @@ struct mvo_fel_context {
         // Décodeurs et reconstruction partagent le budget, jamais chacun le total.
         bl.init(stream, "bl_rpu", std::max(1, threads/3));
         el.init(stream, "el", std::max(1, threads/3));
+        if (start_us > 0) seek();
+    }
+    void seek() {
+        if (raw) {
+            // Flux brut sans index : décodage depuis le début, images antérieures ignorées.
+            skip = av_rescale_q_rnd(start_us, AV_TIME_BASE_Q, av_inv_q(fps),
+                static_cast<AVRounding>(AV_ROUND_UP | AV_ROUND_PASS_MINMAX));
+            return;
+        }
+        const int64_t origin = input->start_time != AV_NOPTS_VALUE ? input->start_time : 0;
+        target = av_rescale_q(origin + start_us, AV_TIME_BASE_Q, stream->time_base);
+        // Image clé antérieure ; un échec garde la lecture depuis le début (même résultat).
+        if (av_seek_frame(input, stream_index, target, AVSEEK_FLAG_BACKWARD) < 0)
+            av_log(nullptr, AV_LOG_DEBUG, "mvo-fel : seek impossible, lecture depuis le début\n");
+    }
+    // Images antérieures à la cible, dont les RASL/RADL d'un GOP ouvert : leurs PTS
+    // précèdent l'image clé atteinte. Chaque couche les écarte avant l'appariement.
+    void drop_leading(Layer &layer) {
+        while (target != AV_NOPTS_VALUE && !layer.ready.empty()) {
+            const auto pts = layer.ready.front()->pts;
+            if (pts != AV_NOPTS_VALUE && pts >= target) break;
+            layer.ready.pop_front();
+        }
+    }
+    int64_t output_pts(const AVFrame &base) const {
+        if (raw) return frames;
+        return target == AV_NOPTS_VALUE ? base.pts : base.pts - target;
     }
     void open_output(const AVFrame &base) {
         if (base.width <= 0 || base.height <= 0 || base.width > 8192 || base.height > 8192)
@@ -222,6 +254,7 @@ struct mvo_fel_context {
     }
     std::string device = "auto", backend = "cpu";
     void pair() {
+        drop_leading(bl); drop_leading(el);
         while (!bl.ready.empty() && !el.ready.empty()) {
             check_cancelled();
             auto base = std::move(bl.ready.front()); bl.ready.pop_front();
@@ -240,11 +273,12 @@ struct mvo_fel_context {
             if (kind != 1 && kind != 3) throw Failure("RPU original invalide ou sans FEL pendant le décodage");
             const muxiveo::fel::Mapping mapping(*reinterpret_cast<const AVDOVIMetadata *>(sd->data));
             if (!mapping.residual) throw Failure("Résiduel désactivé pendant la reconstruction FEL");
+            if (skipped < skip) { ++skipped; continue; }
             if (layers) {
                 if(base->width<=0 || base->height<=0 || base->width>8192 || base->height>8192)
                     throw Failure("Dimensions source invalides");
                 const auto timebase=raw ? av_inv_q(fps) : stream->time_base;
-                const auto pts=raw ? frames : base->pts;
+                const auto pts=output_pts(*base);
                 if(last_pts!=AV_NOPTS_VALUE && pts<=last_pts)
                     throw Failure("Horodatages de présentation non croissants");
                 last_pts=pts;
@@ -298,7 +332,7 @@ struct mvo_fel_context {
             }
             Timer nut(timing[5]);
             const AVRational timebase = raw ? av_inv_q(fps) : stream->time_base;
-            p->pts = p->dts = av_rescale_q(raw ? frames : base->pts, timebase, out_stream->time_base);
+            p->pts = p->dts = av_rescale_q(output_pts(*base), timebase, out_stream->time_base);
             if (last_pts != AV_NOPTS_VALUE && p->pts <= last_pts)
                 throw Failure("Horodatages de présentation non croissants");
             last_pts = p->pts;
@@ -382,9 +416,9 @@ struct mvo_fel_context {
 uint32_t mvo_fel_abi_version() { return MVO_FEL_ABI; }
 const char *mvo_fel_capabilities() {
 #ifdef MVO_FEL_VULKAN_PROTOTYPE
-    return "{\"abi\":1,\"version\":\"" MVO_FEL_VERSION "\",\"transport\":\"nut\",\"pixel_format\":\"gbrp16le\",\"cpu\":true,\"backend\":\"vulkan-prototype\",\"statistics\":1,\"device_selection\":1,\"experimental\":true}";
+    return "{\"abi\":1,\"version\":\"" MVO_FEL_VERSION "\",\"transport\":\"nut\",\"pixel_format\":\"gbrp16le\",\"cpu\":true,\"backend\":\"vulkan-prototype\",\"statistics\":1,\"device_selection\":1,\"seek\":1,\"experimental\":true}";
 #else
-    return "{\"abi\":1,\"version\":\"" MVO_FEL_VERSION "\",\"transport\":\"nut\",\"pixel_format\":\"gbrp16le\",\"cpu\":true,\"statistics\":1,\"device_selection\":1}";
+    return "{\"abi\":1,\"version\":\"" MVO_FEL_VERSION "\",\"transport\":\"nut\",\"pixel_format\":\"gbrp16le\",\"cpu\":true,\"statistics\":1,\"device_selection\":1,\"seek\":1}";
 #endif
 }
 int mvo_fel_classify(const uint8_t *nal, size_t size) {
@@ -404,6 +438,9 @@ int mvo_fel_classify(const uint8_t *nal, size_t size) {
 }
 mvo_fel_context *mvo_fel_create(const char *source, int stream, int threads, int num, int den) {
     if (!source || !*source || stream < 0) return nullptr;
+    // FFmpeg privé muet (pistes ignorées, zlib absent) : les erreurs passent par mvo_fel_error.
+    static const bool quiet = [] { av_log_set_level(AV_LOG_FATAL); return true; }();
+    (void)quiet;
     try { return new mvo_fel_context(source, stream, threads, {num, den}); } catch (...) { return nullptr; }
 }
 size_t mvo_fel_devices(char *buffer, size_t capacity) {
@@ -427,6 +464,11 @@ int mvo_fel_set_device(mvo_fel_context *p, const char *device) {
     return 0;
 }
 const char *mvo_fel_backend(const mvo_fel_context *p) { return p ? p->backend.c_str() : ""; }
+int mvo_fel_set_start(mvo_fel_context *p, int64_t start_us) {
+    if (!p || p->started || start_us < 0) return -1;
+    p->start_us = start_us;
+    return 0;
+}
 const char *mvo_fel_statistics(mvo_fel_context *p) {
     if (!p) return "{}";
     std::ostringstream text;

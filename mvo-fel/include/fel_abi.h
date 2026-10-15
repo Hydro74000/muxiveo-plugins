@@ -35,6 +35,10 @@ MVO_FEL_EXPORT mvo_fel_context *mvo_fel_create(const char *source, int stream,
 MVO_FEL_EXPORT size_t mvo_fel_devices(char *buffer, size_t capacity);
 MVO_FEL_EXPORT int mvo_fel_set_device(mvo_fel_context *, const char *device);
 MVO_FEL_EXPORT const char *mvo_fel_backend(const mvo_fel_context *);
+/* Extension additive ABI 1 ; disponible si capabilities.seek vaut 1. Avant run
+ * uniquement : première image produite à start_us du début du fichier (sémantique
+ * -ss d'entrée de FFmpeg), horodatages de sortie relatifs à ce point. */
+MVO_FEL_EXPORT int mvo_fel_set_start(mvo_fel_context *, int64_t start_us);
 /* Mesures locales après run ; pipe_s est inclus dans nut_s. */
 MVO_FEL_EXPORT const char *mvo_fel_statistics(mvo_fel_context *);
 MVO_FEL_EXPORT int mvo_fel_run(mvo_fel_context *, mvo_fel_write, mvo_fel_progress, void *);
