@@ -25,12 +25,32 @@ struct fel_gpu {
     pl_tex axes[3][6];
     pl_tex exact_axes[3][4];    /* numérateurs entiers, dénominateurs : x puis y */
     int exact[3];
+    /* Composition fusionnée : axes entiers (chroma BL, luma EL, chroma EL ; x puis y). */
+    pl_tex fused_axes[6];
+    int fused, fused_key[6];
     int axis_w[3], axis_h[3], axis_loc[3];
     int width, height;
     pl_tex dither;
     int dither_mode;
+    /* Temps GPU par étape (ns cumulés) : import, BL, résiduel EL, composition, sortie. */
+    pl_timer timers[5];
+    double gpu_ns[5];
     struct fel_output output;   /* sortie Vulkan directe (fel_gpu_configure) */
 };
+
+static void collect_timers(struct fel_gpu *p)
+{
+    for (int k = 0; k < 5; ++k) {
+        uint64_t ns;
+        while (p->timers[k] && (ns = pl_timer_query(p->vk->gpu, p->timers[k]))) p->gpu_ns[k] += (double)ns;
+    }
+}
+
+void fel_gpu_timings(void *context, double *milliseconds)
+{
+    const struct fel_gpu *p = context;
+    for (int k = 0; k < 5; ++k) milliseconds[k] = p ? p->gpu_ns[k] / 1e6 : 0;
+}
 
 int fel_gpu_device_name(void *context, char *buffer, size_t capacity)
 {
@@ -56,10 +76,12 @@ void fel_gpu_destroy(void *context)
         }
         for (int c=0;c<3;++c) for(int a=0;a<6;++a) pl_tex_destroy(p->vk->gpu, &p->axes[c][a]);
         for (int c=0;c<3;++c) for(int a=0;a<4;++a) pl_tex_destroy(p->vk->gpu, &p->exact_axes[c][a]);
+        for (int a=0;a<6;++a) pl_tex_destroy(p->vk->gpu, &p->fused_axes[a]);
         for (int i = 0; i < 12; ++i) pl_shader_obj_destroy(&p->lut[i]);
         pl_tex_destroy(p->vk->gpu, &p->target);
         for (int c=0;c<3;++c) pl_tex_destroy(p->vk->gpu, &p->planar[c]);
         pl_tex_destroy(p->vk->gpu, &p->dither);
+        for (int k = 0; k < 5; ++k) pl_timer_destroy(p->vk->gpu, &p->timers[k]);
     }
     pl_dispatch_destroy(&p->dispatch);
     pl_vulkan_destroy(&p->vk);
@@ -86,6 +108,7 @@ void *fel_gpu_create(int width, int height, const char *device)
     p->vk = pl_vulkan_create(p->log, &params);
     if (!p->vk) goto fail;
     p->dispatch = pl_dispatch_create(p->log, p->vk->gpu);
+    for (int k = 0; k < 5; ++k) p->timers[k] = pl_timer_create(p->vk->gpu);
     pl_fmt fmt = pl_find_fmt(p->vk->gpu, PL_FMT_UNORM, 4, 16, 16, PL_FMT_CAP_RENDERABLE | PL_FMT_CAP_SAMPLEABLE);
     if (!fmt || !p->dispatch) goto fail;
     p->target = pl_tex_create(p->vk->gpu, pl_tex_params(
@@ -220,7 +243,7 @@ static int scale_residual(struct fel_gpu *p, int i, int w, int h,
         int ok=pl_shader_custom(sh,&(struct pl_custom_shader){.body=exact_body,.input=PL_SHADER_SIG_NONE,
             .output=PL_SHADER_SIG_COLOR,.descriptors=exact_planes,.num_descriptors=7,
             .output_w=p->width,.output_h=p->height});
-        ok=ok && pl_dispatch_finish(p->dispatch,pl_dispatch_params(.shader=&sh,.target=p->scaled[i]));
+        ok=ok && pl_dispatch_finish(p->dispatch,pl_dispatch_params(.timer=p->timers[2],.shader=&sh,.target=p->scaled[i]));
         pl_dispatch_abort(p->dispatch,&sh);
         return ok;
     }
@@ -256,7 +279,7 @@ static int scale_residual(struct fel_gpu *p, int i, int w, int h,
             "precise float s=h+l;return vec2(s,l-(s-h));}",
         .body=body,.input=PL_SHADER_SIG_NONE,.output=PL_SHADER_SIG_COLOR,
         .descriptors=planes,.num_descriptors=7,.output_w=p->width,.output_h=p->height});
-    ok=ok && pl_dispatch_finish(p->dispatch,pl_dispatch_params(.shader=&sh,.target=p->scaled[i]));
+    ok=ok && pl_dispatch_finish(p->dispatch,pl_dispatch_params(.timer=p->timers[2],.shader=&sh,.target=p->scaled[i]));
     pl_dispatch_abort(p->dispatch,&sh);
     return ok;
 }
@@ -289,7 +312,7 @@ static int import_layer(struct fel_gpu *p, const AVFrame *frame, int enhancement
         ok = pl_shader_custom(sh, &(struct pl_custom_shader){.body = body, .input = PL_SHADER_SIG_NONE,
             .output = PL_SHADER_SIG_COLOR, .descriptors = &source, .num_descriptors = 1,
             .output_w = w, .output_h = h});
-        ok = ok && pl_dispatch_finish(p->dispatch, pl_dispatch_params(.shader = &sh, .target = p->source[i]));
+        ok = ok && pl_dispatch_finish(p->dispatch, pl_dispatch_params(.timer = p->timers[0], .shader = &sh, .target = p->source[i]));
         pl_dispatch_abort(p->dispatch, &sh);
     }
     if (mapped.release) mapped.release(gpu, &mapped);
@@ -342,7 +365,7 @@ static int scale_layer(struct fel_gpu *p, const AVFrame *frame, int enhancement,
                 .body = "color = vec4(texelFetch(fel_luma, ivec2(gl_FragCoord.xy), 0).r*(65535.0/1023.0), 0.0, 0.0, 1.0);",
                 .input = PL_SHADER_SIG_NONE, .output = PL_SHADER_SIG_COLOR, .descriptors = &source,
                 .num_descriptors = 1, .output_w = p->width, .output_h = p->height});
-            ok = ok && pl_dispatch_finish(p->dispatch, pl_dispatch_params(.shader = &sh, .target = p->scaled[i]));
+            ok = ok && pl_dispatch_finish(p->dispatch, pl_dispatch_params(.timer = p->timers[1], .shader = &sh, .target = p->scaled[i]));
             pl_dispatch_abort(p->dispatch, &sh);
             if (!ok) return 0;
             continue;
@@ -352,19 +375,163 @@ static int scale_layer(struct fel_gpu *p, const AVFrame *frame, int enhancement,
             .scale = 65535.f/1023.f, .new_w = w, .new_h = p->height,
             .rect = {0, -sy*ry, w, (p->height-sy)*ry}),
             pl_sample_filter_params(.filter = pl_filter_spline16, .lut = &p->lut[2*i]));
-        ok = ok && pl_dispatch_finish(p->dispatch, pl_dispatch_params(.shader = &sh, .target = p->middle[i]));
+        ok = ok && pl_dispatch_finish(p->dispatch, pl_dispatch_params(.timer = p->timers[1], .shader = &sh, .target = p->middle[i]));
         if (ok) {
             sh = pl_dispatch_begin(p->dispatch);
             ok = pl_shader_sample_ortho2(sh, pl_sample_src(.tex = p->middle[i], .components = 1,
                 .new_w = p->width, .new_h = p->height,
                 .rect = {-sx*rx, 0, (p->width-sx)*rx, p->height}),
                 pl_sample_filter_params(.filter = pl_filter_spline16, .lut = &p->lut[2*i+1]));
-            ok = ok && pl_dispatch_finish(p->dispatch, pl_dispatch_params(.shader = &sh, .target = p->scaled[i]));
+            ok = ok && pl_dispatch_finish(p->dispatch, pl_dispatch_params(.timer = p->timers[1], .shader = &sh, .target = p->scaled[i]));
         }
         pl_dispatch_abort(p->dispatch, &sh);
         if (!ok) return 0;
     }
     return 1;
+}
+
+/* Plans 10 bits en textures R16 à codes en poids faible : téléversement du décodage
+ * logiciel ou import du décodage Vulkan Video. */
+static int load_layer(struct fel_gpu *p, const AVFrame *frame, int enhancement)
+{
+    pl_gpu gpu = p->vk->gpu;
+    if (frame->format == AV_PIX_FMT_VULKAN) return import_layer(p, frame, enhancement);
+    const AVPixFmtDescriptor *desc = av_pix_fmt_desc_get(frame->format);
+    pl_fmt source_fmt = pl_find_fmt(gpu, PL_FMT_UNORM, 1, 16, 16, PL_FMT_CAP_SAMPLEABLE);
+    if (!desc || !source_fmt) return 0;
+    for (int c = 0; c < 3; ++c) {
+        const AVComponentDescriptor *comp = &desc->comp[c];
+        const int w = c ? AV_CEIL_RSHIFT(frame->width, desc->log2_chroma_w) : frame->width;
+        const int h = c ? AV_CEIL_RSHIFT(frame->height, desc->log2_chroma_h) : frame->height;
+        if (comp->depth != 10 || comp->step != 2 || comp->shift || comp->offset || frame->linesize[comp->plane] <= 0 ||
+            !pl_tex_recreate(gpu, &p->source[enhancement*3+c], pl_tex_params(.w = w, .h = h,
+                .format = source_fmt, .sampleable = true, .host_writable = true)) ||
+            !pl_tex_upload(gpu, pl_tex_transfer_params(.tex = p->source[enhancement*3+c],
+                .ptr = frame->data[comp->plane], .row_pitch = frame->linesize[comp->plane]))) return 0;
+    }
+    return 1;
+}
+
+/* Axe entier compact (RGBA32I, 3 lignes : indices, numérateurs, dénominateur) ; 0 si une
+ * phase n'est pas rationnelle. *sum : max des Σ|numérateurs|. */
+static int fused_axis(struct fel_gpu *p, pl_tex *tex, int count, int size, double ratio, double shift, int *sum)
+{
+    pl_fmt fmt = pl_find_fmt(p->vk->gpu, PL_FMT_SINT, 4, 32, 32, PL_FMT_CAP_SAMPLEABLE);
+    int32_t *data = calloc((size_t)count*12, sizeof(int32_t));
+    int ok = fmt && data;
+    *sum = 0;
+    for (int x = 0; ok && x < count; ++x) {
+        const double pos = (x+0.5-shift)*ratio-0.5;
+        const int first = (int)floor(pos)-1;
+        double weights[4], total = 0;
+        int numerators[4], magnitude = 0;
+        for (int k = 0; k < 4; ++k) total += weights[k] = spline(pos-first-k);
+        for (int k = 0; k < 4; ++k) {
+            int index = first+k;
+            weights[k] /= total;
+            data[4*x+k] = index < 0 ? 0 : index >= size ? size-1 : index;
+        }
+        const int denominator = exact_weights(weights, numerators);
+        ok = denominator > 0;
+        for (int k = 0; k < 4; ++k) {
+            data[4*count+4*x+k] = numerators[k];
+            magnitude += abs(numerators[k]);
+        }
+        data[8*count+4*x] = denominator;
+        if (magnitude > *sum) *sum = magnitude;
+    }
+    ok = ok && pl_tex_recreate(p->vk->gpu, tex, pl_tex_params(.w = count, .h = 3, .format = fmt,
+        .sampleable = true, .host_writable = true)) &&
+        pl_tex_upload(p->vk->gpu, pl_tex_transfer_params(.tex = *tex, .ptr = data));
+    free(data);
+    return ok;
+}
+
+/* Axes de la composition fusionnée pour ces géométries et positions chroma ; 1 si toutes les
+ * phases sont rationnelles et les sommes entières bornées (int32). */
+static int prepare_fused(struct fel_gpu *p, const AVFrame *bl, const AVFrame *el)
+{
+    const int key[6] = {bl->width, bl->height, el->width, el->height, bl->chroma_location, el->chroma_location};
+    if (!memcmp(key, p->fused_key, sizeof(key))) return p->fused;
+    memcpy(p->fused_key, key, sizeof(key));
+    p->fused = 0;
+    if (bl->width != p->width || bl->height != p->height) return 0;
+    float bx, by, ex, ey;
+    pl_chroma_location_offset(pl_chroma_from_av(bl->chroma_location), &bx, &by);
+    pl_chroma_location_offset(pl_chroma_from_av(el->chroma_location), &ex, &ey);
+    const int bw = AV_CEIL_RSHIFT(bl->width, 1), bh = AV_CEIL_RSHIFT(bl->height, 1);
+    const int ew = el->width, eh = el->height, cw = AV_CEIL_RSHIFT(el->width, 1), ch = AV_CEIL_RSHIFT(el->height, 1);
+    const double lx = el->width < p->width ? -.5 : 0;
+    int sums[6];
+    /* Mêmes formules que scale_layer : décalage = couche + chroma, rapport = plan / sortie. */
+    int ok = fused_axis(p, &p->fused_axes[0], p->width, bw, (double)bw/p->width, (double)bx*p->width/bl->width, &sums[0]) &&
+             fused_axis(p, &p->fused_axes[1], p->height, bh, (double)bh/p->height, (double)by*p->height/bl->height, &sums[1]) &&
+             fused_axis(p, &p->fused_axes[2], p->width, ew, (double)ew/p->width, lx, &sums[2]) &&
+             fused_axis(p, &p->fused_axes[3], p->height, eh, (double)eh/p->height, 0, &sums[3]) &&
+             fused_axis(p, &p->fused_axes[4], p->width, cw, (double)cw/p->width, lx + (double)ex*p->width/el->width, &sums[4]) &&
+             fused_axis(p, &p->fused_axes[5], p->height, ch, (double)ch/p->height, (double)ey*p->height/el->height, &sums[5]);
+    /* |code| <= 1023 (BL) et |code - offset| <= 1023 (EL) : aucun débordement int32. */
+    for (int a = 0; ok && a < 6; a += 2) ok = 1023.0*sums[a]*sums[a+1] < 2147483647.0;
+    p->fused = ok;
+    return ok;
+}
+
+/* Corps GLSL d'une somme Spline16 entière exacte : axes AX/AY, plans P et offsets O. */
+#define FEL_TAPS(AX, AY) \
+    "ivec4 ix=texelFetch(" AX ",ivec2(xy.x,0),0),nx=texelFetch(" AX ",ivec2(xy.x,1),0);" \
+    "ivec4 iy=texelFetch(" AY ",ivec2(xy.y,0),0),ny=texelFetch(" AY ",ivec2(xy.y,1),0);" \
+    "float norm=1.0/(float(texelFetch(" AX ",ivec2(xy.x,2),0).x)*float(texelFetch(" AY ",ivec2(xy.y,2),0).x)*1023.0);"
+
+static int join_fused(struct fel_gpu *p, pl_shader sh, int enhancement, const AVDOVIMetadata *metadata)
+{
+    char body[2048];
+    if (!enhancement) {
+        const struct pl_shader_desc planes[5] = {
+            {.desc = {.name = "fb0", .type = PL_DESC_SAMPLED_TEX}, .binding = {.object = p->source[0]}},
+            {.desc = {.name = "fb1", .type = PL_DESC_SAMPLED_TEX}, .binding = {.object = p->source[1]}},
+            {.desc = {.name = "fb2", .type = PL_DESC_SAMPLED_TEX}, .binding = {.object = p->source[2]}},
+            {.desc = {.name = "fbx", .type = PL_DESC_SAMPLED_TEX}, .binding = {.object = p->fused_axes[0]}},
+            {.desc = {.name = "fby", .type = PL_DESC_SAMPLED_TEX}, .binding = {.object = p->fused_axes[1]}},
+        };
+        snprintf(body, sizeof(body),
+            "ivec2 xy=ivec2(gl_FragCoord.xy);"
+            FEL_TAPS("fbx", "fby")
+            "int tb=0,tr=0;"
+            "for(int b=0;b<4;b++){int rb=0,rr=0;for(int a=0;a<4;a++){ivec2 q=ivec2(ix[a],iy[b]);"
+            "rb+=nx[a]*int(round(texelFetch(fb1,q,0).r*65535.0));rr+=nx[a]*int(round(texelFetch(fb2,q,0).r*65535.0));}"
+            "tb+=ny[b]*rb;tr+=ny[b]*rr;}"
+            "color=vec4(round(texelFetch(fb0,xy,0).r*65535.0)/1023.0,float(tb)*norm,float(tr)*norm,1.0);");
+        return pl_shader_custom(sh, &(struct pl_custom_shader){.body = body, .input = PL_SHADER_SIG_NONE,
+            .output = PL_SHADER_SIG_COLOR, .descriptors = planes, .num_descriptors = 5,
+            .output_w = p->width, .output_h = p->height});
+    }
+    const AVDOVIDataMapping *mapping = av_dovi_get_mapping(metadata);
+    const struct pl_shader_desc planes[7] = {
+        {.desc = {.name = "fe0", .type = PL_DESC_SAMPLED_TEX}, .binding = {.object = p->source[3]}},
+        {.desc = {.name = "fe1", .type = PL_DESC_SAMPLED_TEX}, .binding = {.object = p->source[4]}},
+        {.desc = {.name = "fe2", .type = PL_DESC_SAMPLED_TEX}, .binding = {.object = p->source[5]}},
+        {.desc = {.name = "fex", .type = PL_DESC_SAMPLED_TEX}, .binding = {.object = p->fused_axes[2]}},
+        {.desc = {.name = "fey", .type = PL_DESC_SAMPLED_TEX}, .binding = {.object = p->fused_axes[3]}},
+        {.desc = {.name = "fcx", .type = PL_DESC_SAMPLED_TEX}, .binding = {.object = p->fused_axes[4]}},
+        {.desc = {.name = "fcy", .type = PL_DESC_SAMPLED_TEX}, .binding = {.object = p->fused_axes[5]}},
+    };
+    /* Résiduels centrés avant interpolation : sommes entières, zéro et signe exacts. */
+    snprintf(body, sizeof(body),
+        "ivec2 xy=ivec2(gl_FragCoord.xy);vec3 residual;"
+        "{" FEL_TAPS("fex", "fey")
+        "int t=0;for(int b=0;b<4;b++){int r=0;for(int a=0;a<4;a++)"
+        "r+=nx[a]*(int(round(texelFetch(fe0,ivec2(ix[a],iy[b]),0).r*65535.0))-%d);t+=ny[b]*r;}"
+        "residual.x=float(t)*norm;}"
+        "{" FEL_TAPS("fcx", "fcy")
+        "int tb=0,tr=0;for(int b=0;b<4;b++){int rb=0,rr=0;for(int a=0;a<4;a++){ivec2 q=ivec2(ix[a],iy[b]);"
+        "rb+=nx[a]*(int(round(texelFetch(fe1,q,0).r*65535.0))-%d);rr+=nx[a]*(int(round(texelFetch(fe2,q,0).r*65535.0))-%d);}"
+        "tb+=ny[b]*rb;tr+=ny[b]*rr;}"
+        "residual.y=float(tb)*norm;residual.z=float(tr)*norm;}"
+        "color=vec4(residual,1.0);",
+        mapping->nlq[0].nlq_offset, mapping->nlq[1].nlq_offset, mapping->nlq[2].nlq_offset);
+    return pl_shader_custom(sh, &(struct pl_custom_shader){.body = body, .input = PL_SHADER_SIG_NONE,
+        .output = PL_SHADER_SIG_COLOR, .descriptors = planes, .num_descriptors = 7,
+        .output_w = p->width, .output_h = p->height});
 }
 
 static int join_layer(struct fel_gpu *p, pl_shader sh, int enhancement)
@@ -390,7 +557,11 @@ static int join_layer(struct fel_gpu *p, pl_shader sh, int enhancement)
 static int render_target(struct fel_gpu *p, const AVDOVIMetadata *metadata,
                          const AVFrame *bl, const AVFrame *el)
 {
-    if (!scale_layer(p, bl, 0, metadata) || !scale_layer(p, el, 1, metadata)) return 0;
+    /* Phases rationnelles : une seule passe lit les plans (aucune texture 4K intermédiaire). */
+    const int fused = getenv("MVO_FEL_GPU_UNFUSED") == NULL && bl->format == el->format &&
+                      prepare_fused(p, bl, el);
+    if (fused ? !load_layer(p, bl, 0) || !load_layer(p, el, 1)
+              : !scale_layer(p, bl, 0, metadata) || !scale_layer(p, el, 1, metadata)) return 0;
     struct pl_dovi_metadata dovi = {0};
     pl_map_dovi_metadata(&dovi, metadata);
     for (int c=0;c<3;++c) dovi.nlq[c].offset=0;
@@ -398,10 +569,11 @@ static int render_target(struct fel_gpu *p, const AVDOVIMetadata *metadata,
         .bits = {.sample_depth = 16, .color_depth = 16}, .dovi = &dovi};
     pl_shader sh = pl_dispatch_begin(p->dispatch);
     pl_shader eh = pl_shader_alloc(p->log, pl_shader_params(.gpu = p->vk->gpu, .id = 1));
-    int ok = eh && join_layer(p, sh, 0) && join_layer(p, eh, 1);
+    int ok = eh && (fused ? join_fused(p, sh, 0, metadata) && join_fused(p, eh, 1, metadata)
+                          : join_layer(p, sh, 0) && join_layer(p, eh, 1));
     if (ok) {
         pl_shader_decode_color_ex(sh, pl_color_decode_args(.repr = &repr, .enhancement_layer = eh));
-        ok = pl_dispatch_finish(p->dispatch, pl_dispatch_params(.shader = &sh, .target = p->target));
+        ok = pl_dispatch_finish(p->dispatch, pl_dispatch_params(.timer = p->timers[3], .shader = &sh, .target = p->target));
     }
     pl_dispatch_abort(p->dispatch, &sh);
     pl_shader_free(&eh);
@@ -441,7 +613,7 @@ int fel_gpu_render_planar(void *context, const AVDOVIMetadata *metadata,
         ok=pl_shader_custom(sh,&(struct pl_custom_shader){.body=body[c],.input=PL_SHADER_SIG_NONE,
             .output=PL_SHADER_SIG_COLOR,.descriptors=&source,.num_descriptors=1,
             .output_w=p->width,.output_h=p->height});
-        ok=ok && pl_dispatch_finish(p->dispatch,pl_dispatch_params(.shader=&sh,.target=p->planar[c]));
+        ok=ok && pl_dispatch_finish(p->dispatch,pl_dispatch_params(.timer=p->timers[4],.shader=&sh,.target=p->planar[c]));
         pl_dispatch_abort(p->dispatch,&sh);
         if(ok)ok=pl_tex_download(p->vk->gpu,pl_tex_transfer_params(.tex=p->planar[c],
             .ptr=output->data[c],.row_pitch=output->linesize[c],
@@ -449,6 +621,7 @@ int fel_gpu_render_planar(void *context, const AVDOVIMetadata *metadata,
     }
     // Les tampons appartiennent au paquet ; même une erreur attend les DMA lancés.
     pl_gpu_finish(p->vk->gpu);
+    collect_timers(p);
     return ok;
 }
 
@@ -478,7 +651,7 @@ static int dispatch(struct fel_gpu *p, pl_tex target, const char *body, int w, i
     int ok = pl_shader_custom(sh, &(struct pl_custom_shader){.body = body, .input = PL_SHADER_SIG_NONE,
         .output = PL_SHADER_SIG_COLOR, .descriptors = descriptors, .num_descriptors = 2,
         .output_w = w, .output_h = h});
-    ok = ok && pl_dispatch_finish(p->dispatch, pl_dispatch_params(.shader = &sh, .target = target));
+    ok = ok && pl_dispatch_finish(p->dispatch, pl_dispatch_params(.timer = p->timers[4], .shader = &sh, .target = target));
     pl_dispatch_abort(p->dispatch, &sh);
     return ok;
 }
@@ -557,6 +730,7 @@ int fel_gpu_render_yuv(void *context, const AVDOVIMetadata *metadata, const AVFr
             .callback = p->vk->gpu->limits.callbacks ? downloaded : NULL));
     /* Les tampons appartiennent au paquet ; même une erreur attend les DMA lancés. */
     pl_gpu_finish(p->vk->gpu);
+    collect_timers(p);
     return ok;
 }
 
@@ -657,6 +831,7 @@ void *fel_gpu_import(const void *context,int width,int height)
     p->vk=pl_vulkan_import(p->log,&params);
     if(!p->vk)goto fail;
     p->dispatch=pl_dispatch_create(p->log,p->vk->gpu);
+    for (int k = 0; k < 5; ++k) p->timers[k] = pl_timer_create(p->vk->gpu);
     pl_fmt fmt=pl_find_fmt(p->vk->gpu,PL_FMT_UNORM,4,16,16,PL_FMT_CAP_RENDERABLE | PL_FMT_CAP_SAMPLEABLE);
     if(!fmt || !p->dispatch)goto fail;
     p->target=pl_tex_create(p->vk->gpu,pl_tex_params(.w=width,.h=height,.format=fmt,
@@ -699,7 +874,7 @@ int fel_gpu_render_vulkan(void *context,const AVDOVIMetadata *metadata,
         ok=pl_shader_custom(sh,&(struct pl_custom_shader){.body=body[c],.input=PL_SHADER_SIG_NONE,
             .output=PL_SHADER_SIG_COLOR,.descriptors=&source,.num_descriptors=1,
             .output_w=p->width,.output_h=p->height});
-        ok=ok && pl_dispatch_finish(p->dispatch,pl_dispatch_params(.shader=&sh,.target=target.planes[c].texture));
+        ok=ok && pl_dispatch_finish(p->dispatch,pl_dispatch_params(.timer=p->timers[4],.shader=&sh,.target=target.planes[c].texture));
         pl_dispatch_abort(p->dispatch,&sh);
     }
     if(target.release)target.release(p->vk->gpu,&target);

@@ -54,6 +54,7 @@ void *fel_gpu_import(const void *, int, int);
 int fel_gpu_render_vulkan(void *, const AVDOVIMetadata *, const AVFrame *, const AVFrame *, AVFrame *);
 int fel_gpu_render_yuv(void *, const AVDOVIMetadata *, const AVFrame *, const AVFrame *, const fel_output *, AVFrame *);
 void fel_gpu_configure(void *, const fel_output *);
+void fel_gpu_timings(void *, double *);
 #endif
 }
 
@@ -943,6 +944,15 @@ const char *mvo_fel_statistics(mvo_fel_context *p) {
     // Attentes des files : l'étage le plus attendu par les autres est le goulot.
     const char *waits[]={"decode_blocked_s","render_starved_s","render_blocked_s","output_starved_s"};
     for(size_t i=0;i<p->waits.size();++i)text << ",\"" << waits[i] << "\":" << p->waits[i];
+#ifdef MVO_FEL_VULKAN_PROTOTYPE
+    if (p->gpu_prototype) {
+        // Temps GPU mesurés par étape (pl_timer), en millisecondes cumulées.
+        double gpu[5];
+        fel_gpu_timings(p->gpu_prototype, gpu);
+        const char *stages[]={"gpu_import_ms","gpu_bl_ms","gpu_el_ms","gpu_compose_ms","gpu_output_ms"};
+        for(int i=0;i<5;++i)text << ",\"" << stages[i] << "\":" << gpu[i];
+    }
+#endif
     text << '}';
     p->statistics=text.str();
     return p->statistics.c_str();
