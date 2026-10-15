@@ -31,6 +31,7 @@ typedef struct FelSource {
     int (*render)(void *,const void *,const void *,const void *,void *);
     void (*gpu_destroy)(void *);
     int (*configure)(void *,const char *,const char *,int,int,int,int);
+    int (*decoder_device)(mvo_fel_context *,const void *);
 } FelSource;
 
 #define OFFSET(x) offsetof(FelSource,x)
@@ -79,6 +80,7 @@ static av_cold int init(AVFilterContext *ctx)
     s->p010=s->format && !strcmp(s->format,"p010");
     if(s->format && !s->p010 && strcmp(s->format,"gbrp16"))return AVERROR(EINVAL);
     *(void **)(&s->configure)=dlsym(s->module,"mvo_fel_vulkan_configure");
+    *(void **)(&s->decoder_device)=dlsym(s->module,"mvo_fel_set_decoder_device");
     if(s->p010 && !s->configure) {
         av_log(ctx,AV_LOG_ERROR,"MVO_FEL_RECOVERABLE : sortie p010 absente de cette bibliothèque FEL.\n");
         return AVERROR_EXTERNAL;
@@ -154,6 +156,9 @@ static int config_output(AVFilterLink *link)
         av_log(ctx,AV_LOG_ERROR,"MVO_FEL_RECOVERABLE : sortie p010 refusée (position chroma, tramage ou zone).\n");
         return AVERROR_EXTERNAL;
     }
+    /* Couches décodées sur le même GPU que le rendu, sans retour en RAM (contrôle au départ). */
+    if(s->decoder_device && s->decoder_device(s->context,ctx->hw_device_ctx))
+        av_log(ctx,AV_LOG_WARNING,"Décodage Vulkan des couches FEL indisponible : décodage CPU.\n");
     l->hw_frames_ctx=av_buffer_ref(s->frames);
     if(!l->hw_frames_ctx)return AVERROR(ENOMEM);
     l->frame_rate=s->frame_rate;

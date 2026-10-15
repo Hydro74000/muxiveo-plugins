@@ -12,6 +12,7 @@
 #include <math.h>
 #include <string.h>
 #include <inttypes.h>
+#include <stdlib.h>
 
 extern PFN_vkGetInstanceProcAddr fel_vk_get_proc_addr(void);
 
@@ -22,6 +23,8 @@ struct fel_gpu {
     pl_tex source[6], middle[6], scaled[6], target, planar[3];
     pl_shader_obj lut[12];
     pl_tex axes[3][6];
+    pl_tex exact_axes[3][4];    /* numérateurs entiers, dénominateurs : x puis y */
+    int exact[3];
     int axis_w[3], axis_h[3], axis_loc[3];
     int width, height;
     pl_tex dither;
@@ -52,6 +55,7 @@ void fel_gpu_destroy(void *context)
             pl_tex_destroy(p->vk->gpu, &p->scaled[i]);
         }
         for (int c=0;c<3;++c) for(int a=0;a<6;++a) pl_tex_destroy(p->vk->gpu, &p->axes[c][a]);
+        for (int c=0;c<3;++c) for(int a=0;a<4;++a) pl_tex_destroy(p->vk->gpu, &p->exact_axes[c][a]);
         for (int i = 0; i < 12; ++i) pl_shader_obj_destroy(&p->lut[i]);
         pl_tex_destroy(p->vk->gpu, &p->target);
         for (int c=0;c<3;++c) pl_tex_destroy(p->vk->gpu, &p->planar[c]);
@@ -104,26 +108,60 @@ static double spline(double x)
     return ((-x/3+4.0/5.0)*x-7.0/15.0)*x;
 }
 
+/* Dénominateur minimal rendant les quatre poids entiers (phases multiples de 1/8 :
+ * diviseurs de 2560) ; 0 si la phase n'est pas rationnelle de ce type. */
+static int exact_weights(const double *w, int *numerators)
+{
+    static const int divisors[] = {1,2,4,5,8,10,16,20,32,40,64,80,128,160,256,320,512,640,1280,2560};
+    for (size_t d = 0; d < sizeof(divisors)/sizeof(*divisors); ++d) {
+        int ok = 1, sum = 0;
+        for (int k = 0; k < 4 && ok; ++k) {
+            const double scaled = w[k] * divisors[d];
+            numerators[k] = (int)lround(scaled);
+            ok = fabs(scaled - numerators[k]) < 1e-9;
+            sum += numerators[k];
+        }
+        if (ok && sum == divisors[d]) return divisors[d];
+    }
+    return 0;
+}
+
+/* Axes du résiduel EL : indices et poids hi/lo (float-float), et si toutes les phases le
+ * permettent, numérateurs/dénominateurs entiers exacts. *weight_sum : max des Σ|num|. */
 static int prepare_axis(struct fel_gpu *p, int c, int axis,
-                        int count, int size, double ratio, double shift)
+                        int count, int size, double ratio, double shift, int *exact, int *weight_sum)
 {
     pl_fmt fmt=pl_find_fmt(p->vk->gpu, PL_FMT_FLOAT, 4, 32, 32, PL_FMT_CAP_SAMPLEABLE);
+    pl_fmt ifmt=pl_find_fmt(p->vk->gpu, PL_FMT_SINT, 4, 32, 32, PL_FMT_CAP_SAMPLEABLE);
     float *data=calloc((size_t)count*12,sizeof(float));
-    if(!fmt || !data) {free(data);return 0;}
+    int32_t *integers=calloc((size_t)count*8,sizeof(int32_t));
+    if(!fmt || !data || !integers) {free(data);free(integers);return 0;}
+    *exact = ifmt != NULL;
+    *weight_sum = 0;
     for(int x=0;x<count;++x){
         const double pos=(x+0.5-shift)*ratio-0.5;
         const int first=(int)floor(pos)-1;
         double weights[4],sum=0;
+        int numerators[4], total=0;
         for(int k=0;k<4;++k) sum+=weights[k]=spline(pos-first-k);
         for(int k=0;k<4;++k){
             double w=weights[k]/sum;
             int index=first+k;
+            weights[k]=w;
             if(index<0)index=0;
             if(index>=size)index=size-1;
             data[4*x+k]=(float)index;
             data[4*count+4*x+k]=(float)w;
             data[8*count+4*x+k]=(float)(w-(float)w);
         }
+        const int denominator = exact_weights(weights, numerators);
+        if (!denominator) *exact = 0;
+        for(int k=0;k<4;++k){
+            integers[4*x+k]=numerators[k];
+            total+=abs(numerators[k]);
+        }
+        integers[4*count+4*x]=denominator;
+        if (total > *weight_sum) *weight_sum = total;
     }
     int ok=1;
     for(int k=0;k<3;++k){
@@ -132,7 +170,14 @@ static int prepare_axis(struct fel_gpu *p, int c, int axis,
             .format=fmt,.sampleable=true,.host_writable=true));
         ok=ok && pl_tex_upload(p->vk->gpu, pl_tex_transfer_params(.tex=*tex,.ptr=data+4*count*k));
     }
+    for(int k=0;k<2 && ok && *exact;++k){
+        pl_tex *tex=&p->exact_axes[c][2*axis+k];
+        ok=pl_tex_recreate(p->vk->gpu, tex, pl_tex_params(.w=count,.h=1,
+            .format=ifmt,.sampleable=true,.host_writable=true)) &&
+           pl_tex_upload(p->vk->gpu, pl_tex_transfer_params(.tex=*tex,.ptr=integers+4*count*k));
+    }
     free(data);
+    free(integers);
     return ok;
 }
 
@@ -143,9 +188,41 @@ static int scale_residual(struct fel_gpu *p, int i, int w, int h,
 {
     const int c=i-3;
     if(p->axis_w[c]!=w || p->axis_h[c]!=h || p->axis_loc[c]!=location){
-        if(!prepare_axis(p,c,0,p->width,w,rx,sx) ||
-           !prepare_axis(p,c,1,p->height,h,ry,sy))return 0;
+        int exact_x, exact_y, sum_x, sum_y;
+        if(!prepare_axis(p,c,0,p->width,w,rx,sx,&exact_x,&sum_x) ||
+           !prepare_axis(p,c,1,p->height,h,ry,sy,&exact_y,&sum_y))return 0;
+        /* Somme entière bornée : |code - offset| <= 1023, aucun débordement int32. */
+        p->exact[c]=exact_x && exact_y && 1023.0*sum_x*sum_y < 2147483647.0;
         p->axis_w[c]=w;p->axis_h[c]=h;p->axis_loc[c]=location;
+    }
+    if(p->exact[c]){
+        /* Phases rationnelles : somme entière exacte, zéro et signe du résiduel exacts. */
+        char exact_body[1024];
+        snprintf(exact_body,sizeof(exact_body),
+            "ivec2 xy=ivec2(gl_FragCoord.xy);"
+            "ivec4 ix=ivec4(texelFetch(ax0,ivec2(xy.x,0),0)),iy=ivec4(texelFetch(ax3,ivec2(xy.y,0),0));"
+            "ivec4 wx=texelFetch(ex0,ivec2(xy.x,0),0),wy=texelFetch(ey0,ivec2(xy.y,0),0);"
+            "int dx=texelFetch(ex1,ivec2(xy.x,0),0).x,dy=texelFetch(ey1,ivec2(xy.y,0),0).x;"
+            "int total=0;"
+            "for(int y=0;y<4;y++){int row=0;for(int x=0;x<4;x++){"
+            "row+=wx[x]*(int(round(texelFetch(raw_el,ivec2(ix[x],iy[y]),0).r*65535.0))-%d);}"
+            "total+=wy[y]*row;}"
+            "color=vec4(float(total)/(float(dx)*float(dy)*1023.0),0.0,0.0,1.0);",offset);
+        const struct pl_shader_desc exact_planes[7]={
+            {.desc={.name="raw_el",.type=PL_DESC_SAMPLED_TEX},.binding={.object=p->source[i]}},
+            {.desc={.name="ax0",.type=PL_DESC_SAMPLED_TEX},.binding={.object=p->axes[c][0]}},
+            {.desc={.name="ax3",.type=PL_DESC_SAMPLED_TEX},.binding={.object=p->axes[c][3]}},
+            {.desc={.name="ex0",.type=PL_DESC_SAMPLED_TEX},.binding={.object=p->exact_axes[c][0]}},
+            {.desc={.name="ex1",.type=PL_DESC_SAMPLED_TEX},.binding={.object=p->exact_axes[c][1]}},
+            {.desc={.name="ey0",.type=PL_DESC_SAMPLED_TEX},.binding={.object=p->exact_axes[c][2]}},
+            {.desc={.name="ey1",.type=PL_DESC_SAMPLED_TEX},.binding={.object=p->exact_axes[c][3]}}};
+        pl_shader sh=pl_dispatch_begin(p->dispatch);
+        int ok=pl_shader_custom(sh,&(struct pl_custom_shader){.body=exact_body,.input=PL_SHADER_SIG_NONE,
+            .output=PL_SHADER_SIG_COLOR,.descriptors=exact_planes,.num_descriptors=7,
+            .output_w=p->width,.output_h=p->height});
+        ok=ok && pl_dispatch_finish(p->dispatch,pl_dispatch_params(.shader=&sh,.target=p->scaled[i]));
+        pl_dispatch_abort(p->dispatch,&sh);
+        return ok;
     }
     char body[2048];
     snprintf(body,sizeof(body),
@@ -184,30 +261,68 @@ static int scale_residual(struct fel_gpu *p, int i, int w, int h,
     return ok;
 }
 
+/* Couche décodée par Vulkan Video (P010 : codes 10 bits en poids fort, chroma entrelacée)
+ * recopiée dans les textures R16 du téléversement (codes en poids faible) : le calcul aval
+ * reste identique, bit à bit, au parcours du décodage logiciel. */
+static int import_layer(struct fel_gpu *p, const AVFrame *frame, int enhancement)
+{
+    pl_gpu gpu = p->vk->gpu;
+    pl_fmt fmt = pl_find_fmt(gpu, PL_FMT_UNORM, 1, 16, 16, PL_FMT_CAP_RENDERABLE | PL_FMT_CAP_SAMPLEABLE);
+    struct pl_frame mapped = {0};
+    if (!fmt || !pl_map_avframe_ex(gpu, &mapped, pl_avframe_params(.frame = frame))) return 0;
+    int ok = mapped.num_planes == 2 && (!mapped.acquire || mapped.acquire(gpu, &mapped));
+    for (int c = 0; c < 3 && ok; ++c) {
+        const int i = enhancement*3 + c;
+        const int w = c ? AV_CEIL_RSHIFT(frame->width, 1) : frame->width;
+        const int h = c ? AV_CEIL_RSHIFT(frame->height, 1) : frame->height;
+        const struct pl_plane *plane = &mapped.planes[c ? 1 : 0];
+        const struct pl_shader_desc source = {.desc = {.name = "fel_layer", .type = PL_DESC_SAMPLED_TEX},
+                                              .binding = {.object = plane->texture}};
+        char body[256];
+        snprintf(body, sizeof(body),
+            "float code = round(texelFetch(fel_layer, ivec2(gl_FragCoord.xy), 0).%c*65535.0/64.0);"
+            "color = vec4((code + 0.25)/65535.0, 0.0, 0.0, 1.0);", c == 2 ? 'g' : 'r');
+        ok = pl_tex_recreate(gpu, &p->source[i], pl_tex_params(.w = w, .h = h, .format = fmt,
+            .sampleable = true, .renderable = true));
+        if (!ok) break;
+        pl_shader sh = pl_dispatch_begin(p->dispatch);
+        ok = pl_shader_custom(sh, &(struct pl_custom_shader){.body = body, .input = PL_SHADER_SIG_NONE,
+            .output = PL_SHADER_SIG_COLOR, .descriptors = &source, .num_descriptors = 1,
+            .output_w = w, .output_h = h});
+        ok = ok && pl_dispatch_finish(p->dispatch, pl_dispatch_params(.shader = &sh, .target = p->source[i]));
+        pl_dispatch_abort(p->dispatch, &sh);
+    }
+    if (mapped.release) mapped.release(gpu, &mapped);
+    pl_unmap_avframe(gpu, &mapped);
+    return ok;
+}
+
 static int scale_layer(struct fel_gpu *p, const AVFrame *frame, int enhancement, const AVDOVIMetadata *metadata)
 {
     pl_gpu gpu = p->vk->gpu;
-    const AVPixFmtDescriptor *desc = av_pix_fmt_desc_get(frame->format);
+    const int imported = frame->format == AV_PIX_FMT_VULKAN;
+    const AVPixFmtDescriptor *desc = av_pix_fmt_desc_get(imported ? AV_PIX_FMT_YUV420P10LE : frame->format);
     pl_fmt source_fmt = pl_find_fmt(gpu, PL_FMT_UNORM, 1, 16, 16, PL_FMT_CAP_SAMPLEABLE);
     pl_fmt float_fmt = pl_find_fmt(gpu, PL_FMT_FLOAT, 1, 32, 32,
         PL_FMT_CAP_RENDERABLE | PL_FMT_CAP_SAMPLEABLE | PL_FMT_CAP_LINEAR);
     if (!desc || !source_fmt || !float_fmt) return 0;
+    if (imported && !import_layer(p, frame, enhancement)) return 0;
     for (int c = 0; c < 3; ++c) {
         const int i = enhancement*3+c;
         const int w = c ? AV_CEIL_RSHIFT(frame->width, desc->log2_chroma_w) : frame->width;
         const int h = c ? AV_CEIL_RSHIFT(frame->height, desc->log2_chroma_h) : frame->height;
         const AVComponentDescriptor *comp = &desc->comp[c];
         // Le prototype accepte les plans 16 bits contenant les codes HEVC 10 bits.
-        if (comp->depth != 10 || comp->step != 2 || comp->shift || comp->offset ||
-            frame->linesize[comp->plane] <= 0) return 0;
-        if (!pl_tex_recreate(gpu, &p->source[i], pl_tex_params(.w = w, .h = h,
+        if (!imported && (comp->depth != 10 || comp->step != 2 || comp->shift || comp->offset ||
+            frame->linesize[comp->plane] <= 0)) return 0;
+        if ((!imported && (!pl_tex_recreate(gpu, &p->source[i], pl_tex_params(.w = w, .h = h,
                 .format = source_fmt, .sampleable = true, .host_writable = true)) ||
+             !pl_tex_upload(gpu, pl_tex_transfer_params(.tex = p->source[i],
+                .ptr = frame->data[comp->plane], .row_pitch = frame->linesize[comp->plane])))) ||
             !pl_tex_recreate(gpu, &p->middle[i], pl_tex_params(.w = w, .h = p->height,
                 .format = float_fmt, .sampleable = true, .renderable = true)) ||
             !pl_tex_recreate(gpu, &p->scaled[i], pl_tex_params(.w = p->width, .h = p->height,
-                .format = float_fmt, .sampleable = true, .renderable = true)) ||
-            !pl_tex_upload(gpu, pl_tex_transfer_params(.tex = p->source[i],
-                .ptr = frame->data[comp->plane], .row_pitch = frame->linesize[comp->plane]))) return 0;
+                .format = float_fmt, .sampleable = true, .renderable = true))) return 0;
         float cx = 0, cy = 0;
         if (c) pl_chroma_location_offset(pl_chroma_from_av(frame->chroma_location), &cx, &cy);
         const float lx = enhancement && frame->width < p->width ? -.5f : 0;
@@ -216,6 +331,20 @@ static int scale_layer(struct fel_gpu *p, const AVFrame *frame, int enhancement,
         if (enhancement) {
             if (!scale_residual(p, i, w, h, rx, ry, sx, sy,
                     av_dovi_get_mapping(metadata)->nlq[c].nlq_offset, frame->chroma_location)) return 0;
+            continue;
+        }
+        if (c == 0 && w == p->width && h == p->height) {
+            /* Luma BL à la définition de sortie : Spline16 en phase nulle = identité exacte. */
+            const struct pl_shader_desc source = {.desc = {.name = "fel_luma", .type = PL_DESC_SAMPLED_TEX},
+                                                  .binding = {.object = p->source[i]}};
+            pl_shader sh = pl_dispatch_begin(p->dispatch);
+            int ok = pl_shader_custom(sh, &(struct pl_custom_shader){
+                .body = "color = vec4(texelFetch(fel_luma, ivec2(gl_FragCoord.xy), 0).r*(65535.0/1023.0), 0.0, 0.0, 1.0);",
+                .input = PL_SHADER_SIG_NONE, .output = PL_SHADER_SIG_COLOR, .descriptors = &source,
+                .num_descriptors = 1, .output_w = p->width, .output_h = p->height});
+            ok = ok && pl_dispatch_finish(p->dispatch, pl_dispatch_params(.shader = &sh, .target = p->scaled[i]));
+            pl_dispatch_abort(p->dispatch, &sh);
+            if (!ok) return 0;
             continue;
         }
         pl_shader sh = pl_dispatch_begin(p->dispatch);

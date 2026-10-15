@@ -85,13 +85,21 @@ def main() -> None:
     prefix = build / "private"
     ffbuild = build / "ffmpeg"
     ffbuild.mkdir(exist_ok=True)
+    cflags = "-fvisibility=hidden"
+    hardware: list[str] = []
+    if args.gpu:
+        # Décodage Vulkan Video des couches BL/EL : en-têtes épinglés, chargeur Vulkan
+        # ouvert à l'exécution par FFmpeg (aucune dépendance de lien ajoutée).
+        headers = fetch("vulkan-headers", deps["vulkan_headers"], cache)
+        cflags += f" -I{headers / 'include'}"
+        hardware = ["--enable-vulkan", "--enable-hwaccel=hevc_vulkan"]
     configure = [str(ffmpeg / "configure"), f"--prefix={prefix}", "--disable-everything",
         "--disable-autodetect", "--disable-programs", "--disable-doc", "--disable-debug",
         "--disable-network", "--disable-avdevice", "--disable-avfilter", "--disable-swscale",
         "--disable-swresample", "--disable-shared", "--enable-static", "--enable-pic",
         "--enable-protocol=file", "--enable-demuxer=matroska,mov,mpegts,hevc", "--enable-muxer=nut",
         "--enable-decoder=hevc", "--enable-parser=hevc", "--enable-bsf=dovi_split,hevc_mp4toannexb",
-        "--enable-encoder=rawvideo", "--extra-cflags=-fvisibility=hidden"]
+        "--enable-encoder=rawvideo", *hardware, f"--extra-cflags={cflags}"]
     run([bash_executable(), *configure], ffbuild, env)
     run(["make", f"-j{max(1,args.jobs)}"], ffbuild, env)
     run(["make", "install"], ffbuild, env)

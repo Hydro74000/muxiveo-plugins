@@ -10,6 +10,7 @@
 #include <condition_variable>
 #include <functional>
 #include <iomanip>
+#include <map>
 #include <locale>
 #include <sstream>
 #include <cstring>
@@ -32,6 +33,7 @@ extern "C" {
 #include <libavcodec/avcodec.h>
 #include <libavcodec/bsf.h>
 #include <libavformat/avformat.h>
+#include <libavutil/hwcontext.h>
 #include <libavutil/imgutils.h>
 #include <libavutil/opt.h>
 // Préfixe stable de RpuDataHeader de la révision libdovi épinglée.
@@ -80,12 +82,23 @@ using Frame = std::unique_ptr<AVFrame, FrameFree>;
 using Packet = std::unique_ptr<AVPacket, PacketFree>;
 Frame frame() { Frame f(av_frame_alloc()); if (!f) throw std::bad_alloc(); return f; }
 Packet packet() { Packet p(av_packet_alloc()); if (!p) throw std::bad_alloc(); return p; }
+AVPixelFormat vulkan_format(AVCodecContext *, const AVPixelFormat *formats) {
+    for (; *formats != AV_PIX_FMT_NONE; ++formats)
+        if (*formats == AV_PIX_FMT_VULKAN) return *formats;
+    return AV_PIX_FMT_NONE;
+}
 struct Layer {
     AVBSFContext *split = nullptr;
     AVCodecContext *decoder = nullptr;
     std::deque<Frame> ready;
-    ~Layer() { av_bsf_free(&split); avcodec_free_context(&decoder); }
-    void init(AVStream *stream, const char *mode, int threads) {
+    Layer() = default;
+    Layer(const Layer &) = delete;
+    Layer &operator=(const Layer &) = delete;
+    ~Layer() { reset(); }
+    // Libère décodeur et images (références au périphérique Vulkan comprises).
+    void reset() { ready.clear(); av_bsf_free(&split); avcodec_free_context(&decoder); }
+    // hardware : périphérique Vulkan FFmpeg ; images décodées sur ce GPU (Vulkan Video).
+    void init(AVStream *stream, const char *mode, int threads, AVBufferRef *hardware = nullptr) {
         const auto *bsf = av_bsf_get_by_name("dovi_split");
         if (!bsf) throw Failure("FFmpeg privé sans dovi_split");
         check(av_bsf_alloc(bsf, &split), "Allocation séparateur");
@@ -101,6 +114,14 @@ struct Layer {
         decoder->thread_count = threads;
         decoder->err_recognition = AV_EF_EXPLODE;
         decoder->flags |= AV_CODEC_FLAG_COPY_OPAQUE;
+        if (hardware) {
+            decoder->hw_device_ctx = av_buffer_ref(hardware);
+            if (!decoder->hw_device_ctx) throw std::bad_alloc();
+            decoder->get_format = vulkan_format;
+            // Images en vol : files d'appariement, de rendu et anticipation.
+            decoder->extra_hw_frames = 16;
+            decoder->thread_count = 1;
+        }
         check(avcodec_open2(decoder, codec, nullptr), "Ouverture décodeur HEVC");
     }
     void receive() {
@@ -260,6 +281,10 @@ struct mvo_fel_context {
     void *gpu_prototype = nullptr;
     bool gpu_attempted = false;
 #endif
+    // Périphérique Vulkan FFmpeg partagé par les décodeurs et le rendu (Vulkan Video).
+    AVBufferRef *hw_device = nullptr;
+    bool hw_decode = false;
+    std::string decode_note;
     // emitted : images appariées (décodage) ; frames : images écrites ou rendues à l'appelant.
     int64_t frames = 0, emitted = 0, last_pts = AV_NOPTS_VALUE;
     bool output_closed = false, raw = false, started = false;
@@ -289,6 +314,8 @@ struct mvo_fel_context {
 #ifdef MVO_FEL_VULKAN_PROTOTYPE
         fel_gpu_destroy(gpu_prototype);
 #endif
+        bl.reset(); el.reset();
+        av_buffer_unref(&hw_device);
         avformat_close_input(&input);
         if (output) { output->pb = nullptr; avformat_free_context(output); }
         if (io) { av_freep(&io->buffer); avio_context_free(&io); }
@@ -340,10 +367,158 @@ struct mvo_fel_context {
         raw = std::string(input->iformat->name) == "hevc";
         if (fps.num <= 0 || fps.den <= 0) fps = av_guess_frame_rate(input, stream, nullptr);
         if (raw && (fps.num <= 0 || fps.den <= 0)) throw Failure("Cadence du flux brut inconnue");
-        // Décodeurs et reconstruction partagent le budget, jamais chacun le total.
-        bl.init(stream, "bl_rpu", std::max(1, threads/3));
-        el.init(stream, "el", std::max(1, threads/3));
         if (start_us > 0) seek();
+#ifdef MVO_FEL_VULKAN_PROTOTYPE
+        if (!pulling && device != "cpu") prepare_gpu();
+#endif
+        if (hw_device && !hw_decode) {
+            // Même GPU, même source, même piste : résultat réutilisé (passes, captures d'aperçu).
+            static std::mutex cache_mutex;
+            static std::map<std::string, std::pair<bool, std::string>> cache;
+            // GPU désigné par UUID uniquement : « auto » peut changer de carte d'un appel à l'autre.
+            const std::string key = device + "|" + source + "|" + std::to_string(stream_index);
+            const bool cacheable = device.size() == 32;
+            if (cacheable) {
+                std::lock_guard lock(cache_mutex);
+                const auto found = cache.find(key);
+                if (found != cache.end()) std::tie(hw_decode, decode_note) = found->second;
+            }
+            if (decode_note.empty()) {
+                hw_decode = verify_hw_decode();
+                if (cacheable) {
+                    std::lock_guard lock(cache_mutex);
+                    cache[key] = {hw_decode, decode_note};
+                }
+            }
+            backend += (backend.empty() ? "" : ", ") + decode_note;
+        }
+        // Décodeurs et reconstruction partagent le budget, jamais chacun le total.
+        bl.init(stream, "bl_rpu", std::max(1, threads/3), hw_decode ? hw_device : nullptr);
+        el.init(stream, "el", std::max(1, threads/3), hw_decode ? hw_device : nullptr);
+    }
+#ifdef MVO_FEL_VULKAN_PROTOTYPE
+    // UUID du premier GPU dédié énuméré (sinon le premier) pour le choix automatique.
+    static std::string automatic_uuid() {
+        std::vector<char> json(mvo_fel_devices(nullptr, 0) + 1);
+        if (json.size() < 3 || !mvo_fel_devices(json.data(), json.size())) return "";
+        const std::string text(json.data());
+        std::string first;
+        for (size_t at = text.find("{\"uuid\":\""); at != std::string::npos; at = text.find("{\"uuid\":\"", at + 1)) {
+            const std::string uuid = text.substr(at + 9, 32);
+            const size_t end = text.find('}', at);
+            if (first.empty()) first = uuid;
+            if (text.substr(at, end - at).find("\"kind\":\"discrete\"") != std::string::npos) return uuid;
+        }
+        return first;
+    }
+    // Rendu sur le périphérique Vulkan de FFmpeg (décodage Vulkan Video possible) ;
+    // à défaut, renderer libplacebo autonome et décodage CPU, comme en 0.1.0.
+    void prepare_gpu() {
+        gpu_attempted = true;
+        const int w = stream->codecpar->width, h = stream->codecpar->height;
+        const std::string uuid = device == "auto" ? automatic_uuid() : device;
+        if (uuid.size() == 32) {
+            const std::string dashed = uuid.substr(0, 8) + "-" + uuid.substr(8, 4) + "-" + uuid.substr(12, 4) + "-" +
+                                       uuid.substr(16, 4) + "-" + uuid.substr(20);
+            if (av_hwdevice_ctx_create(&hw_device, AV_HWDEVICE_TYPE_VULKAN, dashed.c_str(), nullptr, 0) >= 0) {
+                gpu_prototype = fel_gpu_import(hw_device->data, w, h);
+                if (!gpu_prototype) av_buffer_unref(&hw_device);
+            }
+        }
+        if (!gpu_prototype) gpu_prototype = fel_gpu_create(w, h, uuid.size() == 32 ? uuid.c_str() : device.c_str());
+        if (!gpu_prototype && device != "auto") throw Failure("Initialisation du GPU FEL sélectionné impossible");
+        if (gpu_prototype) {
+            char name[256];
+            fel_gpu_device_name(gpu_prototype, name, sizeof(name));
+            backend = std::string("vulkan: ") + name;
+        }
+    }
+#endif
+    // Contrôle du décodage Vulkan Video sur les premières images (même départ) : codes BL/EL
+    // et RPU identiques au décodage logiciel, sinon décodage CPU pour tout le job.
+    bool verify_hw_decode() {
+        constexpr int needed = 16;
+        AVFormatContext *probe = avformat_alloc_context();
+        if (!probe) throw std::bad_alloc();
+        probe->interrupt_callback = {interrupt, this};
+        struct Close { AVFormatContext *&p; ~Close() { avformat_close_input(&p); } } close{probe};
+        if (avformat_open_input(&probe, source.c_str(), nullptr, nullptr) < 0) return false;
+        for (unsigned i = 0; i < probe->nb_streams; ++i)
+            if (static_cast<int>(i) != stream_index) probe->streams[i]->discard = AVDISCARD_ALL;
+        if (avformat_find_stream_info(probe, nullptr) < 0) return false;
+        AVStream *track = probe->streams[stream_index];
+        if (target != AV_NOPTS_VALUE) av_seek_frame(probe, stream_index, target, AVSEEK_FLAG_BACKWARD);
+        std::array<Layer, 4> layers; // BL logiciel, BL Vulkan, EL logiciel, EL Vulkan
+        int compared[2] = {0, 0};
+        bool same = true, available = true;
+        try {
+            layers[0].init(track, "bl_rpu", std::max(1, threads/3));
+            layers[1].init(track, "bl_rpu", 1, hw_device);
+            layers[2].init(track, "el", std::max(1, threads/3));
+            layers[3].init(track, "el", 1, hw_device);
+            auto p = packet();
+            auto drain = [&] {
+                for (int layer = 0; layer < 2 && same; ++layer) {
+                    auto &sw = layers[2*layer], &hw = layers[2*layer + 1];
+                    while (same && !sw.ready.empty() && !hw.ready.empty()) {
+                        same = same_frame(*sw.ready.front(), *hw.ready.front(), layer == 0);
+                        sw.ready.pop_front(); hw.ready.pop_front();
+                        ++compared[layer];
+                    }
+                }
+            };
+            bool eof = false;
+            while (same && (compared[0] < needed || compared[1] < needed) && !eof) {
+                check_cancelled();
+                const int ret = av_read_frame(probe, p.get());
+                if (ret == AVERROR_EOF) {
+                    for (auto &layer : layers) layer.send(nullptr);
+                    eof = true;
+                } else if (ret < 0) {
+                    return false;
+                } else if (p->stream_index == stream_index) {
+                    for (auto &layer : layers) layer.send(p.get());
+                }
+                av_packet_unref(p.get());
+                drain();
+            }
+        } catch (const Failure &failure) {
+            if (failure.status == MVO_FEL_CANCELLED) throw;
+            // Profil ou extension non pris en charge par le pilote : aucune image comparée.
+            same = false;
+            available = compared[0] > 0;
+        }
+        const bool ok = same && compared[0] > 0 && compared[0] == compared[1];
+        decode_note = ok ? "décodage Vulkan Video vérifié (" + std::to_string(compared[0]) + " images)"
+                    : available && compared[0] > 0 ? "décodage CPU (Vulkan Video différent du logiciel)"
+                    : "décodage CPU (Vulkan Video indisponible)";
+        return ok;
+    }
+    // Codes 10 bits identiques (P010 en poids fort face à yuv420p10le) et, pour le BL, même RPU.
+    static bool same_frame(const AVFrame &sw, const AVFrame &hw, bool base) {
+        if (sw.format != AV_PIX_FMT_YUV420P10LE || hw.format != AV_PIX_FMT_VULKAN ||
+            sw.width != hw.width || sw.height != hw.height || sw.pts != hw.pts) return false;
+        if (base) {
+            const auto *a = av_frame_get_side_data(&sw, AV_FRAME_DATA_DOVI_RPU_BUFFER);
+            const auto *b = av_frame_get_side_data(&hw, AV_FRAME_DATA_DOVI_RPU_BUFFER);
+            if (!a || !b || a->size != b->size || std::memcmp(a->data, b->data, a->size) ||
+                !av_frame_get_side_data(&hw, AV_FRAME_DATA_DOVI_METADATA)) return false;
+        }
+        Frame host = frame();
+        if (av_hwframe_transfer_data(host.get(), &hw, 0) < 0 || host->format != AV_PIX_FMT_P010LE) return false;
+        for (int y = 0; y < sw.height; ++y) {
+            const auto *a = reinterpret_cast<const uint16_t *>(sw.data[0] + y*sw.linesize[0]);
+            const auto *b = reinterpret_cast<const uint16_t *>(host->data[0] + y*host->linesize[0]);
+            for (int x = 0; x < sw.width; ++x) if (b[x] != a[x] << 6) return false;
+        }
+        for (int y = 0; y < (sw.height + 1)/2; ++y) {
+            const auto *u = reinterpret_cast<const uint16_t *>(sw.data[1] + y*sw.linesize[1]);
+            const auto *v = reinterpret_cast<const uint16_t *>(sw.data[2] + y*sw.linesize[2]);
+            const auto *b = reinterpret_cast<const uint16_t *>(host->data[1] + y*host->linesize[1]);
+            for (int x = 0; x < (sw.width + 1)/2; ++x)
+                if (b[2*x] != u[x] << 6 || b[2*x + 1] != v[x] << 6) return false;
+        }
+        return true;
     }
     void seek() {
         if (raw) {
@@ -515,16 +690,6 @@ struct mvo_fel_context {
         {
             Timer pixels(timing[4]);
 #ifdef MVO_FEL_VULKAN_PROTOTYPE
-            if (!gpu_attempted && device != "cpu") {
-                gpu_attempted = true;
-                gpu_prototype = fel_gpu_create(width, height, device.c_str());
-                if (!gpu_prototype && device != "auto") throw Failure("Initialisation du GPU FEL sélectionné impossible");
-                if (gpu_prototype) {
-                    char name[256];
-                    fel_gpu_device_name(gpu_prototype, name, sizeof(name));
-                    backend = std::string("vulkan: ")+name;
-                }
-            }
             if (gpu_prototype) {
                 const bool ok = yuv
                     ? fel_gpu_render_yuv(gpu_prototype, job.metadata, job.base.get(), job.enhancement.get(),
@@ -534,6 +699,7 @@ struct mvo_fel_context {
             } else
 #endif
             {
+                if (job.base->format == AV_PIX_FMT_VULKAN) throw Failure("Image Vulkan sans rendu GPU");
                 if (!rows) rows = std::make_unique<RowPool>(std::max(1, threads - 2*std::max(1, threads/3)));
                 // Y'CbCr : reconstruction RGB 16 bits intermédiaire, puis conversion par lignes chroma.
                 AVFrame *target = rgb.get();
@@ -736,6 +902,14 @@ int mvo_fel_set_output(mvo_fel_context *p, const char *format, const char *chrom
     if (value < 0 || location < 0 || mode < 0) return -1;
     p->output_format.format = value; p->output_format.chroma = location; p->output_format.dither = mode;
     return 0;
+}
+int mvo_fel_set_decoder_device(mvo_fel_context *p, const void *device) {
+    const auto *reference = static_cast<const AVBufferRef *>(device);
+    if (!p || p->started || !reference || !reference->data ||
+        reinterpret_cast<const AVHWDeviceContext *>(reference->data)->type != AV_HWDEVICE_TYPE_VULKAN) return -1;
+    av_buffer_unref(&p->hw_device);
+    p->hw_device = av_buffer_ref(const_cast<AVBufferRef *>(reference));
+    return p->hw_device ? 0 : -1;
 }
 int mvo_fel_set_crop(mvo_fel_context *p, int left, int top, int right, int bottom) {
     if (!p || p->started || left < 0 || top < 0 || right < 0 || bottom < 0 ||

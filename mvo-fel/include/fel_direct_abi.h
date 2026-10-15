@@ -10,6 +10,10 @@ extern "C" {
 typedef int (*mvo_fel_layers)(void *, const void *bl, const void *el,
     const void *metadata, int64_t pts, int64_t duration, int tb_num, int tb_den);
 MVO_FEL_EXPORT unsigned mvo_fel_libavutil_version(void);
+/* Avant le premier mvo_fel_next_layers : AVBufferRef d'un AVHWDeviceContext Vulkan de la
+ * même révision FFmpeg (celui du renderer). Les couches sont alors décodées sur ce GPU
+ * (Vulkan Video), après contrôle des premières images face au décodage logiciel. */
+MVO_FEL_EXPORT int mvo_fel_set_decoder_device(mvo_fel_context *, const void *device_reference);
 /* Retour 0 : une image ; 5 : EOF ; autres : mvo_fel_status. */
 MVO_FEL_EXPORT int mvo_fel_next_layers(mvo_fel_context *, mvo_fel_layers, void *);
 /* Le contexte AVHWDeviceContext Vulkan est détenu par l'appelant. */
