@@ -6,15 +6,18 @@
 #include <atomic>
 #include <array>
 #include <chrono>
+#include <condition_variable>
+#include <functional>
 #include <iomanip>
 #include <locale>
 #include <sstream>
 #include <cstring>
 #include <deque>
-#include <future>
 #include <memory>
+#include <mutex>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 #ifdef _WIN32
 #include <windows.h>
@@ -126,6 +129,107 @@ struct Layer {
         if (!input) { check(avcodec_send_packet(decoder, nullptr), "Vidange HEVC"); receive(); }
     }
 };
+// Interruption d'un étage par l'aval (file abandonnée) : pas une erreur en soi.
+struct Stopped {};
+// File bornée, un producteur et un consommateur ; l'annulation interrompt les attentes.
+template <typename T> class Channel {
+    std::mutex mutex;
+    std::condition_variable changed;
+    std::deque<T> items;
+    size_t capacity;
+    bool closed = false, aborted = false;
+    static void wait(std::unique_lock<std::mutex> &lock, std::condition_variable &cv, double &waited) {
+        const auto start = Clock::now();
+        cv.wait_for(lock, std::chrono::milliseconds(50));
+        waited += std::chrono::duration<double>(Clock::now()-start).count();
+    }
+public:
+    explicit Channel(size_t size) : capacity(size) {}
+    bool push(T value, const std::atomic<bool> &cancelled, double &waited) {
+        std::unique_lock lock(mutex);
+        while (!aborted && items.size() >= capacity && !cancelled.load()) wait(lock, changed, waited);
+        if (aborted || cancelled.load()) return false;
+        items.push_back(std::move(value));
+        changed.notify_all();
+        return true;
+    }
+    // Fin normale : les éléments restants sont rendus avant false.
+    bool pop(T &value, const std::atomic<bool> &cancelled, double &waited) {
+        std::unique_lock lock(mutex);
+        while (!aborted && items.empty() && !closed && !cancelled.load()) wait(lock, changed, waited);
+        if (aborted || cancelled.load() || items.empty()) return false;
+        value = std::move(items.front());
+        items.pop_front();
+        changed.notify_all();
+        return true;
+    }
+    void close() { std::lock_guard lock(mutex); closed = true; changed.notify_all(); }
+    void abort() { std::lock_guard lock(mutex); aborted = true; items.clear(); changed.notify_all(); }
+};
+// Threads persistants de la reconstruction CPU, par blocs de lignes.
+class RowPool {
+    std::vector<std::thread> workers;
+    std::mutex mutex;
+    std::condition_variable work, done;
+    std::function<void(int)> task;
+    int next = 0, rows = 0, active = 0;
+    uint64_t generation = 0;
+    bool stop = false;
+    std::exception_ptr failure;
+    void loop() {
+        uint64_t seen = 0;
+        for (;;) {
+            {
+                std::unique_lock lock(mutex);
+                work.wait(lock, [&] { return stop || generation != seen; });
+                if (stop) return;
+                seen = generation;
+            }
+            for (;;) {
+                int row;
+                {
+                    std::lock_guard lock(mutex);
+                    if (failure || next >= rows) break;
+                    row = next++;
+                }
+                try { task(row); }
+                catch (...) { std::lock_guard lock(mutex); if (!failure) failure = std::current_exception(); }
+            }
+            std::lock_guard lock(mutex);
+            if (--active == 0) done.notify_all();
+        }
+    }
+public:
+    explicit RowPool(int count) {
+        for (int i = 0; i < std::max(1, count); ++i) workers.emplace_back([this] { loop(); });
+    }
+    ~RowPool() {
+        { std::lock_guard lock(mutex); stop = true; }
+        work.notify_all();
+        for (auto &worker : workers) worker.join();
+    }
+    void run(int count, std::function<void(int)> function) {
+        std::unique_lock lock(mutex);
+        task = std::move(function); rows = count; next = 0; failure = nullptr;
+        active = static_cast<int>(workers.size()); ++generation;
+        work.notify_all();
+        done.wait(lock, [&] { return active == 0; });
+        if (failure) std::rethrow_exception(failure);
+    }
+};
+// Image appariée et validée, prête pour la reconstruction ; possède BL et EL.
+struct Job {
+    Frame base, enhancement;
+    const AVDOVIMetadata *metadata;
+    muxiveo::fel::Mapping mapping;
+    int64_t pts, duration;
+    AVRational timebase;
+};
+struct Rendered {
+    Packet packet;
+    int width, height;
+    AVRational timebase;
+};
 }
 
 struct mvo_fel_context {
@@ -142,29 +246,43 @@ struct mvo_fel_context {
     AVStream *stream = nullptr, *out_stream = nullptr;
     Layer bl, el;
     Frame rgb;
+    AVBufferPool *pool = nullptr;
+    int width = 0, height = 0, packet_size = 0;
+    std::unique_ptr<RowPool> rows;
 #ifdef MVO_FEL_VULKAN_PROTOTYPE
     void *gpu_prototype = nullptr;
     bool gpu_attempted = false;
 #endif
-    int64_t frames = 0, last_pts = AV_NOPTS_VALUE;
+    // emitted : images appariées (décodage) ; frames : images écrites ou rendues à l'appelant.
+    int64_t frames = 0, emitted = 0, last_pts = AV_NOPTS_VALUE;
     bool output_closed = false, raw = false, started = false;
     std::array<double,7> timing{}; // ouverture, lecture, BL, EL, pixels, NUT, pipe.
+    // Attentes des files : décodage bloqué, rendu affamé, rendu bloqué, écriture affamée.
+    std::array<double,4> waits{};
     Clock::time_point began{}, ended{};
     std::string statistics;
     mvo_fel_layers layers = nullptr;
-    bool pulling = false, drained = false;
+    bool pulling = false;
     // Seek : cible en base de temps de la piste, ou nombre d'images ignorées (HEVC brut).
     int64_t start_us = 0, target = AV_NOPTS_VALUE, skip = 0, skipped = 0;
+    // Mode pull : décodage anticipé sur un thread, une image rendue par appel.
+    std::unique_ptr<Channel<std::unique_ptr<Job>>> prefetched;
+    std::thread prefetcher;
+    std::mutex failure_mutex;
+    std::exception_ptr prefetch_failure;
 
     mvo_fel_context(const char *path, int index, int count, AVRational rate)
         : source(path), stream_index(index), threads(std::clamp(count, 1, 16)), fps(rate) {}
     ~mvo_fel_context() {
+        stop_prefetch();
+        rows.reset();
 #ifdef MVO_FEL_VULKAN_PROTOTYPE
         fel_gpu_destroy(gpu_prototype);
 #endif
         avformat_close_input(&input);
         if (output) { output->pb = nullptr; avformat_free_context(output); }
         if (io) { av_freep(&io->buffer); avio_context_free(&io); }
+        av_buffer_pool_uninit(&pool);
     }
     void check_cancelled() {
         if (cancelled.load()) throw Failure("Reconstruction annulée", MVO_FEL_CANCELLED);
@@ -227,8 +345,7 @@ struct mvo_fel_context {
         const int64_t origin = input->start_time != AV_NOPTS_VALUE ? input->start_time : 0;
         target = av_rescale_q(origin + start_us, AV_TIME_BASE_Q, stream->time_base);
         // Image clé antérieure ; un échec garde la lecture depuis le début (même résultat).
-        if (av_seek_frame(input, stream_index, target, AVSEEK_FLAG_BACKWARD) < 0)
-            av_log(nullptr, AV_LOG_DEBUG, "mvo-fel : seek impossible, lecture depuis le début\n");
+        av_seek_frame(input, stream_index, target, AVSEEK_FLAG_BACKWARD);
     }
     // Images antérieures à la cible, dont les RASL/RADL d'un GOP ouvert : leurs PTS
     // précèdent l'image clé atteinte. Chaque couche les écarte avant l'appariement.
@@ -240,12 +357,10 @@ struct mvo_fel_context {
         }
     }
     int64_t output_pts(const AVFrame &base) const {
-        if (raw) return frames;
+        if (raw) return emitted;
         return target == AV_NOPTS_VALUE ? base.pts : base.pts - target;
     }
-    void open_output(const AVFrame &base) {
-        if (base.width <= 0 || base.height <= 0 || base.width > 8192 || base.height > 8192)
-            throw Failure("Dimensions source invalides");
+    void open_output(int w, int h) {
         check(avformat_alloc_output_context2(&output, nullptr, "nut", nullptr), "Création NUT");
         auto *buffer = static_cast<uint8_t *>(av_malloc(65536));
         if (!buffer) throw std::bad_alloc();
@@ -265,7 +380,7 @@ struct mvo_fel_context {
         p->codec_id = AV_CODEC_ID_RAWVIDEO;
         p->format = AV_PIX_FMT_GBRP16LE;
         p->codec_tag = avcodec_pix_fmt_to_codec_tag(AV_PIX_FMT_GBRP16LE);
-        p->width = base.width; p->height = base.height;
+        p->width = w; p->height = h;
         p->color_range = AVCOL_RANGE_JPEG;
         p->color_primaries = AVCOL_PRI_BT2020;
         p->color_trc = AVCOL_TRC_SMPTE2084;
@@ -276,11 +391,11 @@ struct mvo_fel_context {
         av_dict_set(&out_stream->metadata, "color_space", "gbr", 0);
         av_dict_set(&out_stream->metadata, "color_range", "pc", 0);
         check(avformat_write_header(output, nullptr), "En-tête NUT");
-        rgb = frame();
-        rgb->format = AV_PIX_FMT_GBRP16LE; rgb->width = base.width; rgb->height = base.height;
     }
     std::string device = "auto", backend = "cpu";
-    void pair() {
+    using Emit = std::function<bool(std::unique_ptr<Job>)>;
+    // Apparie BL/EL/RPU dans l'ordre de présentation ; false si emit demande l'arrêt.
+    bool pair(const Emit &emit) {
         drop_leading(bl); drop_leading(el);
         while (!bl.ready.empty() && !el.ready.empty()) {
             check_cancelled();
@@ -298,89 +413,33 @@ struct mvo_fel_context {
             if (!original) throw Failure("RPU original absent de l'image BL");
             const int kind = mvo_fel_classify(original->data, original->size);
             if (kind != 1 && kind != 3) throw Failure("RPU original invalide ou sans FEL pendant le décodage");
-            const muxiveo::fel::Mapping mapping(*reinterpret_cast<const AVDOVIMetadata *>(sd->data));
+            const auto *metadata = reinterpret_cast<const AVDOVIMetadata *>(sd->data);
+            muxiveo::fel::Mapping mapping(*metadata);
             if (!mapping.residual) throw Failure("Résiduel désactivé pendant la reconstruction FEL");
             if (skipped < skip) { ++skipped; continue; }
-            if (layers) {
-                if(base->width<=0 || base->height<=0 || base->width>8192 || base->height>8192)
-                    throw Failure("Dimensions source invalides");
-                const auto timebase=raw ? av_inv_q(fps) : stream->time_base;
-                const auto pts=output_pts(*base);
-                if(last_pts!=AV_NOPTS_VALUE && pts<=last_pts)
-                    throw Failure("Horodatages de présentation non croissants");
-                last_pts=pts;
-                if(layers(opaque,base.get(),enhancement.get(),sd->data,pts,
-                          raw ? 1 : base->duration,timebase.num,timebase.den))
-                    throw Failure("Consommateur de couches FEL arrêté",MVO_FEL_OUTPUT_CLOSED);
-                ++frames;
-                return;
-            }
-            if (!output) open_output(*base);
-            if (base->width != rgb->width || base->height != rgb->height)
-                throw Failure("Changement de dimensions pendant la reconstruction");
-            auto p = packet();
-            const int size = av_image_get_buffer_size(AV_PIX_FMT_GBRP16LE, rgb->width, rgb->height, 1);
-            check(size, "Taille image"); check(av_new_packet(p.get(), size), "Allocation paquet RGB");
-            check(av_image_fill_arrays(rgb->data, rgb->linesize, p->data,
-                AV_PIX_FMT_GBRP16LE, rgb->width, rgb->height, 1), "Plans du paquet RGB");
-            {
-            Timer pixels(timing[4]);
-#ifdef MVO_FEL_VULKAN_PROTOTYPE
-            if (!gpu_attempted && device != "cpu") {
-                gpu_attempted = true;
-                gpu_prototype = fel_gpu_create(base->width, base->height, device.c_str());
-                if (!gpu_prototype && device != "auto") throw Failure("Initialisation du GPU FEL sélectionné impossible");
-                if (gpu_prototype) {
-                    char name[256];
-                    fel_gpu_device_name(gpu_prototype, name, sizeof(name));
-                    backend = std::string("vulkan: ")+name;
-                }
-            }
-            if (gpu_prototype) {
-            if (!fel_gpu_render_planar(gpu_prototype,
-                    reinterpret_cast<const AVDOVIMetadata *>(sd->data),
-                    base.get(), enhancement.get(), rgb.get()))
-                throw Failure("Échec de reconstruction du prototype Vulkan");
-            } else
-#endif
-            {
-            const int count = std::max(1, threads - 2*std::max(1, threads/3));
-            const muxiveo::fel::FrameSampler bs(*base, base->width, base->height, false);
-            const muxiveo::fel::FrameSampler es(*enhancement, base->width, base->height, true);
-            std::vector<std::future<void>> workers;
-            for (int i = 0; i < count; ++i) workers.push_back(std::async(std::launch::async, [&, i] {
-                for (int y = i*base->height/count; y < (i+1)*base->height/count; ++y) {
-                    check_cancelled();
-                    muxiveo::fel::reconstruct_rows(bs, es, mapping, *rgb, y, y+1);
-                }
-            }));
-            for (auto &worker : workers) worker.get();
-            }
-            }
-            Timer nut(timing[5]);
-            const AVRational timebase = raw ? av_inv_q(fps) : stream->time_base;
-            p->pts = p->dts = av_rescale_q(output_pts(*base), timebase, out_stream->time_base);
-            if (last_pts != AV_NOPTS_VALUE && p->pts <= last_pts)
+            if (base->width <= 0 || base->height <= 0 || base->width > 8192 || base->height > 8192)
+                throw Failure("Dimensions source invalides");
+            const auto timebase = raw ? av_inv_q(fps) : stream->time_base;
+            const auto pts = output_pts(*base);
+            if (last_pts != AV_NOPTS_VALUE && pts <= last_pts)
                 throw Failure("Horodatages de présentation non croissants");
-            last_pts = p->pts;
-            p->duration = av_rescale_q(raw ? 1 : base->duration, timebase, out_stream->time_base);
-            p->stream_index = 0; p->flags |= AV_PKT_FLAG_KEY;
-            check(av_interleaved_write_frame(output, p.get()), "Écriture NUT");
-            ++frames;
-            if (progress) progress(opaque, frames);
+            last_pts = pts;
+            const int64_t duration = raw ? 1 : base->duration;
+            ++emitted;
+            if (!emit(std::unique_ptr<Job>(new Job{std::move(base), std::move(enhancement), metadata,
+                                                    std::move(mapping), pts, duration, timebase})))
+                return false;
         }
+        return true;
     }
-    void run() {
-        if (started) throw Failure("Contexte déjà exécuté");
-        started = true;
-        began = Clock::now();
-        { Timer timer(timing[0]); open(); }
+    // Lecture, décodage BL/EL et appariement jusqu'à la fin du flux.
+    void decode_all(const Emit &emit) {
         auto p = packet();
         int64_t identity = 0;
         for (;;) {
             check_cancelled();
             int ret;
-            { Timer timer(timing[1]); ret=av_read_frame(input,p.get()); }
+            { Timer timer(timing[1]); ret = av_read_frame(input, p.get()); }
             if (ret == AVERROR_EOF) break;
             check(ret, "Lecture source", MVO_FEL_INPUT_ERROR);
             if (p->stream_index == stream_index) {
@@ -390,54 +449,170 @@ struct mvo_fel_context {
                 std::memcpy(p->opaque_ref->data, &identity, sizeof(identity)); ++identity;
                 { Timer timer(timing[2]); bl.send(p.get()); }
                 { Timer timer(timing[3]); el.send(p.get()); }
-                pair();
+                if (!pair(emit)) return;
             }
             av_packet_unref(p.get());
         }
         { Timer timer(timing[2]); bl.send(nullptr); }
         { Timer timer(timing[3]); el.send(nullptr); }
-        pair();
+        if (!pair(emit)) return;
         if (!bl.ready.empty() || !el.ready.empty()) throw Failure("Fin de flux BL/EL désalignée");
+    }
+    // Reconstruction d'une image dans un paquet du pool (thread de rendu uniquement).
+    std::unique_ptr<Rendered> render(Job &job) {
+        check_cancelled();
+        const AVFrame &base = *job.base;
+        if (!width) {
+            width = base.width; height = base.height;
+            packet_size = av_image_get_buffer_size(AV_PIX_FMT_GBRP16LE, width, height, 1);
+            check(packet_size, "Taille image");
+            // Tampons réutilisés : ni allocation ni défauts de page de 49,8 Mo par image UHD.
+            pool = av_buffer_pool_init(static_cast<size_t>(packet_size), nullptr);
+            if (!pool) throw std::bad_alloc();
+            rgb = frame();
+            rgb->format = AV_PIX_FMT_GBRP16LE; rgb->width = width; rgb->height = height;
+        }
+        if (base.width != width || base.height != height)
+            throw Failure("Changement de dimensions pendant la reconstruction");
+        auto out = std::unique_ptr<Rendered>(new Rendered{packet(), width, height, job.timebase});
+        out->packet->buf = av_buffer_pool_get(pool);
+        if (!out->packet->buf) throw std::bad_alloc();
+        out->packet->data = out->packet->buf->data;
+        out->packet->size = packet_size;
+        check(av_image_fill_arrays(rgb->data, rgb->linesize, out->packet->data,
+            AV_PIX_FMT_GBRP16LE, width, height, 1), "Plans du paquet RGB");
+        {
+            Timer pixels(timing[4]);
+#ifdef MVO_FEL_VULKAN_PROTOTYPE
+            if (!gpu_attempted && device != "cpu") {
+                gpu_attempted = true;
+                gpu_prototype = fel_gpu_create(width, height, device.c_str());
+                if (!gpu_prototype && device != "auto") throw Failure("Initialisation du GPU FEL sélectionné impossible");
+                if (gpu_prototype) {
+                    char name[256];
+                    fel_gpu_device_name(gpu_prototype, name, sizeof(name));
+                    backend = std::string("vulkan: ")+name;
+                }
+            }
+            if (gpu_prototype) {
+                if (!fel_gpu_render_planar(gpu_prototype, job.metadata, job.base.get(), job.enhancement.get(), rgb.get()))
+                    throw Failure("Échec de reconstruction du prototype Vulkan");
+            } else
+#endif
+            {
+                if (!rows) rows = std::make_unique<RowPool>(std::max(1, threads - 2*std::max(1, threads/3)));
+                const muxiveo::fel::FrameSampler bs(base, width, height, false);
+                const muxiveo::fel::FrameSampler es(*job.enhancement, width, height, true);
+                constexpr int block = 8;
+                rows->run((height + block - 1) / block, [&](int index) {
+                    check_cancelled();
+                    muxiveo::fel::reconstruct_rows(bs, es, job.mapping, *rgb, index*block,
+                                                   std::min(height, (index+1)*block));
+                });
+            }
+        }
+        auto &p = *out->packet;
+        p.pts = p.dts = job.pts;
+        p.duration = job.duration;
+        p.stream_index = 0; p.flags |= AV_PKT_FLAG_KEY;
+        return out;
+    }
+    void write_rendered(Rendered &item) {
+        if (!output) open_output(item.width, item.height);
+        Timer nut(timing[5]);
+        av_packet_rescale_ts(item.packet.get(), item.timebase, out_stream->time_base);
+        check(av_interleaved_write_frame(output, item.packet.get()), "Écriture NUT");
+        ++frames;
+        if (progress) progress(opaque, frames);
+    }
+    // Trois étages bornés : décodage/appariement, rendu, écriture sur le thread appelant
+    // (contrat ABI des callbacks). Une erreur ou l'annulation abandonne les files.
+    void run() {
+        if (started) throw Failure("Contexte déjà exécuté");
+        started = true;
+        began = Clock::now();
+        { Timer timer(timing[0]); open(); }
+        Channel<std::unique_ptr<Job>> jobs(3);
+        Channel<std::unique_ptr<Rendered>> rendered(2);
+        std::exception_ptr failure;
+        auto fail = [&] {
+            { std::lock_guard lock(failure_mutex); if (!failure) failure = std::current_exception(); }
+            jobs.abort(); rendered.abort();
+        };
+        std::thread decoder([&] {
+            try {
+                decode_all([&](std::unique_ptr<Job> job) {
+                    if (!jobs.push(std::move(job), cancelled, waits[0])) throw Stopped{};
+                    return true;
+                });
+                jobs.close();
+            } catch (const Stopped &) {
+            } catch (...) { fail(); }
+        });
+        std::thread renderer([&] {
+            try {
+                std::unique_ptr<Job> job;
+                while (jobs.pop(job, cancelled, waits[1])) {
+                    auto out = render(*job);
+                    job.reset();
+                    if (!rendered.push(std::move(out), cancelled, waits[2])) return;
+                }
+                rendered.close();
+            } catch (...) { fail(); }
+        });
+        try {
+            std::unique_ptr<Rendered> item;
+            while (rendered.pop(item, cancelled, waits[3])) write_rendered(*item);
+        } catch (...) { fail(); }
+        decoder.join();
+        renderer.join();
+        rows.reset();
+        if (failure) std::rethrow_exception(failure);
+        check_cancelled();
         if (!frames) throw Failure("Aucune image FEL reconstruite");
         check(av_write_trailer(output), "Fin NUT");
         avio_flush(io); check(io->error, "Vidange NUT");
     }
+    void stop_prefetch() {
+        if (!prefetcher.joinable()) return;
+        prefetched->abort();
+        prefetcher.join();
+    }
     int next() {
-        if(!started) { started=true; pulling=true; began=Clock::now(); Timer timer(timing[0]); open(); }
-        if(!pulling)throw Failure("Contexte NUT déjà exécuté");
-        const auto before=frames;
-        pair();
-        if(frames!=before)return MVO_FEL_OK;
-        auto p=packet();
-        while(!drained) {
-            check_cancelled();
-            int ret;
-            {Timer timer(timing[1]);ret=av_read_frame(input,p.get());}
-            if(ret==AVERROR_EOF) {
-                {Timer timer(timing[2]);bl.send(nullptr);}
-                {Timer timer(timing[3]);el.send(nullptr);}
-                drained=true;
-            } else {
-                check(ret,"Lecture source",MVO_FEL_INPUT_ERROR);
-                if(p->stream_index==stream_index) {
-                    av_buffer_unref(&p->opaque_ref);
-                    p->opaque_ref=av_buffer_alloc(sizeof(int64_t));
-                    if(!p->opaque_ref)throw std::bad_alloc();
-                    const auto identity=input_identity++;
-                    std::memcpy(p->opaque_ref->data,&identity,sizeof(identity));
-                    {Timer timer(timing[2]);bl.send(p.get());}
-                    {Timer timer(timing[3]);el.send(p.get());}
+        if (!started) {
+            started = true; pulling = true; began = Clock::now();
+            { Timer timer(timing[0]); open(); }
+            // Décodage de l'image suivante pendant le rendu de la précédente par l'appelant.
+            prefetched = std::make_unique<Channel<std::unique_ptr<Job>>>(3);
+            prefetcher = std::thread([this] {
+                try {
+                    decode_all([this](std::unique_ptr<Job> job) {
+                        if (!prefetched->push(std::move(job), cancelled, waits[0])) throw Stopped{};
+                        return true;
+                    });
+                    prefetched->close();
+                } catch (const Stopped &) {
+                } catch (...) {
+                    { std::lock_guard lock(failure_mutex); prefetch_failure = std::current_exception(); }
+                    prefetched->abort();
                 }
-                av_packet_unref(p.get());
-            }
-            pair();
-            if(frames!=before)return MVO_FEL_OK;
+            });
         }
-        if(!bl.ready.empty() || !el.ready.empty())throw Failure("Fin de flux BL/EL désalignée");
-        if(!frames)throw Failure("Aucune image FEL reconstruite");
+        if (!pulling) throw Failure("Contexte NUT déjà exécuté");
+        std::unique_ptr<Job> job;
+        if (prefetched->pop(job, cancelled, waits[3])) {
+            if (layers(opaque, job->base.get(), job->enhancement.get(), job->metadata, job->pts,
+                       job->duration, job->timebase.num, job->timebase.den))
+                throw Failure("Consommateur de couches FEL arrêté", MVO_FEL_OUTPUT_CLOSED);
+            ++frames;
+            return MVO_FEL_OK;
+        }
+        if (prefetcher.joinable()) prefetcher.join();
+        { std::lock_guard lock(failure_mutex); if (prefetch_failure) std::rethrow_exception(prefetch_failure); }
+        check_cancelled();
+        if (!frames) throw Failure("Aucune image FEL reconstruite");
         return 5;
     }
-    int64_t input_identity=0;
 };
 
 uint32_t mvo_fel_abi_version() { return MVO_FEL_ABI; }
@@ -507,6 +682,9 @@ const char *mvo_fel_statistics(mvo_fel_context *p) {
     const auto end = p->ended.time_since_epoch().count() ? p->ended : Clock::now();
     const double wall = p->began.time_since_epoch().count() ? std::chrono::duration<double>(end-p->began).count() : 0;
     text << ",\"wall_s\":" << wall << ",\"fps\":" << (wall > 0 ? p->frames/wall : 0);
+    // Attentes des files : l'étage le plus attendu par les autres est le goulot.
+    const char *waits[]={"decode_blocked_s","render_starved_s","render_blocked_s","output_starved_s"};
+    for(size_t i=0;i<p->waits.size();++i)text << ",\"" << waits[i] << "\":" << p->waits[i];
     text << '}';
     p->statistics=text.str();
     return p->statistics.c_str();
