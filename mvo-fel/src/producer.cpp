@@ -16,6 +16,14 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+#ifdef _WIN32
+#include <windows.h>
+#else
+#include <cerrno>
+#include <csignal>
+#include <pthread.h>
+#include <unistd.h>
+#endif
 extern "C" {
 #include <libavcodec/avcodec.h>
 #include <libavcodec/bsf.h>
@@ -126,6 +134,7 @@ struct mvo_fel_context {
     AVRational fps;
     std::atomic<bool> cancelled{false};
     mvo_fel_write write = nullptr;
+    intptr_t fd = -1;
     mvo_fel_progress progress = nullptr;
     void *opaque = nullptr;
     AVFormatContext *input = nullptr, *output = nullptr;
@@ -161,11 +170,27 @@ struct mvo_fel_context {
         if (cancelled.load()) throw Failure("Reconstruction annulée", MVO_FEL_CANCELLED);
     }
     static int interrupt(void *p) { return static_cast<mvo_fel_context *>(p)->cancelled.load(); }
+    // Écriture complète sur le pipe ; false si l'aval est fermé ou en erreur.
+    bool write_fd(const uint8_t *data, size_t size) {
+        while (size) {
+#ifdef _WIN32
+            DWORD written = 0;
+            const DWORD chunk = static_cast<DWORD>(std::min<size_t>(size, 1u << 30));
+            if (!WriteFile(reinterpret_cast<HANDLE>(fd), data, chunk, &written, nullptr) || !written) return false;
+#else
+            const ssize_t written = ::write(static_cast<int>(fd), data, size);
+            if (written < 0 && errno == EINTR) continue;
+            if (written <= 0) return false;
+#endif
+            data += written; size -= static_cast<size_t>(written);
+        }
+        return true;
+    }
     static int write_packet(void *p, const uint8_t *data, int size) {
         auto &self = *static_cast<mvo_fel_context *>(p);
         if (self.cancelled.load()) return AVERROR_EXIT;
         Timer timer(self.timing[6]);
-        if (self.write(self.opaque, data, size)) {
+        if (self.fd >= 0 ? !self.write_fd(data, static_cast<size_t>(size)) : self.write(self.opaque, data, size) != 0) {
             self.output_closed = true;
             return AVERROR(EPIPE);
         }
@@ -227,6 +252,8 @@ struct mvo_fel_context {
         io = avio_alloc_context(buffer, 65536, 1, this, nullptr, write_packet, nullptr);
         if (!io) { av_free(buffer); throw std::bad_alloc(); }
         io->seekable = 0;
+        // Charge utile d'une image écrite d'un bloc : une écriture par image, pas 760.
+        io->direct = 1;
         output->pb = io;
         output->flags |= AVFMT_FLAG_CUSTOM_IO;
         out_stream = avformat_new_stream(output, nullptr);
@@ -416,9 +443,9 @@ struct mvo_fel_context {
 uint32_t mvo_fel_abi_version() { return MVO_FEL_ABI; }
 const char *mvo_fel_capabilities() {
 #ifdef MVO_FEL_VULKAN_PROTOTYPE
-    return "{\"abi\":1,\"version\":\"" MVO_FEL_VERSION "\",\"transport\":\"nut\",\"pixel_format\":\"gbrp16le\",\"cpu\":true,\"backend\":\"vulkan-prototype\",\"statistics\":1,\"device_selection\":1,\"seek\":1,\"experimental\":true}";
+    return "{\"abi\":1,\"version\":\"" MVO_FEL_VERSION "\",\"transport\":\"nut\",\"pixel_format\":\"gbrp16le\",\"cpu\":true,\"backend\":\"vulkan-prototype\",\"statistics\":1,\"device_selection\":1,\"seek\":1,\"fd_output\":1,\"experimental\":true}";
 #else
-    return "{\"abi\":1,\"version\":\"" MVO_FEL_VERSION "\",\"transport\":\"nut\",\"pixel_format\":\"gbrp16le\",\"cpu\":true,\"statistics\":1,\"device_selection\":1,\"seek\":1}";
+    return "{\"abi\":1,\"version\":\"" MVO_FEL_VERSION "\",\"transport\":\"nut\",\"pixel_format\":\"gbrp16le\",\"cpu\":true,\"statistics\":1,\"device_selection\":1,\"seek\":1,\"fd_output\":1}";
 #endif
 }
 int mvo_fel_classify(const uint8_t *nal, size_t size) {
@@ -484,9 +511,28 @@ const char *mvo_fel_statistics(mvo_fel_context *p) {
     p->statistics=text.str();
     return p->statistics.c_str();
 }
-int mvo_fel_run(mvo_fel_context *p, mvo_fel_write write, mvo_fel_progress progress, void *opaque) {
-    if (!p || !write) return MVO_FEL_ERROR;
-    p->write = write; p->progress = progress; p->opaque = opaque;
+namespace {
+#ifndef _WIN32
+// SIGPIPE bloqué sur ce thread : l'écriture rend EPIPE, le signal éventuel est consommé.
+struct SigpipeGuard {
+    sigset_t set{}, previous{};
+    bool blocked = false;
+    SigpipeGuard() {
+        sigemptyset(&set); sigaddset(&set, SIGPIPE);
+        blocked = pthread_sigmask(SIG_BLOCK, &set, &previous) == 0;
+    }
+    ~SigpipeGuard() {
+        if (!blocked) return;
+        sigset_t pending;
+        if (!sigismember(&previous, SIGPIPE) && sigpending(&pending) == 0 && sigismember(&pending, SIGPIPE)) {
+            int signal = 0;
+            sigwait(&set, &signal);
+        }
+        pthread_sigmask(SIG_SETMASK, &previous, nullptr);
+    }
+};
+#endif
+int run_context(mvo_fel_context *p) {
     int result = MVO_FEL_OK;
     try { p->run(); }
     catch (const Failure &exc) { p->error = exc.what(); result = exc.status; }
@@ -495,6 +541,22 @@ int mvo_fel_run(mvo_fel_context *p, mvo_fel_write write, mvo_fel_progress progre
     p->ended = Clock::now();
     if (p->cancelled.load()) return MVO_FEL_CANCELLED;
     return p->output_closed ? MVO_FEL_OUTPUT_CLOSED : result;
+}
+}
+int mvo_fel_run_fd(mvo_fel_context *p, intptr_t fd, mvo_fel_progress progress, void *opaque) {
+#ifdef _WIN32
+    if (!p || fd == -1 || fd == 0) return MVO_FEL_ERROR;
+#else
+    if (!p || fd < 0) return MVO_FEL_ERROR;
+    SigpipeGuard guard;
+#endif
+    p->fd = fd; p->progress = progress; p->opaque = opaque;
+    return run_context(p);
+}
+int mvo_fel_run(mvo_fel_context *p, mvo_fel_write write, mvo_fel_progress progress, void *opaque) {
+    if (!p || !write) return MVO_FEL_ERROR;
+    p->write = write; p->progress = progress; p->opaque = opaque;
+    return run_context(p);
 }
 void mvo_fel_cancel(mvo_fel_context *p) { if (p) p->cancelled.store(true); }
 const char *mvo_fel_error(const mvo_fel_context *p) { return p ? p->error.c_str() : "Contexte absent"; }

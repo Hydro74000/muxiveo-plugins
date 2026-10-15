@@ -16,3 +16,4 @@ _mvo_fel_vulkan_create
 _mvo_fel_vulkan_render
 _mvo_fel_vulkan_destroy
 _mvo_fel_set_start
+_mvo_fel_run_fd

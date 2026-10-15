@@ -22,6 +22,8 @@ def load(path: Path):
     lib.mvo_fel_run.restype = c.c_int
     lib.mvo_fel_error.argtypes = [c.c_void_p]
     lib.mvo_fel_error.restype = c.c_char_p
+    lib.mvo_fel_run_fd.argtypes = [c.c_void_p, c.c_ssize_t, PROGRESS, c.c_void_p]
+    lib.mvo_fel_run_fd.restype = c.c_int
     lib.mvo_fel_set_start.argtypes = [c.c_void_p, c.c_int64]
     lib.mvo_fel_set_start.restype = c.c_int
     for name in ("mvo_fel_cancel", "mvo_fel_destroy"):
@@ -83,7 +85,47 @@ def smoke(library: Path, fixture: Path, output: Path | None = None, device: str 
             lib.mvo_fel_destroy(handle)
             if sink:
                 sink.close()
-    print("ABI, NUT, 12 images/B-frames, seek, fermeture aval, annulation, piste invalide et erreur de lecture : OK")
+    fd_output(lib, fixture)
+    print("ABI, NUT, 12 images/B-frames, seek, descripteur, fermeture aval, annulation, piste invalide et erreur de lecture : OK")
+
+
+def fd_output(lib, fixture: Path) -> None:
+    """Sortie directe sur pipe : même flux que le callback, puis aval fermé sans SIGPIPE."""
+    import os
+    import threading
+    expected = bytearray()
+    handle = lib.mvo_fel_create(str(fixture.resolve()).encode(), 0, 2, 24000, 1001)
+    assert lib.mvo_fel_run(handle, WRITE(lambda _o, p, n: expected.extend(c.string_at(p, n)) or 0),
+                           PROGRESS(lambda *_: None), None) == 0
+    lib.mvo_fel_destroy(handle)
+    for close_early in (False, True):
+        read, write = os.pipe()
+        received = bytearray()
+
+        def consume():
+            with os.fdopen(read, "rb") as stream:
+                if close_early:
+                    stream.read(4096)
+                    return
+                while chunk := stream.read(1 << 20):
+                    received.extend(chunk)
+
+        reader = threading.Thread(target=consume)
+        reader.start()
+        handle = lib.mvo_fel_create(str(fixture.resolve()).encode(), 0, 2, 24000, 1001)
+        if os.name == "nt":
+            import msvcrt
+            target = msvcrt.get_osfhandle(write)
+        else:
+            target = write
+        result = lib.mvo_fel_run_fd(handle, target, PROGRESS(lambda *_: None), None)
+        os.close(write)
+        reader.join()
+        lib.mvo_fel_destroy(handle)
+        if close_early:
+            assert result == 2, result
+        else:
+            assert result == 0 and bytes(received) == bytes(expected), (result, len(received), len(expected))
 
 
 if __name__ == "__main__":

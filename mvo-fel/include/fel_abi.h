@@ -42,6 +42,11 @@ MVO_FEL_EXPORT int mvo_fel_set_start(mvo_fel_context *, int64_t start_us);
 /* Mesures locales après run ; pipe_s est inclus dans nut_s. */
 MVO_FEL_EXPORT const char *mvo_fel_statistics(mvo_fel_context *);
 MVO_FEL_EXPORT int mvo_fel_run(mvo_fel_context *, mvo_fel_write, mvo_fel_progress, void *);
+/* Extension additive ABI 1 ; disponible si capabilities.fd_output vaut 1. Écrit le NUT
+ * directement sur un descripteur POSIX ou un HANDLE Windows (pipe), sans callback ni
+ * copie de l'hôte. Le descripteur reste à l'appelant. SIGPIPE est bloqué sur le thread
+ * appelant pendant l'appel : un aval fermé rend MVO_FEL_OUTPUT_CLOSED. */
+MVO_FEL_EXPORT int mvo_fel_run_fd(mvo_fel_context *, intptr_t fd, mvo_fel_progress, void *);
 MVO_FEL_EXPORT void mvo_fel_cancel(mvo_fel_context *);
 /* Erreur valide jusqu'à destroy, à consulter après run uniquement. */
 MVO_FEL_EXPORT const char *mvo_fel_error(const mvo_fel_context *);
