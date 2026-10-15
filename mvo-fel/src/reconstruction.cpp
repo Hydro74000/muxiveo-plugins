@@ -5,6 +5,7 @@
 #include "blue_noise.h"
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <limits>
 #include <stdexcept>
 #if (defined(__x86_64__) || defined(__i386__)) && (defined(__GNUC__) || defined(__clang__))
@@ -43,6 +44,7 @@ __attribute__((target("avx2"))) double dot4_avx2(const double *a, const double *
 using Dot4 = double (*)(const double *, const double *);
 Dot4 select_dot4() {
 #ifdef MVO_FEL_AVX2
+    __builtin_cpu_init();
     if (__builtin_cpu_supports("avx2")) return dot4_avx2;
 #endif
     return dot4_scalar;
@@ -321,6 +323,253 @@ void taps(double offset, std::array<double, 4> &weights, int &first) {
         weights[k] = std::max(0.0, 1 - d/2) / 2;
     }
 }
+}
+}
+
+namespace muxiveo::fel {
+namespace {
+int exact_weights(const double *w, std::array<int32_t, 4> &numerators) {
+    static const int divisors[] = {1,2,4,5,8,10,16,20,32,40,64,80,128,160,256,320,512,640,1280,2560};
+    for (int d : divisors) {
+        bool exact = true;
+        int sum = 0;
+        for (int k = 0; k < 4 && exact; ++k) {
+            const double scaled = w[k]*d;
+            numerators[k] = static_cast<int32_t>(std::lround(scaled));
+            exact = std::abs(scaled - numerators[k]) < 1e-9;
+            sum += numerators[k];
+        }
+        if (exact && sum == d) return d;
+    }
+    return 0;
+}
+}
+
+namespace {
+// log2/exp2 float32 sans branche ni appel (≈ 1 ulp sur les plages PQ) : boucles de lignes
+// vectorisées par le compilateur (SSE2/NEON, AVX2+FMA choisi à l'exécution sur x86-64).
+[[gnu::always_inline]] inline float fast_log2(float x) {
+    uint32_t bits;
+    std::memcpy(&bits, &x, 4);
+    const float exponent = static_cast<float>(static_cast<int32_t>((bits >> 23) & 255) - 127);
+    bits = (bits & 0x007fffffu) | 0x3f800000u;
+    float m;
+    std::memcpy(&m, &bits, 4);
+    // log2(m), m ∈ [1, 2) : s = (m-1)/(m+1), série atanh jusqu'à s^13.
+    const float s = (m - 1.0f)/(m + 1.0f), s2 = s*s;
+    return exponent + s*(2.8853900817779268f + s2*(0.9617966939259756f + s2*(0.5770780163555854f +
+        s2*(0.4121985831111324f + s2*(0.3205988979753252f + s2*(0.2623081923452661f + s2*0.2219530842921457f))))));
+}
+[[gnu::always_inline]] inline float fast_exp2(float x) {
+    x = std::min(std::max(x, -126.0f), 126.0f);
+    // Arrondi au plus proche par constante magique (1,5 × 2^23) : pas de nearbyint.
+    const float n = (x + 12582912.0f) - 12582912.0f, f = x - n;
+    const float p = 1.0f + f*(0.6931471805599453f + f*(0.2402265069591007f + f*(0.0555041086648216f +
+        f*(0.0096181291076285f + f*(0.0013333558146428f + f*(0.0001540353039338f + f*0.0000152527338040f))))));
+    const uint32_t bits = static_cast<uint32_t>(static_cast<int32_t>(n) + 127) << 23;
+    float scale;
+    std::memcpy(&scale, &bits, 4);
+    return p*scale;
+}
+// x <= 0 donne 0 (sélection, sans branche).
+[[gnu::always_inline]] inline float fast_pow(float x, float y) {
+    const float value = fast_exp2(y*fast_log2(std::max(x, 1e-30f)));
+    return x > 0 ? value : 0.0f;
+}
+constexpr float fm1 = 2610.0f/16384.0f, fm2 = 2523.0f/32.0f;
+constexpr float fc1 = 3424.0f/4096.0f, fc2 = 2413.0f/128.0f, fc3 = 2392.0f/128.0f;
+// PQ en place sur un tableau ; NaN si le dénominateur s'annule (refusé ensuite comme non fini).
+#define FEL_PQ_ROWS(SUFFIX, ATTRIBUTES) \
+    ATTRIBUTES void pq_eotf_row##SUFFIX(float *v, int count) { \
+        for (int i = 0; i < count; ++i) { \
+            const float p = fast_pow(v[i], 1.0f/fm2); \
+            const float d = fc2 - fc3*p; \
+            const float value = fast_pow(std::max(p - fc1, 0.0f)/std::max(d, 1e-30f), 1.0f/fm1); \
+            v[i] = d > 0 ? value : NAN; \
+        } \
+    } \
+    ATTRIBUTES void pq_oetf_row##SUFFIX(float *v, int count) { \
+        for (int i = 0; i < count; ++i) { \
+            const float p = fast_pow(v[i], fm1); \
+            v[i] = fast_pow((fc1 + fc2*p)/(1.0f + fc3*p), fm2); \
+        } \
+    }
+// Sélections sans branche : fichier compilé avec -fno-trapping-math (CMakeLists), sinon GCC
+// garde des branches autour d'opérations flottantes susceptibles de lever une exception.
+FEL_PQ_ROWS(_default, )
+#ifdef MVO_FEL_AVX2
+FEL_PQ_ROWS(_avx2, __attribute__((target("avx2,fma"))))
+// Détection au premier appel : __builtin_cpu_init explicite, l'ordre des constructeurs
+// d'une bibliothèque chargée par dlopen n'étant pas garanti.
+bool pq_avx2() {
+    static const bool supported = [] {
+        __builtin_cpu_init();
+        return __builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma");
+    }();
+    return supported;
+}
+#endif
+void pq_eotf_row(float *v, int count) {
+#ifdef MVO_FEL_AVX2
+    if (pq_avx2()) return pq_eotf_row_avx2(v, count);
+#endif
+    pq_eotf_row_default(v, count);
+}
+void pq_oetf_row(float *v, int count) {
+#ifdef MVO_FEL_AVX2
+    if (pq_avx2()) return pq_oetf_row_avx2(v, count);
+#endif
+    pq_oetf_row_default(v, count);
+}
+}
+
+bool IntegerAxis::build(int count, int size, double ratio, double layer, double chroma, int subsample) {
+    index.resize(count); weight.resize(count); denominator.resize(count);
+    weight_sum = 0;
+    for (int i = 0; i < count; ++i) {
+        // Même coordonnée que FrameSampler (centres des pixels, couche et position chroma).
+        const double coordinate = ((i+.5-layer)*ratio-chroma)/(1 << subsample)-.5;
+        const int first = static_cast<int>(std::floor(coordinate))-1;
+        double w[4], sum = 0;
+        for (int k = 0; k < 4; ++k) {
+            index[i][k] = std::clamp(first+k, 0, size-1);
+            sum += w[k] = spline16(coordinate-first-k);
+        }
+        for (double &value : w) value /= sum;
+        denominator[i] = exact_weights(w, weight[i]);
+        if (!denominator[i]) return false;
+        int32_t magnitude = 0;
+        for (int32_t value : weight[i]) magnitude += std::abs(value);
+        weight_sum = std::max(weight_sum, magnitude);
+    }
+    return true;
+}
+
+std::array<int, 6> FastReconstruction::key(const AVFrame &bl, const AVFrame &el) {
+    return {bl.width, bl.height, el.width, el.height, bl.chroma_location*16 + el.chroma_location, bl.format*1024 + el.format};
+}
+
+bool FastReconstruction::plane(Plane &plane, const AVFrame &frame, int c, int bw, int bh, bool el) {
+    const auto *desc = av_pix_fmt_desc_get(static_cast<AVPixelFormat>(frame.format));
+    if (!desc || desc->nb_components != 3 || !(desc->flags & AV_PIX_FMT_FLAG_PLANAR) ||
+        (desc->flags & (AV_PIX_FMT_FLAG_BE | AV_PIX_FMT_FLAG_RGB | AV_PIX_FMT_FLAG_FLOAT)) ||
+        desc->comp[c].depth != 10 || desc->comp[c].step != 2 || desc->comp[c].shift || desc->comp[c].offset)
+        return false;
+    const int hs = c ? desc->log2_chroma_w : 0, vs = c ? desc->log2_chroma_h : 0;
+    double cx = 0, cy = 0;
+    if (c) switch (frame.chroma_location) {
+        case AVCHROMA_LOC_TOPLEFT: cx = -.5; cy = -.5; break;
+        case AVCHROMA_LOC_LEFT: cx = -.5; break;
+        case AVCHROMA_LOC_CENTER: break;
+        case AVCHROMA_LOC_TOP: cy = -.5; break;
+        case AVCHROMA_LOC_BOTTOMLEFT: cx = -.5; cy = .5; break;
+        case AVCHROMA_LOC_BOTTOM: cy = .5; break;
+        default: return false;
+    }
+    plane.width = (frame.width + (1 << hs)-1) >> hs;
+    plane.height = (frame.height + (1 << vs)-1) >> vs;
+    return plane.horizontal.build(bw, plane.width, double(frame.width)/bw, el && frame.width < bw ? -.5 : 0, cx, hs) &&
+           plane.vertical.build(bh, plane.height, double(frame.height)/bh, 0, cy, vs) &&
+           // |code - offset| <= 1023 : sommes verticales puis horizontales en int32.
+           1023.0*plane.horizontal.weight_sum*plane.vertical.weight_sum < 2147483647.0;
+}
+
+FastReconstruction::FastReconstruction(const AVFrame &bl, const AVFrame &el) {
+    const auto *desc = av_pix_fmt_desc_get(static_cast<AVPixelFormat>(bl.format));
+    width = bl.width; height = bl.height;
+    geometry = key(bl, el);
+    if (!desc || desc->comp[0].depth != 10 || desc->comp[0].step != 2 || desc->comp[0].shift) return;
+    ok = plane(base_chroma[0], bl, 1, width, height, false) && plane(base_chroma[1], bl, 2, width, height, false);
+    for (int c = 0; ok && c < 3; ++c) ok = plane(enhancement[c], el, c, width, height, true);
+}
+
+bool FastReconstruction::bind(const AVFrame &bl, const AVFrame &el, const AVDOVIMetadata &metadata) {
+    if (!ok || key(bl, el) != geometry) return false;
+    const auto *bd = av_pix_fmt_desc_get(static_cast<AVPixelFormat>(bl.format));
+    const auto *ed = av_pix_fmt_desc_get(static_cast<AVPixelFormat>(el.format));
+    const auto &mapping = *av_dovi_get_mapping(&metadata);
+    luma = bl.data[bd->comp[0].plane]; luma_stride = bl.linesize[bd->comp[0].plane];
+    for (int c = 0; c < 2; ++c) {
+        base_chroma[c].data = bl.data[bd->comp[c+1].plane];
+        base_chroma[c].stride = bl.linesize[bd->comp[c+1].plane];
+    }
+    for (int c = 0; c < 3; ++c) {
+        enhancement[c].data = el.data[ed->comp[c].plane];
+        enhancement[c].stride = el.linesize[ed->comp[c].plane];
+        enhancement[c].offset = mapping.nlq[c].nlq_offset;
+    }
+    return true;
+}
+
+void FastReconstruction::rows(const Mapping &mapping, AVFrame &rgb, int first_row, int last_row) const {
+    // Passe verticale par colonne source (int32), puis horizontale : 4 + 4 prises au lieu de 16.
+    std::array<std::vector<int32_t>, 5> vertical;
+    const Plane *planes[5] = {&base_chroma[0], &base_chroma[1], &enhancement[0], &enhancement[1], &enhancement[2]};
+    for (int k = 0; k < 5; ++k) vertical[k].resize(planes[k]->width);
+    std::vector<double> scale(5);
+    std::vector<float> lms(3*width), linear(3*width);
+    // LMS → RGB : produit lms_to_rgb · linear (matrice du RPU), en float.
+    float matrix[3][3];
+    for (int c = 0; c < 3; ++c)
+        for (int k = 0; k < 3; ++k) {
+            double sum = 0;
+            for (int j = 0; j < 3; ++j) sum += lms_to_rgb[c][j]*mapping.linear[j][k];
+            matrix[c][k] = static_cast<float>(sum);
+        }
+    for (int y = first_row; y < last_row; ++y) {
+        for (int k = 0; k < 5; ++k) {
+            const Plane &p = *planes[k];
+            const auto &rows = p.vertical.index[y];
+            const auto &w = p.vertical.weight[y];
+            const uint16_t *source[4];
+            for (int b = 0; b < 4; ++b) source[b] = reinterpret_cast<const uint16_t *>(p.data + rows[b]*p.stride);
+            int32_t *out = vertical[k].data();
+            for (int x = 0; x < p.width; ++x)
+                out[x] = w[0]*(source[0][x]-p.offset) + w[1]*(source[1][x]-p.offset) +
+                         w[2]*(source[2][x]-p.offset) + w[3]*(source[3][x]-p.offset);
+            scale[k] = 1.0/(double(p.vertical.denominator[y])*1023.0);
+        }
+        const auto *row = reinterpret_cast<const uint16_t *>(luma + y*luma_stride);
+        // Signal non linéaire (mapping, NLQ, matrice Y'CbCr→LMS') par pixel, puis PQ par
+        // tableaux contigus : boucles sans branche vectorisées par le compilateur.
+        for (int x = 0; x < width; ++x) {
+            double value[5];
+            for (int k = 0; k < 5; ++k) {
+                const Plane &p = *planes[k];
+                const auto &i = p.horizontal.index[x];
+                const auto &w = p.horizontal.weight[x];
+                const int32_t *v = vertical[k].data();
+                const int32_t sum = w[0]*v[i[0]] + w[1]*v[i[1]] + w[2]*v[i[2]] + w[3]*v[i[3]];
+                value[k] = sum ? sum*scale[k]/p.horizontal.denominator[x] : 0.0;
+            }
+            Vec out = reshape(mapping, {row[x]/1023.0, value[0], value[1]});
+            // Résiduel EL exact : un zéro entier n'applique ni seuil ni pente NLQ.
+            if (mapping.residual) for (int c = 0; c < 3; ++c) {
+                const double d = value[2+c];
+                if (d != 0) out[c] += sign(d)*(std::abs(d)*mapping.slope[c] + mapping.threshold[c]);
+            }
+            for (int c = 0; c < 3; ++c) out[c] -= mapping.nonlinear_offset[c];
+            for (int c = 0; c < 3; ++c)
+                lms[c*width + x] = static_cast<float>(mapping.nonlinear[c][0]*out[0] + mapping.nonlinear[c][1]*out[1] +
+                                                      mapping.nonlinear[c][2]*out[2]);
+        }
+        pq_eotf_row(lms.data(), 3*width);
+        for (int x = 0; x < width; ++x) {
+            const float l[3] = {lms[x], lms[width + x], lms[2*width + x]};
+            for (int c = 0; c < 3; ++c)
+                linear[c*width + x] = l[0]*matrix[c][0] + l[1]*matrix[c][1] + l[2]*matrix[c][2];
+        }
+        pq_oetf_row(linear.data(), 3*width);
+        for (int c = 0; c < 3; ++c) {
+            const int plane = c == 0 ? 2 : c == 1 ? 0 : 1;
+            auto *p = reinterpret_cast<uint16_t *>(rgb.data[plane] + y*rgb.linesize[plane]);
+            for (int x = 0; x < width; ++x) {
+                const float v = linear[c*width + x];
+                if (!std::isfinite(v)) throw std::runtime_error("Pixel reconstruit non fini");
+                p[x] = static_cast<uint16_t>(std::lround(std::clamp(v, 0.0f, 1.0f)*65535.0f));
+            }
+        }
+    }
 }
 }
 

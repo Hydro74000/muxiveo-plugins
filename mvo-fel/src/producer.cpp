@@ -13,6 +13,7 @@
 #include <map>
 #include <locale>
 #include <sstream>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <memory>
@@ -278,6 +279,8 @@ struct mvo_fel_context {
     std::array<int, 4> crop{};
     int width = 0, height = 0, packet_size = 0;
     std::unique_ptr<RowPool> rows;
+    std::unique_ptr<muxiveo::fel::FastReconstruction> fast;
+    int render_threads = 1;
 #ifdef MVO_FEL_VULKAN_PROTOTYPE
     void *gpu_prototype = nullptr;
     bool gpu_attempted = false;
@@ -393,9 +396,17 @@ struct mvo_fel_context {
             }
             backend += (backend.empty() ? "" : ", ") + decode_note;
         }
-        // Décodeurs et reconstruction partagent le budget, jamais chacun le total.
-        bl.init(stream, "bl_rpu", std::max(1, threads/3), hw_decode ? hw_device : nullptr);
-        el.init(stream, "el", std::max(1, threads/3), hw_decode ? hw_device : nullptr);
+        // Décodeurs et reconstruction partagent le budget, jamais chacun le total. Rendu CPU
+        // (~2–6 i/s UHD) : décodage au plus juste, le reste des threads à la reconstruction.
+        bool cpu_render = true;
+#ifdef MVO_FEL_VULKAN_PROTOTYPE
+        cpu_render = gpu_prototype == nullptr && !pulling;
+#endif
+        const int bl_threads = cpu_render ? std::max(1, threads/4) : std::max(1, threads/3);
+        const int el_threads = cpu_render ? 1 : std::max(1, threads/3);
+        render_threads = std::max(1, threads - bl_threads - el_threads);
+        bl.init(stream, "bl_rpu", bl_threads, hw_decode ? hw_device : nullptr);
+        el.init(stream, "el", el_threads, hw_decode ? hw_device : nullptr);
     }
 #ifdef MVO_FEL_VULKAN_PROTOTYPE
     // UUID du premier GPU dédié énuméré (sinon le premier) pour le choix automatique.
@@ -701,7 +712,7 @@ struct mvo_fel_context {
 #endif
             {
                 if (job.base->format == AV_PIX_FMT_VULKAN) throw Failure("Image Vulkan sans rendu GPU");
-                if (!rows) rows = std::make_unique<RowPool>(std::max(1, threads - 2*std::max(1, threads/3)));
+                if (!rows) rows = std::make_unique<RowPool>(render_threads);
                 // Y'CbCr : reconstruction RGB 16 bits intermédiaire, puis conversion par lignes chroma.
                 AVFrame *target = rgb.get();
                 if (yuv) {
@@ -712,14 +723,29 @@ struct mvo_fel_context {
                     }
                     target = scratch.get();
                 }
-                const muxiveo::fel::FrameSampler bs(base, width, height, false);
-                const muxiveo::fel::FrameSampler es(*job.enhancement, width, height, true);
                 constexpr int block = 8;
-                rows->run((height + block - 1) / block, [&](int index) {
-                    check_cancelled();
-                    muxiveo::fel::reconstruct_rows(bs, es, job.mapping, *target, index*block,
-                                                   std::min(height, (index+1)*block));
-                });
+                // Entiers exacts séparables si la géométrie s'y prête, sinon échantillonneurs en double.
+                // MVO_FEL_CPU_REFERENCE : échantillonneurs en double (comparaisons de validation).
+                static const bool reference = getenv("MVO_FEL_CPU_REFERENCE") != nullptr;
+                if (reference) fast.reset();
+                else if (!fast || !fast->bind(base, *job.enhancement, *job.metadata)) {
+                    fast = std::make_unique<muxiveo::fel::FastReconstruction>(base, *job.enhancement);
+                    if (fast->valid()) fast->bind(base, *job.enhancement, *job.metadata);
+                }
+                if (fast && fast->valid()) {
+                    rows->run((height + block - 1) / block, [&](int index) {
+                        check_cancelled();
+                        fast->rows(job.mapping, *target, index*block, std::min(height, (index+1)*block));
+                    });
+                } else {
+                    const muxiveo::fel::FrameSampler bs(base, width, height, false);
+                    const muxiveo::fel::FrameSampler es(*job.enhancement, width, height, true);
+                    rows->run((height + block - 1) / block, [&](int index) {
+                        check_cancelled();
+                        muxiveo::fel::reconstruct_rows(bs, es, job.mapping, *target, index*block,
+                                                       std::min(height, (index+1)*block));
+                    });
+                }
                 const int chroma_rows = output_format.height/2;
                 if (yuv) rows->run((chroma_rows + block - 1) / block, [&](int index) {
                     check_cancelled();

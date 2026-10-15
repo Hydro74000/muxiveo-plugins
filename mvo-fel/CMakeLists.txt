@@ -57,7 +57,9 @@ endif()
 if(MSVC)
   target_compile_options(fel_math PRIVATE /W4)
 else()
-  target_compile_options(fel_math PRIVATE -Wall -Wextra -Wpedantic)
+  # Exceptions flottantes masquées : sélections sans branche, boucles PQ vectorisées.
+  # Aucun changement de résultat (pas de réassociation, contrairement à -ffast-math).
+  target_compile_options(fel_math PRIVATE -Wall -Wextra -Wpedantic -fno-trapping-math)
 endif()
 
 include(CTest)

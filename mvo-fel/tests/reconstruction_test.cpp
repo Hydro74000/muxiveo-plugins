@@ -3,6 +3,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <iostream>
+#include <random>
 #include <stdexcept>
 
 using namespace muxiveo::fel;
@@ -12,6 +13,52 @@ void near(double actual, double expected, double tolerance = 1e-10) {
         std::exit(1);
     }
 }
+AVFrame *layer(int width, int height, std::mt19937 &random) {
+    AVFrame *frame = av_frame_alloc();
+    frame->format = AV_PIX_FMT_YUV420P10LE; frame->width = width; frame->height = height;
+    frame->chroma_location = AVCHROMA_LOC_TOPLEFT;
+    if (av_frame_get_buffer(frame, 0) < 0) std::exit(1);
+    std::uniform_int_distribution<int> code(0, 1023);
+    for (int c = 0; c < 3; ++c)
+        for (int y = 0; y < (c ? height/2 : height); ++y) {
+            auto *row = reinterpret_cast<uint16_t *>(frame->data[c] + y*frame->linesize[c]);
+            for (int x = 0; x < (c ? width/2 : width); ++x) row[x] = static_cast<uint16_t>(code(random));
+        }
+    return frame;
+}
+
+// Chemin entier séparable + PQ float face aux échantillonneurs en double : ≤ 2 codes 16 bits.
+void fast_matches_reference(AVDOVIMetadata &metadata) {
+    std::mt19937 random(7);
+    auto &mapping = *av_dovi_get_mapping(&metadata);
+    for (int c = 0; c < 3; ++c) {
+        auto &curve = mapping.curves[c];
+        curve.num_pivots = 3; curve.pivots[1] = 400; curve.pivots[2] = 1023;
+        curve.mapping_idc[1] = AV_DOVI_MAPPING_MMR;
+        curve.mmr_order[1] = 2; curve.mmr_constant[1] = 2000;
+        for (int k = 0; k < 2; ++k) for (int j = 0; j < 7; ++j) curve.mmr_coef[1][k][j] = 3000*(j+1)*(k ? -1 : 1);
+    }
+    AVFrame *bl = layer(64, 32, random), *el = layer(32, 16, random);
+    AVFrame *a = av_frame_alloc(), *b = av_frame_alloc();
+    for (AVFrame *rgb : {a, b}) {
+        rgb->format = AV_PIX_FMT_GBRP16LE; rgb->width = 64; rgb->height = 32;
+        if (av_frame_get_buffer(rgb, 0) < 0) std::exit(1);
+    }
+    const Mapping m(metadata);
+    reconstruct_rows(*bl, *el, m, *a, 0, 32);
+    FastReconstruction fast(*bl, *el);
+    if (!fast.valid() || !fast.bind(*bl, *el, metadata)) std::exit(1);
+    fast.rows(m, *b, 0, 32);
+    int worst = 0;
+    for (int c = 0; c < 3; ++c)
+        for (int y = 0; y < 32; ++y)
+            for (int x = 0; x < 64; ++x)
+                worst = std::max(worst, std::abs(reinterpret_cast<const uint16_t *>(a->data[c] + y*a->linesize[c])[x] -
+                                                 reinterpret_cast<const uint16_t *>(b->data[c] + y*b->linesize[c])[x]));
+    if (worst > 2) { std::cerr << "chemin rapide : " << worst << " codes 16 bits\n"; std::exit(1); }
+    for (AVFrame *frame : {bl, el, a, b}) av_frame_free(&frame);
+}
+
 int main() {
     auto *metadata = av_dovi_metadata_alloc(nullptr);
     auto &header = *av_dovi_get_header(metadata);
@@ -63,6 +110,7 @@ int main() {
         const double x = i/100.;
         near(spline16(x+1)+spline16(x)+spline16(x-1)+spline16(x-2), 1);
     }
+    fast_matches_reference(*metadata);
     mapping.curves[0].num_pivots = 10;
     try { Mapping bad(*metadata); return 1; } catch (const std::runtime_error &) {}
     av_free(metadata);

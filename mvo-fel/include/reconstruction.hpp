@@ -60,6 +60,39 @@ public:
 };
 void reconstruct_rows(const FrameSampler &bl, const FrameSampler &el, const Mapping &mapping,
                       AVFrame &rgb, int first_row, int last_row);
+
+// Axe Spline16 à poids entiers exacts (phases multiples de 1/8 : dénominateurs ≤ 2560).
+struct IntegerAxis {
+    std::vector<std::array<int32_t, 4>> index, weight;
+    std::vector<int32_t> denominator;
+    int32_t weight_sum = 0;  // max des Σ|poids| : borne des sommes entières
+    // false si une phase n'est pas rationnelle de ce type.
+    bool build(int count, int size, double ratio, double layer, double chroma, int subsample);
+};
+// Reconstruction CPU séparable en entiers exacts (zéro et signe du résiduel exacts) ;
+// valid() faux si une géométrie sort de ce cadre : FrameSampler en double en repli.
+class FastReconstruction {
+    struct Plane {
+        const uint8_t *data = nullptr;
+        int stride = 0, width = 0, height = 0, offset = 0;
+        IntegerAxis horizontal, vertical;
+    };
+    std::array<Plane, 2> base_chroma;
+    std::array<Plane, 3> enhancement;
+    const uint8_t *luma = nullptr;
+    int luma_stride = 0, width = 0, height = 0;
+    std::array<int, 6> geometry{};
+    bool ok = false;
+    static bool plane(Plane &plane, const AVFrame &frame, int component, int bw, int bh, bool el);
+    static std::array<int, 6> key(const AVFrame &bl, const AVFrame &el);
+public:
+    // Axes calculés une fois pour la géométrie (dimensions, positions chroma) des couches.
+    FastReconstruction(const AVFrame &bl, const AVFrame &el);
+    bool valid() const { return ok; }
+    // Plans et offsets NLQ de l'image courante ; false si la géométrie a changé.
+    bool bind(const AVFrame &bl, const AVFrame &el, const AVDOVIMetadata &metadata);
+    void rows(const Mapping &mapping, AVFrame &rgb, int first_row, int last_row) const;
+};
 void reconstruct_rows(const AVFrame &bl, const AVFrame &el, const Mapping &mapping,
                       AVFrame &rgb, int first_row, int last_row);
 // RGB PQ 16 bits (gbrp16le) vers Y'CbCr 4:2:0 limité : lignes chroma [first, last) et
