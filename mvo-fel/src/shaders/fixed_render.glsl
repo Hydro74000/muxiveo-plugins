@@ -4,7 +4,14 @@
 // composantes non certaines en retour ; R (Q0.96), bornes et codes pour le diagnostic.
 // Décalages des paramètres : fixed_abi.h (FX_CURVE0, FX_CURVE, FX_GLOBAL définis avant ce fichier).
 
-uvec4 fx_threshold(int k) { return texelFetch(fel_thr96, ivec2(k & 255, k >> 8), 0); }
+// Seuil T_bas·2^96 (trois mots) ; fx_threshold_up : suivant(T_bas), au-dessus du seuil exact (le
+// quatrième mot de la texture porte l'exposant de l'ulp). R n'étant pas un double, la borne basse se
+// compare à suivant(T_bas).
+uvec4 fx_threshold(int k) { uvec4 t = texelFetch(fel_thr96, ivec2(k & 255, k >> 8), 0); return uvec4(t.xyz, 0u); }
+uvec4 fx_threshold_up(int k) {
+    uvec4 t = texelFetch(fel_thr96, ivec2(k & 255, k >> 8), 0);
+    return x4add(uvec4(t.xyz, 0u), x4shl(uvec4(1u, 0u, 0u, 0u), int(t.w)));
+}
 
 uint fx_render(int code, int tb, int tr, int Db, int te0, int te1, int te2, int Dl, int Dc,
                out int seg[3], out vec3 out3, out uvec4 Rd[3], out float Ed[3], out uint qd[3]) {
@@ -128,7 +135,7 @@ uint fx_render(int code, int tb, int tr, int Db, int te0, int te1, int te2, int 
         for (int i = 0; i < 8 && qc > 0 && !x4lt(fx_threshold(qc - 1), R); ++i) --qc;
         float e96 = e*7.9228163e28;
         uvec4 eq = uvec4(x2add(x2from(e96), uvec2(1u, 0u)), 0u, 0u);
-        bool certain = !unc && e96 < 1.8e19 && (qc == 0 || x4lt(fx_threshold(qc - 1), x4sub(R, eq))) &&
+        bool certain = !unc && e96 < 1.8e19 && (qc == 0 || !x4lt(x4sub(R, eq), fx_threshold_up(qc - 1))) &&
                        (qc == 65535 || !x4lt(fx_threshold(qc), x4add(R, eq)));
         if (!certain) mask |= 1u << c;
         out3[c] = (float(qc) + 0.25)/65535.0;

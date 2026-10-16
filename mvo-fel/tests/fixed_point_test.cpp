@@ -63,7 +63,8 @@ int main() {
     std::uniform_real_distribution<double> unit(0, 1);
     double worst = 0;
     for (int s = 0; s < 300000; ++s) {
-        const double x = s % 2 ? std::exp(std::log(7.31e-7)*unit(random)) : unit(random);
+        // Log-uniforme sur [x0, 1], uniforme sur [0, 1], puis [1 ; 1,33] (g > 1, exponentielle positive).
+        const double x = s % 3 == 0 ? std::exp(std::log(7.31e-7)*unit(random)) : s % 3 == 1 ? unit(random) : 1 + 0.33*unit(random);
         const u128 x64 = (u128)std::ldexp(x, 64);
         uint64_t mant; int n; double dl;
         if (!fixed::eotf(x64, 64, mant, n, dl) || !mant) continue;

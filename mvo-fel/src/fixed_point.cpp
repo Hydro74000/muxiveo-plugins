@@ -316,9 +316,12 @@ unsigned pixel(const Params &p, const certified::ExactPixel &in, std::array<uint
         int lo = 0, hi = PQ_THRESHOLDS;
         while (lo < hi) { const int mid = (lo + hi)/2; if (pq_threshold(mid) < Rd) lo = mid + 1; else hi = mid; }
         const int k = lo;
+        // Seuil exact T dans ]T_bas, suivant(T_bas)[ : borne basse comparée à suivant(T_bas) (R n'est pas
+        // un double), borne haute à T_bas.
         auto T = [](int i) { return (i128)(u128)std::ldexp(pq_threshold(i), 96); };
+        auto T_up = [](int i) { return (i128)(u128)std::ldexp(std::nextafter(pq_threshold(i), 2.0), 96); };
         const i128 eq = (i128)(u128)std::ceil(std::ldexp(bound[c], 96)) + 1;
-        const bool certain = (k == 0 || R - eq > T(k - 1)) && (k == PQ_THRESHOLDS || R + eq <= T(k));
+        const bool certain = (k == 0 || R - eq >= T_up(k - 1)) && (k == PQ_THRESHOLDS || R + eq <= T(k));
         codes[c] = (uint16_t)k;
         if (!certain || (uncertain & 7) == 7) uncertain |= 1u << c;
     }

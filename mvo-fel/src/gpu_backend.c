@@ -1116,6 +1116,14 @@ static int prepare_fixed(struct fel_gpu *p)
             v = (unsigned __int128)mant << (e + 43);                             /* t·2^96 = mant·2^(e+43) */
         }
         for (int w = 0; w < 4; ++w) data[4 * k + w] = (uint32_t)(v >> (32 * w));
+        /* Quatrième mot (nul pour t < 1) : ulp de t en Q0.96 = 2^(e+43) ; seuil exact < t + ulp. */
+        if (k < 65535) {
+            double t;
+            memcpy(&t, fel_pq_threshold_bytes + 8 * (size_t)k, sizeof(t));
+            int e;
+            frexp(t, &e);
+            data[4 * k + 3] = (uint32_t)(e + 43);
+        }
     }
     const int ok = pl_tex_recreate(p->vk->gpu, &p->thr96, pl_tex_params(.w = 256, .h = 256, .format = fmt,
                        .sampleable = true, .host_writable = true)) &&
