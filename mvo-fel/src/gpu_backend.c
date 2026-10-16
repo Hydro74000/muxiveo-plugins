@@ -771,14 +771,17 @@ static int render_precise(struct fel_gpu *p, const AVDOVIMetadata *metadata)
         H, H, G, H, H, G, G, G, G);
     if (p->precision == FEL_PRECISION_STANDARD && used > 0 && used < (int)sizeof(body))
         used += snprintf(body + used, sizeof(body) - used,
-            /* Float32 avec borne : erreur relative de L (EOTF), annulation de la matrice
-             * LMS→RGB et pente de la PQ ; R ≤ son erreur : PQ(2·erreur) majore l'écart. */
+            /* Float32 avec borne estimée (premier ordre, marges ×8 ; validée par stress, sans
+             * preuve formelle) : erreur relative de L (EOTF), annulation de la matrice LMS→RGB,
+             * puis PQ. La PQ est concave : sa pente sur [y-e, y+e] est maximale en y-e, d'où la
+             * pente prise en y-e ; si y ≤ e, PQ(2e) majore l'écart. */
             "refine=false;float fL[3],fR[3];"
             "for(int i=0;i<3;++i){float x=float(xd[i]),rel;fL[i]=f_eotf(x,1.0e-7*abs(x),rel);fR[i]=rel;"
             "if(rel>1.0e20)refine=true;}"
             "for(int i=0;i<3&&!refine;++i){float y=0.0,ey=0.0;"
             "for(int k=0;k<3;++k){float m=float(fel_d(%d+13+3*i+k));y+=m*fL[k];ey+=abs(m)*fL[k]*(fR[k]+1.0e-6);}"
-            "float slope;float pq=f_oetf(y,slope);float err=y>ey?slope*ey+2.0e-6*pq:f_oetf(2.0*ey,slope);"
+            "float slope;float pq=f_oetf(y,slope);float err;"
+            "if(y>ey){f_oetf(y-ey,slope);err=slope*ey+2.0e-6*pq;}else err=f_oetf(2.0*ey,slope);"
             "if(err*65535.0>0.4)refine=true;out3[i]=(floor(clamp(pq,0.0,1.0)*65535.0+0.5)+0.25)/65535.0;}",
             G);
     if (used > 0 && used < (int)sizeof(body))
