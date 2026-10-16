@@ -36,12 +36,20 @@ Conventions :
 | **R** | Rapide amélioré | Shader float32 Muxiveo à la place de libplacebo : pivots et zéro NLQ exacts, EOTF et OETF sans annulation | Écart au CPU mesuré (stress et réel), en baisse nette ; coût iGPU acceptable ; tous GPU |
 | ~~A2~~ | ~~Étage float32 du Standard~~ | Remplacé par A2' (décision du 16/10) : l'erreur relative de L en float32 plafonne vers 10⁻⁶ (L = g^6,28 amplifie l'erreur de g = num/den), borne réaliste 6·10⁻⁶ à 1,5·10⁻⁵ ; 15 à 80 % des pixels resteraient à recalculer, gain ≈ 1,3× au mieux | — |
 | **A2'** | Lent en virgule fixe multi-mots | Mapping (B0) **et EOTF** en entiers 64 bits : logarithme et exponentielle par table de 64 entrées et polynôme court, num = c₁·expm1(ln(x/x₀)/m2) sans annulation, inverse par Newton ; matrice LMS→RGB et seuils PQ en virgule fixe 96 bits ; erreurs de méthode bornées analytiquement, erreurs d'arrondi démontrées (Gappa, installé) ; même classement, mêmes reprises CPU et même auto-test qu'A1 ; variante choisie au démarrage là où elle bat le double (NVIDIA) | 0 différence avec C1 (stress, réel, attestation) ; débit Lent RTX ≈ 2× A1 |
-| **P** | Recouvrement du pipeline de rendu GPU | Plusieurs images en vol : téléversement, calcul, rapatriement des reprises et téléchargement d'images successives se chevauchent (contextes de rendu par fil, décision d'auto-test partagée) | Lent RTX vers 70 i/s ou plus ; codes inchangés (attestation) ; mémoire GPU mesurée |
-| **T0** | Banc Tensor Cores (RTX) | Mapping MMR et matrices en virgule fixe découpée en tranches INT8, produits partiels **exacts** accumulés en INT32 sur les unités matricielles (schéma d'Ozaki, `VK_KHR_cooperative_matrix`) ; pipeline de calcul hors libplacebo si l'extension GLSL ne peut pas y être activée ; même précision des termes que B0 (≤ 10⁻¹²), comparé au mapping en double d'A2 | **Go si au moins 2 fois plus rapide** que le mapping en double sur RTX ; sinon arrêt de T |
-| **T1** | Mapping sur Tensor Cores (si T0 go) | Intégration dans le Lent et le Standard : mapping exact à erreur bornée sur unités matricielles, le reste inchangé (étage float32 d'A2, classement par seuils, reprises vers le CPU) ; repli double sans l'extension | 0 différence avec C1 ; débit face à A2 sur RTX ; exactitude sans `shaderFloat64` possible sur Intel Arc (XMX), non testable localement |
+| **P** | Recouvrement du pipeline de rendu GPU | Plusieurs images en vol : téléversement, calcul, rapatriement des reprises et téléchargement d'images successives se chevauchent (un contexte de rendu par fil, précision et auto-test hérités, ordre rétabli par tickets). Conservé dans tous les cas : levier principal pour les GPU non NVIDIA et utile partout où le GPU a des temps morts | Codes inchangés (attestation) ; débit et mémoire GPU mesurés |
+| **M** | Mesures de bout en bout | Workflow Muxiveo complet (`benchmark_fel_workflow.py`), FEL Lent puis Standard : x265 (CPU), NVEncC HEVC 10 bits sur le même GPU (preset rapide et lent), hevc_nvenc en NUT et direct ; RTX et iGPU ; configurations P (1 ou 2 images en vol), puis T et P + T après T0 | Débit global et durée par encodeur ; P ne doit pas ralentir un encodeur GPU partagé (sinon une seule image en vol dans ce cas) |
+| **T0** | Banc Tensor Cores (RTX) | Mapping MMR et matrices en virgule fixe découpée en tranches INT8, produits partiels **exacts** accumulés en INT32 sur les unités matricielles (schéma d'Ozaki, `VK_KHR_cooperative_matrix`) ; pipeline de calcul hors libplacebo si l'extension GLSL ne peut pas y être activée ; référence à battre : la virgule fixe multi-mots d'A2' (mapping ≈ 2 ms sur 7,8 ms de composition UHD) | Gain sur la composition, puis débit global mesuré en M (T seul, P + T) ; T et P sont cumulables, pas exclusifs |
+| **T1** | Tensor Cores dans le rendu exact (si T0 go) | **Intégré à l'extension Tensor existante** (`mvo-rife-trt`, dépôt muxiveo-plugins), qui devient l'extension portant tous les sujets Tensor du projet Muxiveo : interface entre mvo-fel et l'extension (chargement dynamique facultatif), repli virgule fixe A2' sans l'extension ; mêmes classement, reprises et auto-test | 0 différence avec C1 ; débit face à A2' sur RTX et en M ; licence vérifiée (ci-dessous) |
+| **Q** | Politique adaptative | Nombre d'images en vol et emploi des Tensor Cores choisis par Muxiveo selon l'encodeur (CPU ou GPU partagé), le GPU (NVIDIA ou non) et les mesures de M : option d'ABI additive (au lieu de `MVO_FEL_GPU_WORKERS`) | Meilleure configuration mesurée pour chaque cas ; textes de Muxiveo |
 | **V** | Validation et livraison | Attestation de schéma 5 (référence certifiée, compteurs de reprises) ; documentation ; textes de Muxiveo (débits et précisions) | Attestation réussie ; tests Muxiveo et natifs verts |
 
-Ordre d'exécution : C0 → C1 → A1 → B0 → R → A2' → B1 (arrêté) → P → V ; T0 → T1 reportés, sur mesure (décision du 16/10 : le mapping ne pèse plus qu'environ 2 ms sur 7,8 ms de composition, le goulot est la mise en série de l'étage de rendu). Chaque lot est commité séparément puis audité.
+Ordre d'exécution : C0 → C1 → A1 → B0 → R → A2' → B1 (arrêté) → P → M (P) → T0 → M (T, P + T) → T1 (si go) → Q → V. Chaque lot est commité séparément puis audité.
+
+Décisions du 16/10 :
+
+- P avant T : le mapping ne pèse plus qu'environ 2 ms sur 7,8 ms de composition, et le goulot était la mise en série de l'étage de rendu.
+- P est conservé, et la politique Q en règle l'emploi.
+- T est évalué contre P et cumulé avec lui. Il réduit le travail, au lieu de remplir les temps morts, ce qui l'avantage quand le GPU est partagé avec un encodeur (NVEncC, NVENC). Sur un encodage CPU (x265), l'encodeur limite probablement le débit, et M le dira.
 
 T vient après A2' : sa référence à battre est la virgule fixe multi-mots d'A2' sur RTX, et non plus le double.
 
@@ -50,7 +58,9 @@ Ce que les Tensor Cores ne couvrent pas :
 - **pas de double.** Les GeForce n'ont pas d'unités matricielles FP64, et FP16, BF16, TF32 et FP8 sont moins précis que le float32 ;
 - **pas l'EOTF.** Les fonctions transcendantes n'ont pas une forme matricielle ;
 - **pas l'iGPU Raphael.** Le RDNA2 n'a pas d'instructions matricielles ;
-- **pas TensorRT.** C'est de l'inférence non exacte.
+- **pas TensorRT.** C'est de l'inférence non exacte. T1 n'emploie que le calcul matriciel Vulkan, même s'il vit dans l'extension Tensor.
+
+**Licence de l'extension Tensor.** `mvo-rife-trt` est distribuée avec TensorRT for RTX, sous licence NVIDIA. La clause 2.13 interdit de publier des mesures de performance de TensorRT. Avant T1, il faut vérifier que cette clause ne s'étend pas aux mesures du rendu FEL, qui n'utilise pas TensorRT. Sinon, les débits du FEL Tensor ne seront pas publiés, ou le module FEL sera distribué à part, sous licence MIT, dans la même extension.
 
 ## Points de décision
 
@@ -80,3 +90,4 @@ Ce que les Tensor Cores ne couvrent pas :
 | B0 | Fait : [banc](2026-10-16-b0-entiers-multimots.md) ; Raphael 0,54× (critère 2× non atteint) : **B1 arrêté**. RTX : 2,64× plus rapide que le double, candidat pour le mapping d'A2 et référence de T0 |
 | R | Fait : [Rapide amélioré](2026-10-16-rapide-ameliore.md) ; stress : 9 151 → 1 code 16 bits (matrices réelles), 1 026 → 112 (identité) ; réel : 1 code ; iGPU −12 % |
 | A2' | Fait : [Lent en virgule fixe](2026-10-16-a2-virgule-fixe.md) ; RTX : composition 18,7 → 7,8 ms, Lent 34,4 → 43,6–51,4 i/s, 0 reprise sur scènes réelles ; iGPU : double conservé (choix par auto-test) |
+| P | Fait (plugin seul) : [recouvrement](2026-10-16-recouvrement.md), 2 images en vol ; Lent RTX 50,5 → 57,3 i/s ; mesures de bout en bout (M) en cours |
