@@ -35,14 +35,26 @@ Conventions :
 | **B1** | Certificat entier (si B0 go) | EOTF et matrice en virgule fixe à borne démontrée, classement par seuils, reprises vers le CPU ; aucun `shaderFloat64` requis | 0 différence avec C1 ; débit iGPU face au Standard actuel ; exactitude possible sur Intel Arc et Mac |
 | **R** | Rapide amélioré | Shader float32 Muxiveo à la place de libplacebo : pivots et zéro NLQ exacts, EOTF et OETF sans annulation | Écart au CPU mesuré (stress et réel), en baisse nette ; coût iGPU acceptable ; tous GPU |
 | **A2** | Étage float32 du Standard | Étage float32 avant A1 ; borne float32 **démontrée** (Gappa, à installer dans le distrobox de développement) ; liste compacte vers A1 | 0 différence avec C1 ; débit proche du Standard actuel sur GPU dédié |
+| **T0** | Banc Tensor Cores (RTX) | Mapping MMR et matrices en virgule fixe découpée en tranches INT8, produits partiels **exacts** accumulés en INT32 sur les unités matricielles (schéma d'Ozaki, `VK_KHR_cooperative_matrix`) ; pipeline de calcul hors libplacebo si l'extension GLSL ne peut pas y être activée ; même précision des termes que B0 (≤ 10⁻¹²), comparé au mapping en double d'A2 | **Go si au moins 2 fois plus rapide** que le mapping en double sur RTX ; sinon arrêt de T |
+| **T1** | Mapping sur Tensor Cores (si T0 go) | Intégration dans le Lent et le Standard : mapping exact à erreur bornée sur unités matricielles, le reste inchangé (étage float32 d'A2, classement par seuils, reprises vers le CPU) ; repli double sans l'extension | 0 différence avec C1 ; débit face à A2 sur RTX ; exactitude sans `shaderFloat64` possible sur Intel Arc (XMX), non testable localement |
 | **V** | Validation et livraison | Attestation de schéma 5 (référence certifiée, compteurs de reprises) ; documentation ; textes de Muxiveo (débits et précisions) | Attestation réussie ; tests Muxiveo et natifs verts |
 
-Ordre d'exécution : C0 → C1 → A1 → B0 → R → A2 → B1 (si go) → V. Chaque lot est commité séparément puis audité.
+Ordre d'exécution : C0 → C1 → A1 → B0 → R → A2 → B1 (si go) → T0 → T1 (si go) → V. Chaque lot est commité séparément puis audité.
+
+T vient après A2 : tant que l'EOTF en double domine (A1), accélérer le mapping ne change presque rien. Une fois l'EOTF passée dans l'étage float32 d'A2, le mapping, qui reste en précision étendue à cause des annulations du MMR, devient le poste dominant sur GPU dédié.
+
+Ce que les Tensor Cores ne couvrent pas :
+
+- **pas de double.** Les GeForce n'ont pas d'unités matricielles FP64, et FP16, BF16, TF32 et FP8 sont moins précis que le float32 ;
+- **pas l'EOTF.** Les fonctions transcendantes n'ont pas une forme matricielle ;
+- **pas l'iGPU Raphael.** Le RDNA2 n'a pas d'instructions matricielles ;
+- **pas TensorRT.** C'est de l'inférence non exacte.
 
 ## Points de décision
 
 - **Après A1 :** si A2 donne au Standard l'exactitude du Lent pour un débit proche, les modes Lent et Standard deviennent tous deux exacts. Faut-il les garder distincts (Lent sans étage float32, Standard avec), ou les fusionner ? La décision revient à l'utilisateur, au vu des mesures.
 - **Après B0 :** go ou arrêt de B1, selon le critère du double débit.
+- **Après T0 :** go ou arrêt de T1, selon le critère du double débit sur RTX. T0 se mesure sur la seule RTX : la GTX 1070 et les UHD 630 et 730 n'ont pas d'unités matricielles, et aucun Arc n'est disponible.
 - **A2 :** l'installation de Gappa dans le distrobox de développement sera demandée avant ce lot.
 
 ## Risques
@@ -53,6 +65,7 @@ Ordre d'exécution : C0 → C1 → A1 → B0 → R → A2 → B1 (si go) → V. 
 | Optimisations du pilote GPU sur les transformations exactes | Pas de float-float sur GPU ; reprises fines sur CPU (compilation maîtrisée, sans contraction) |
 | Synchronisation GPU → CPU pour les reprises | Liste minuscule (moins d'un pixel sur 10⁶ attendu en A1) ; rapatriement groupé par image ; coût mesuré |
 | Écart entre l'ancienne référence et la référence certifiée | Écarts comptés et expliqués (proximité d'une frontière) avant de changer de référence |
+| Extension `VK_KHR_cooperative_matrix` absente du contexte FFmpeg importé, ou non activable dans libplacebo | Activation à la création du périphérique autonome ; pipeline de calcul dédié ; repli sur le mapping en double |
 | Taille de la table (512 Kio) | Intégrée au plugin et partagée par toutes les images ; générateur et empreinte versionnés |
 
 ## Avancement
