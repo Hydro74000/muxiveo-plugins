@@ -52,11 +52,17 @@ toujours la référence certifiée, quel que soit le mode.
 
 | Mode | Calcul GPU | Écart au CPU | RTX 4070 Ti SUPER | iGPU Raphael |
 |---|---|---|---:|---:|
-| `exact` (Lent, recommandé) | classement certifié entre seuils PQ, reprises par le CPU certifié, Y'CbCr en entiers exacts ; variante choisie par auto-test : virgule fixe multi-mots ([A2'](docs/2026-10-16-a2-virgule-fixe.md)) ou double ([A1](docs/2026-10-16-gpu-exact-certifie.md)) | identique au bit près (référence certifiée) | 43,6–51,4 i/s (virgule fixe) | 2,5 i/s (double) |
+| `exact` (Lent, recommandé) | classement certifié entre seuils PQ, reprises par le CPU certifié, Y'CbCr en entiers exacts ; variante choisie par auto-test : virgule fixe multi-mots ([A2'](docs/2026-10-16-a2-virgule-fixe.md)) ou double ([A1](docs/2026-10-16-gpu-exact-certifie.md)) | identique au bit près (référence certifiée) | 57,3 i/s (virgule fixe) | 2,5 i/s (double) |
 | `standard` | float32 reformulé, borne d'erreur par pixel, recalcul en double au-delà de 0,4 code | ≤ 1 code 16 bits | 66,7 i/s | 8,1 i/s |
-| `fast` (défaut de l'ABI) | shader float32 Muxiveo : sommes, segments et zéro NLQ exacts, EOTF et OETF sans annulation ([détails](docs/2026-10-16-rapide-ameliore.md)) | 1 code 16 bits sur scènes réelles ; jusqu'à 112 codes 16 bits sur le stress synthétique le plus défavorable | 74–78 i/s | 19,8 i/s |
+| `fast` (défaut de l'ABI) | shader float32 Muxiveo : sommes, segments et zéro NLQ exacts, EOTF et OETF sans annulation ([détails](docs/2026-10-16-rapide-ameliore.md)) | 1 code 16 bits sur scènes réelles ; jusqu'à 112 codes 16 bits sur le stress synthétique le plus défavorable | 74–78 i/s | 20,2 i/s |
 
-Débit du plugin seul, 300 images UHD, sortie 10 bits finale ; CPU (7800X3D) : 7,9 i/s.
+Débit du plugin seul, 300 images UHD, sortie 10 bits finale, 2 images en vol ; CPU (7800X3D) : 7,9 i/s.
+
+Le rendu GPU garde par défaut 2 images en vol, chacune avec son propre contexte sur le même
+périphérique ([recouvrement](docs/2026-10-16-recouvrement.md)). `mvo_fel_set_render_workers`
+(capacité `render_workers`, de 1 à 4) règle ce nombre avant `run`. Une seule image suffit quand
+un autre traitement GPU limite déjà le débit, par exemple l'interpolation RIFE
+([mesures de bout en bout](docs/2026-10-16-mesures-bout-en-bout.md)).
 
 Dans les modes `exact` et `standard` :
 
