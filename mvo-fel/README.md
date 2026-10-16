@@ -211,17 +211,28 @@ python3 scripts/package.py linux-x86_64 build build/dist \
   --validation build/gpu-validation.json
 ```
 
-`validate_gpu.py` teste tous les GPU énumérés sur trois scènes distinctes.
-Il utilise aussi le FFmpeg de validation pour lire en pipe le NUT produit par
-la bibliothèque exacte : les images 0, 8 et 16 doivent avoir les mêmes
-empreintes GBRP16LE que le renderer comparé aux références CPU et `kernel64`.
-Aucun intermédiaire vidéo n'est écrit. Les sorties finales Y'CbCr 4:2:0 10 bits
-du même NUT sont ensuite comparées à une conversion de référence en double
-(numpy), recalculée depuis ce RGB attesté : position chroma `topleft` recadrée
-sans tramage (arrondi exact, ≤ 0,5 code), puis `left` avec le tramage livré
-(< 1 code). L'attestation de schéma 3 contient ces empreintes, ces écarts et les
-SHA-256 du moteur, des sources et des dépendances ; les schémas 1 et 2 ne sont
-plus acceptés.
+`validate_gpu.py` teste tous les GPU énumérés sur trois scènes distinctes, dans
+chaque précision : `fast` sur tout GPU, `standard` et `exact` sur les GPU
+calculant en double. Il utilise le FFmpeg de validation pour lire en pipe le NUT
+produit par la bibliothèque exacte : les images 0, 8 et 16 doivent avoir les
+mêmes empreintes GBRP16LE que le renderer, comparé aux références CPU et
+`kernel64`. Aucun intermédiaire vidéo n'est écrit.
+
+Critères par précision :
+
+- `fast` : ≤ 2 codes PQ12 face au CPU et à `kernel64` ;
+- `standard` : en plus, ≤ 1 code 16 bits face au chemin CPU rapide (sommes entières exactes) ;
+- `exact` : 0 code ; images RGB et Y'CbCr du producteur identiques octet pour octet à celles du CPU.
+
+Les sorties finales Y'CbCr 4:2:0 10 bits du même NUT sont ensuite comparées à une
+conversion de référence en double (numpy), recalculée depuis ce RGB attesté :
+
+- position chroma `topleft` recadrée sans tramage : arrondi exact, ≤ 0,5 code ;
+- position `left` avec le tramage livré : < 1 code.
+
+L'attestation de schéma 4 contient, par précision, ces empreintes et ces écarts,
+ainsi que les SHA-256 du moteur, des sources et des dépendances. Les schémas 1 à 3
+ne sont plus acceptés.
 Le packaging refuse un paquet GPU sans attestation valide. Il est autorisé sur
 Linux et Windows ; macOS reste CPU, faute de contenu réel en CI. Le paquet est
 autonome hors pilote graphique : `package.py` vérifie les dépendances ELF, ou les
@@ -244,9 +255,10 @@ python3 scripts/package.py linux-x86_64 build build/dist \
 
 L'attestation vérifie aussi les images Vulkan produites par ce binaire exact,
 après lecture de 17 images, et refuse une différence d'empreinte avec le renderer
-de référence aux images 0/8/16. Les images P010 finales du filtre (position
-chroma, recadrage, tramage) doivent être identiques, octet pour octet, aux sorties
-Y'CbCr attestées du producteur. Le paquet contient le binaire `ffmpeg-fel`, ses
+de référence aux images 0/8/16, dans chaque précision (option `precision` du
+filtre). Les images P010 finales du filtre (position chroma, recadrage, tramage)
+doivent être identiques, octet pour octet, aux sorties Y'CbCr attestées du
+producteur. Le paquet contient le binaire `ffmpeg-fel`, ses
 sources et configurations, les en-têtes NVIDIA MIT épinglés et leurs notices.
 Muxiveo ne l'utilise que si le manifeste du plugin l'annonce et que le workflow
 est compatible. Sinon, la reconstruction FEL continue par NUT.

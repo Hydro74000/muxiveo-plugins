@@ -373,6 +373,10 @@ Le [plan de continuation](docs/2026-10-15-plan-continuation.md) a été réalis�
   - composition fusionnée en entiers exacts.
   - Écart PQ12 face au CPU ramené de 1,37 à 0,125 au maximum.
 - **CPU :** 0,7 → 8,1 i/s UHD (entiers exacts séparables, PQ et matrice en double vectorisées).
+- **Précision GPU (lots 11–12) :** modes `exact` (double natif, identique au CPU au bit
+  près), `standard` (hybride borné, ≤ 1 code 16 bits) et `fast` (float32) ; pivots et zéro
+  NLQ décidés sur sommes entières exactes, aussi sur CPU ; attestation de schéma 4 par
+  précision ([proposition](docs/2026-10-16-gpu-exact-proposition.md)).
 - **Plateformes :**
   - GPU Windows attesté sur matériel réel ;
   - macOS : CPU, avec le GPU en choix manuel derrière une sonde CI ;
@@ -380,8 +384,10 @@ Le [plan de continuation](docs/2026-10-15-plan-continuation.md) a été réalis�
 
 Restent avant une release générale :
 
-- attestation de schéma 3 de la bibliothèque définitive (Linux, Windows), mesures de
+- attestation de schéma 4 de la bibliothèque définitive (Linux, Windows), mesures de
   bout en bout, construction portable et paquet ;
+- optimisation iGPU du mode standard (borne plus fine, mapping float32 quand c'est sûr) ;
+- recherche : quantification certifiée (seuils PQ inverses, certificat entier) ;
 - publication de 0.2.0 puis épinglage dans Muxiveo (accord du mainteneur) ;
 - lecture P8.1 et repli HDR10 sur un téléviseur Dolby Vision ;
 - candidats CI Windows (MSYS2) et sonde macOS à exécuter ;

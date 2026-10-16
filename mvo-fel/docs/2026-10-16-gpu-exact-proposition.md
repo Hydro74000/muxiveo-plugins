@@ -91,3 +91,25 @@ Part de pixels recalculés en double sur films réels :
 | G3 | Tests : stress GPU 3 × 200 graines (≤ 1 code face au CPU exact) dans `fel_gpu_reference_test`. Attestation de schéma 4 : GPU face au CPU exact, tolérance 1 code 16 bits. |
 | G4 | iGPU : borne plus fine, mesure, choix Auto du moteur exact le plus rapide. |
 | G5 | Attestation finale Linux et Windows (GTX 1070), documentation, réponse. |
+
+## Décision et mise en œuvre (16/10/2026)
+
+Choix de l'utilisateur : trois modes exposés dans Muxiveo.
+
+| Mode | Mention | Moteur |
+|---|---|---|
+| Lent | recommandé, défaut | `exact` : double natif partout, conversion Y'CbCr comprise ; GPU identique au CPU au bit près (attestation de schéma 4) |
+| Standard | rapide, moins précis | `standard` : hybride borné |
+| Rapide | non recommandé | `fast` : float32 libplacebo, avertissement de dérive aux couleurs extrêmes |
+
+GPU sans double natif : rendu CPU en Lent et Standard.
+
+Une relecture indépendante (16/10) a relevé un défaut de la borne du Standard : la pente de la PQ, prise au centre de l'intervalle, sous-estime l'écart descendant. La PQ étant concave, la pente est désormais évaluée en bas de l'intervalle. La borne reste une estimation au premier ordre, validée par stress, pas une preuve.
+
+La même relecture propose une quantification certifiée :
+
+- classement de la valeur linéaire entre des seuils PQ inverses précalculés (table d'environ 1 Mio) ;
+- encadrement en arithmétique entière ;
+- recalcul des seules valeurs ambiguës dans une seconde passe compacte.
+
+Cette piste viserait le bit à bit sans double partout, y compris sur les GPU sans double natif. Elle est retenue comme lot de recherche ultérieur. Le point dur est l'encadrement certifié de l'EOTF ; la première mesure à faire est le taux de valeurs ambiguës.

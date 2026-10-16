@@ -11,16 +11,27 @@ from pathlib import Path
 
 
 def validate_producer(lib: ctypes.CDLL, clip: Path, uuid: str, frame_bytes: int,
-                      expected: list[str]) -> tuple[dict, list[bytes]]:
+                      expected: list[str], precision: str = "fast") -> tuple[dict, list[bytes]]:
     """Aucun intermédiaire vidéo ; FFmpeg sélectionne les images 0, 8 et 16 (rendues aussi brutes)."""
     if not 0 < frame_bytes <= 8192*8192*6 or len(expected) != 3:
         raise ValueError("Dimensions ou nombre d'images de validation invalides")
-    backend, frames = producer_frames(lib, clip, uuid, frame_bytes, "gbrp16le")
+    backend, frames = producer_frames(lib, clip, uuid, frame_bytes, "gbrp16le", precision_setter(lib, precision))
     hashes = [hashlib.sha256(frame).hexdigest() for frame in frames]
     if hashes != expected:
         raise RuntimeError(f"Pixels de la bibliothèque différents de la référence : moteur={backend!r}, "
                            f"empreintes={[h[:16] for h in hashes]}")
     return {"backend": backend, "frame_sha256": hashes}, frames
+
+
+def precision_setter(lib: ctypes.CDLL, precision: str) -> Callable[[int], None]:
+    """Réglage de précision appliqué au contexte du producteur avant le rendu."""
+    lib.mvo_fel_set_precision.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
+    lib.mvo_fel_set_precision.restype = ctypes.c_int
+
+    def configure(context: int) -> None:
+        if lib.mvo_fel_set_precision(context, precision.encode("ascii")):
+            raise RuntimeError(f"Précision refusée : {precision}")
+    return configure
 
 
 def producer_frames(lib: ctypes.CDLL, clip: Path, uuid: str, frame_bytes: int, pixel_format: str,

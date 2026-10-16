@@ -20,18 +20,24 @@ class PackageValidationTests(unittest.TestCase):
         self.library = Path(self.temp.name) / "library.so"
         self.library.write_bytes(b"bibliotheque de test")
         self.validation = Path(self.temp.name) / "validation.json"
+        def mode(name: str) -> dict:
+            result = {"max_cpu_pq12": 0.0 if name == "exact" else 1.0, "max_reference_pq12": 1.1,
+                      "max_fast_codes16": {"fast": 16, "standard": 1, "exact": 0}[name],
+                      "producer": {"backend": "vulkan: test", "frame_sha256": ["b"*64]*3},
+                      "yuv": [{"chroma": "topleft", "dither": "none", "crop": [2, 4, 6, 8], "max_code10": .5,
+                               "frame_sha256": ["d"*64]*3},
+                              {"chroma": "left", "dither": "blue", "crop": [0, 0, 0, 0], "max_code10": .9999,
+                               "frame_sha256": ["e"*64]*3}]}
+            if name == "exact":
+                result["cpu_identical"] = True
+            return result
         self.report = {
-            "schema": 3, "passed": True, "tolerance_pq12": 2,
+            "schema": 4, "passed": True, "tolerance_pq12": 2, "tolerance_codes16": {"standard": 1, "exact": 0},
             "library_sha256": package.digest(self.library),
             "backend_source_sha256": package.digest(package.ROOT / "src/gpu_backend.c"),
             "dependencies": json.loads((package.ROOT / "dependencies.json").read_text()),
-            "samples": [{"device": {"uuid": "a"*32}, "clip_sha256": str(index)*64, "frames": 3,
-                         "max_cpu_pq12": 1.0, "max_reference_pq12": 1.1,
-                         "producer": {"backend": "vulkan: test", "frame_sha256": ["b"*64]*3},
-                         "yuv": [{"chroma": "topleft", "dither": "none", "crop": [2, 4, 6, 8], "max_code10": .5,
-                                  "frame_sha256": ["d"*64]*3},
-                                 {"chroma": "left", "dither": "blue", "crop": [0, 0, 0, 0], "max_code10": .9999,
-                                  "frame_sha256": ["e"*64]*3}]}
+            "samples": [{"device": {"uuid": "a"*32, "float64": True}, "clip_sha256": str(index)*64, "frames": 3,
+                         "modes": {name: mode(name) for name in ("fast", "standard", "exact")}}
                         for index in range(3)],
         }
         lib = Mock()
@@ -49,7 +55,7 @@ class PackageValidationTests(unittest.TestCase):
         self.assertTrue(self.load()["experimental"])
 
     def test_old_attestation_is_rejected(self):
-        self.report["schema"] = 1
+        self.report["schema"] = 3
         with self.assertRaisesRegex(RuntimeError, "incompatible"):
             self.load()
 
@@ -59,27 +65,48 @@ class PackageValidationTests(unittest.TestCase):
             self.load()
 
     def test_missing_producer_pixels_are_rejected(self):
-        del self.report["samples"][0]["producer"]
+        del self.report["samples"][0]["modes"]["fast"]["producer"]
         with self.assertRaisesRegex(RuntimeError, "pixels"):
             self.load()
 
     def test_cpu_fallback_is_rejected(self):
-        self.report["samples"][0]["producer"]["backend"] = "cpu"
+        self.report["samples"][0]["modes"]["exact"]["producer"]["backend"] = "cpu"
         with self.assertRaisesRegex(RuntimeError, "pixels"):
             self.load()
 
     def test_pq_threshold_is_not_relaxed(self):
-        self.report["samples"][0]["max_reference_pq12"] = 2.001
+        self.report["samples"][0]["modes"]["fast"]["max_reference_pq12"] = 2.001
         with self.assertRaisesRegex(RuntimeError, "PQ12"):
             self.load()
 
+    def test_precise_modes_are_required_on_float64_gpus(self):
+        del self.report["samples"][2]["modes"]["standard"]
+        with self.assertRaisesRegex(RuntimeError, "Précisions"):
+            self.load()
+
+    def test_exact_mode_must_match_cpu(self):
+        self.report["samples"][0]["modes"]["exact"]["max_fast_codes16"] = 1
+        with self.assertRaisesRegex(RuntimeError, "exact"):
+            self.load()
+
+    def test_standard_mode_bound_is_one_code(self):
+        self.report["samples"][1]["modes"]["standard"]["max_fast_codes16"] = 2
+        with self.assertRaisesRegex(RuntimeError, "standard"):
+            self.load()
+
+    def test_gpu_without_float64_needs_fast_mode_only(self):
+        for sample in self.report["samples"]:
+            sample["device"]["float64"] = False
+            del sample["modes"]["standard"], sample["modes"]["exact"]
+        self.load()
+
     def test_final_yuv_outputs_are_required(self):
-        self.report["samples"][0]["yuv"].pop()
+        self.report["samples"][0]["modes"]["standard"]["yuv"].pop()
         with self.assertRaisesRegex(RuntimeError, "Y'CbCr"):
             self.load()
 
     def test_yuv_rounding_is_not_relaxed(self):
-        self.report["samples"][1]["yuv"][0]["max_code10"] = .6
+        self.report["samples"][1]["modes"]["fast"]["yuv"][0]["max_code10"] = .6
         with self.assertRaisesRegex(RuntimeError, "Y'CbCr"):
             self.load()
 
@@ -89,17 +116,19 @@ class PackageValidationTests(unittest.TestCase):
         self.report["direct"] = {"binary_sha256": package.digest(binary),
             "filter_sources": {p.name: package.digest(p) for p in sorted((package.ROOT/'integrations/ffmpeg').glob('*.c'))}}
         for sample in self.report["samples"]:
-            sample["direct"] = {"transport": "vulkan", "frames_read": 17,
-                                "frame_sha256": sample["producer"]["frame_sha256"],
-                                "yuv": [case["frame_sha256"] for case in sample["yuv"]]}
+            for result in sample["modes"].values():
+                result["direct"] = {"transport": "vulkan", "frames_read": 17,
+                                    "frame_sha256": result["producer"]["frame_sha256"],
+                                    "yuv": [case["frame_sha256"] for case in result["yuv"]]}
         self.load()
         package.check_direct(binary, self.validation)
-        self.report["samples"][0]["direct"]["yuv"][1] = ["f"*64]*3
+        exact = self.report["samples"][0]["modes"]["exact"]
+        exact["direct"]["yuv"][1] = ["f"*64]*3
         self.load()
         with self.assertRaisesRegex(RuntimeError, "Pixels"):
             package.check_direct(binary, self.validation)
-        self.report["samples"][0]["direct"]["yuv"][1] = self.report["samples"][0]["yuv"][1]["frame_sha256"]
-        self.report["samples"][0]["direct"]["frame_sha256"] = ["c"*64]*3
+        exact["direct"]["yuv"][1] = exact["yuv"][1]["frame_sha256"]
+        self.report["samples"][0]["modes"]["fast"]["direct"]["frame_sha256"] = ["c"*64]*3
         self.load()
         with self.assertRaisesRegex(RuntimeError, "Pixels"):
             package.check_direct(binary, self.validation)

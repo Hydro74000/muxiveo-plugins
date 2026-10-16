@@ -9,6 +9,7 @@
 #include <iomanip>
 #include <memory>
 #include <stdexcept>
+#include <string>
 #include <vector>
 extern "C" {
 #include <libavcodec/avcodec.h>
@@ -25,6 +26,7 @@ void *fel_gpu_create(int, int, const char *);
 void fel_gpu_destroy(void *);
 int fel_gpu_device_name(void *, char *, size_t);
 int fel_gpu_render(void *, const AVDOVIMetadata *, const AVFrame *, const AVFrame *, uint16_t *);
+int fel_gpu_set_precision(void *, int);
 }
 using namespace muxiveo::fel;
 namespace {
@@ -129,6 +131,12 @@ double compare(const AVFrame &bl, const AVFrame &el, int number, bool kernel64, 
         }
         void *gpu = fel_gpu_create(bl.width, bl.height, std::getenv("MVO_FEL_TEST_DEVICE"));
         require(gpu, "Initialisation du prototype GPU");
+        // Précision du rendu (exact, standard, fast) ; défaut fast, comme l'ABI.
+        const std::string precision = std::getenv("MVO_FEL_TEST_PRECISION") ? std::getenv("MVO_FEL_TEST_PRECISION") : "fast";
+        const int mode = precision == "exact" ? FEL_PRECISION_EXACT : precision == "standard" ? FEL_PRECISION_STANDARD
+                       : precision == "fast" ? FEL_PRECISION_FAST : -1;
+        if (mode < 0 || !fel_gpu_set_precision(gpu, mode)) { fel_gpu_destroy(gpu); require(false, "Précision GPU indisponible"); }
+        std::cout << "gpu_precision=" << precision << std::endl;
         char device_name[256];
         require(fel_gpu_device_name(gpu, device_name, sizeof(device_name)), "Identification du GPU");
         std::cout << "gpu_device=" << device_name << std::endl;
@@ -166,6 +174,20 @@ double compare(const AVFrame &bl, const AVFrame &el, int number, bool kernel64, 
             oracle_error=std::max(oracle_error,delta);oracle_above+=delta>2;
         }
         std::cout<<"gpu_frame="<<number<<" max_delta_kernel64_pq12="<<oracle_error<<" above_2="<<oracle_above<<std::endl;
+        // CPU rapide (sommes entières exactes, double) : référence des précisions exacte et standard.
+        Frame fast_rgb(av_frame_alloc());
+        fast_rgb->width = bl.width; fast_rgb->height = bl.height; fast_rgb->format = AV_PIX_FMT_GBRP16LE;
+        checked(av_frame_get_buffer(fast_rgb.get(), 32));
+        FastReconstruction fast(bl, el);
+        require(fast.valid() && fast.bind(bl, el, *metadata), "Chemin CPU rapide indisponible");
+        fast.rows(mapping, *fast_rgb, 0, bl.height);
+        int fast_error = 0;
+        for (int y = 0; y < bl.height; ++y) for (int x = 0; x < bl.width; ++x) for (int c = 0; c < 3; ++c) {
+            const int plane = c == 0 ? 2 : c == 1 ? 0 : 1;
+            const auto *q = fast_rgb->data[plane]+y*fast_rgb->linesize[plane]+2*x;
+            fast_error = std::max(fast_error, std::abs(int(output[4ull*(y*bl.width+x)+c])-int(q[0]+256*q[1])));
+        }
+        std::cout<<"gpu_frame="<<number<<" max_delta_fast_codes16="<<fast_error<<std::endl;
         // Empreinte des pixels GBRP16LE pour vérifier aussi la bibliothèque livrée.
         AVSHA *sha = av_sha_alloc();
         require(sha, "Allocation SHA-256");

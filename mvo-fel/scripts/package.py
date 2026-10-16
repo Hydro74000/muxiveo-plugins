@@ -25,6 +25,33 @@ def digest(path: Path) -> str:
     return h.hexdigest()
 
 
+def check_mode(result: dict, mode: str) -> None:
+    """Une précision attestée : écarts, pixels du producteur, sorties Y'CbCr."""
+    for metric in ("max_cpu_pq12", "max_reference_pq12"):
+        value = float(result[metric])
+        if not math.isfinite(value) or not 0 <= value <= 2:
+            raise RuntimeError("Seuil PQ12 dépassé dans l'attestation")
+    codes = result.get("max_fast_codes16")
+    if (not isinstance(codes, int) or codes < 0 or mode == "standard" and codes > 1
+            or mode == "exact" and (codes or result.get("cpu_identical") is not True)):
+        raise RuntimeError(f"Précision {mode} hors tolérance dans l'attestation")
+    producer = result.get("producer", {})
+    hashes = producer.get("frame_sha256", [])
+    if (len(hashes) != 3 or not all(re.fullmatch(r"[0-9a-f]{64}", h) for h in hashes)
+            or not producer.get("backend", "").startswith("vulkan:")):
+        raise RuntimeError("Comparaison des pixels de la bibliothèque livrée absente")
+    # Sorties finales Y'CbCr : arrondi exact recadré et tramage livré, face à la référence en double.
+    yuv = result.get("yuv") or []
+    if (not any(case.get("dither") == "none" and any(case.get("crop") or []) for case in yuv)
+            or not any(case.get("dither") == "blue" for case in yuv)):
+        raise RuntimeError("Sorties Y'CbCr finales absentes de l'attestation")
+    for case in yuv:
+        value = float(case["max_code10"])
+        if (not math.isfinite(value) or not 0 <= value <= (.52 if case["dither"] == "none" else 1.02)
+                or len(case.get("frame_sha256") or []) != 3):
+            raise RuntimeError("Sortie Y'CbCr hors tolérance dans l'attestation")
+
+
 def load_capabilities(library: Path, validation: Path | None = None) -> dict:
     """Valide le moteur ; un prototype exige son attestation numérique exacte."""
     lib = ctypes.CDLL(str(library.resolve()))
@@ -37,34 +64,23 @@ def load_capabilities(library: Path, validation: Path | None = None) -> dict:
         if validation is None:
             raise RuntimeError("Le prototype Vulkan exige une attestation numérique de cette bibliothèque")
         report = json.loads(validation.read_text(encoding="utf-8"))
-        if (report.get("schema") != 3 or report.get("passed") is not True or report.get("tolerance_pq12") != 2
+        if (report.get("schema") != 4 or report.get("passed") is not True or report.get("tolerance_pq12") != 2
+                or report.get("tolerance_codes16") != {"standard": 1, "exact": 0}
                 or report.get("library_sha256") != digest(library)
                 or report.get("backend_source_sha256") != digest(ROOT / "src/gpu_backend.c")
                 or report.get("dependencies") != json.loads((ROOT / "dependencies.json").read_text(encoding="utf-8"))):
             raise RuntimeError("Attestation GPU incompatible avec cette bibliothèque")
         scenes: dict[str, set[str]] = {}
         for sample in report.get("samples", []):
-            for metric in ("max_cpu_pq12", "max_reference_pq12"):
-                value = float(sample[metric])
-                if not math.isfinite(value) or not 0 <= value <= 2:
-                    raise RuntimeError("Seuil PQ12 dépassé dans l'attestation")
             if sample.get("frames", 0) < 3:
                 raise RuntimeError("Attestation GPU incomplète")
-            producer = sample.get("producer", {})
-            hashes = producer.get("frame_sha256", [])
-            if (len(hashes) != sample["frames"] or not all(re.fullmatch(r"[0-9a-f]{64}", h) for h in hashes)
-                    or not producer.get("backend", "").startswith("vulkan:")):
-                raise RuntimeError("Comparaison des pixels de la bibliothèque livrée absente")
-            # Sorties finales Y'CbCr : arrondi exact recadré et tramage livré, face à la référence en double.
-            yuv = sample.get("yuv") or []
-            if (not any(case.get("dither") == "none" and any(case.get("crop") or []) for case in yuv)
-                    or not any(case.get("dither") == "blue" for case in yuv)):
-                raise RuntimeError("Sorties Y'CbCr finales absentes de l'attestation")
-            for case in yuv:
-                value = float(case["max_code10"])
-                if (not math.isfinite(value) or not 0 <= value <= (.52 if case["dither"] == "none" else 1.02)
-                        or len(case.get("frame_sha256") or []) != 3):
-                    raise RuntimeError("Sortie Y'CbCr hors tolérance dans l'attestation")
+            # Rapide sur tout GPU ; standard et exacte sur un GPU calculant en double.
+            modes = sample.get("modes") or {}
+            required = ("fast", "standard", "exact") if sample["device"].get("float64") else ("fast",)
+            if any(mode not in modes for mode in required):
+                raise RuntimeError("Précisions absentes de l'attestation")
+            for mode in required:
+                check_mode(modes[mode], mode)
             scenes.setdefault(sample["device"]["uuid"], set()).add(sample["clip_sha256"])
         if not scenes or any(len(clips) < 3 for clips in scenes.values()):
             raise RuntimeError("Au moins neuf images de trois scènes par GPU sont nécessaires")
@@ -72,7 +88,7 @@ def load_capabilities(library: Path, validation: Path | None = None) -> dict:
 
 
 def check_direct(binary: Path, validation: Path) -> None:
-    """Le filtre livré doit avoir produit les mêmes pixels que le renderer attesté."""
+    """Le filtre livré doit avoir produit les mêmes pixels que le renderer attesté, dans chaque précision."""
     report = json.loads(validation.read_text(encoding="utf-8"))
     direct = report.get("direct", {})
     sources = {p.name: digest(p) for p in sorted((ROOT/'integrations/ffmpeg').glob('*.c'))}
@@ -81,11 +97,12 @@ def check_direct(binary: Path, validation: Path) -> None:
     if not report.get("samples"):
         raise RuntimeError("Images directes absentes")
     for sample in report["samples"]:
-        measured = sample.get("direct") or {}
-        if (measured.get("transport") != "vulkan" or measured.get("frames_read") != 17
-                or measured.get("frame_sha256") != sample["producer"]["frame_sha256"]
-                or measured.get("yuv") != [case["frame_sha256"] for case in sample.get("yuv") or []]):
-            raise RuntimeError("Pixels du filtre direct absents ou différents")
+        for result in (sample.get("modes") or {}).values():
+            measured = result.get("direct") or {}
+            if (measured.get("transport") != "vulkan" or measured.get("frames_read") != 17
+                    or measured.get("frame_sha256") != result["producer"]["frame_sha256"]
+                    or measured.get("yuv") != [case["frame_sha256"] for case in result.get("yuv") or []]):
+                raise RuntimeError("Pixels du filtre direct absents ou différents")
 
 
 def check_glibc(binary: Path, maximum: str) -> None:

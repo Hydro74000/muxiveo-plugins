@@ -13,7 +13,7 @@ from pathlib import Path
 
 import numpy as np
 
-from validate_producer import producer_frames
+from validate_producer import precision_setter, producer_frames
 
 KR, KB = 0.2627, 0.0593
 KG = 1 - KR - KB
@@ -81,7 +81,7 @@ def direct_options(case: dict) -> str:
             f":crop_right={right}:crop_bottom={bottom}")
 
 
-def validate_yuv(lib: ctypes.CDLL, clip: Path, uuid: str, rgb_frames: list[bytes]) -> list[dict]:
+def validate_yuv(lib: ctypes.CDLL, clip: Path, uuid: str, rgb_frames: list[bytes], precision: str = "fast") -> list[dict]:
     """Écarts au code 10 bits : ≤ 0,5 sans tramage (arrondi), < 1 avec (seuil dans [0, 1))."""
     width, height = dimensions(clip)
     if len(rgb_frames) != 3 or any(len(frame) != width*height*6 for frame in rgb_frames):
@@ -90,12 +90,14 @@ def validate_yuv(lib: ctypes.CDLL, clip: Path, uuid: str, rgb_frames: list[bytes
     lib.mvo_fel_set_output.restype = ctypes.c_int
     lib.mvo_fel_set_crop.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int]
     lib.mvo_fel_set_crop.restype = ctypes.c_int
+    set_precision = precision_setter(lib, precision)
     results = []
     for chroma, dither, crop in CASES:
         def configure(context: int) -> None:
             if (lib.mvo_fel_set_output(context, b"yuv420p10le", chroma.encode(), dither.encode())
                     or lib.mvo_fel_set_crop(context, *crop)):
                 raise RuntimeError(f"Sortie Y'CbCr refusée : {chroma}, {dither}, {crop}")
+            set_precision(context)
         w, h = width - crop[0] - crop[2], height - crop[1] - crop[3]
         backend, frames = producer_frames(lib, clip, uuid, w*h*3, "yuv420p10le", configure)
         worst = 0.0
