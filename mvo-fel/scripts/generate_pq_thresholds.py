@@ -2,9 +2,12 @@
 
 Chaque seuil est calculé à 60 chiffres significatifs (module decimal, sans dépendance), puis
 arrondi vers le bas en double : T_bas ≤ T exact < suivant(T_bas). Un code RGB16 k est certain
-pour une valeur linéaire encadrée [R-e, R+e] si suivant(T_bas(k-½)) ≤ R-e et R+e < T_bas(k+½).
+pour une valeur linéaire encadrée [R-e, R+e] si T_bas(k-½) < R-e et R+e ≤ T_bas(k+½).
+Partie basse (reprises en double-double) : T_bas_lo = T - T_bas arrondi au plus proche,
+|T - (T_bas + T_bas_lo)| ≤ 2^-105·T.
 
-Sortie : doubles petit-boutistes (512 Kio), écrits dans data/pq_thresholds.bin.
+Sortie : 65 535 parties hautes puis 65 535 parties basses, doubles petit-boutistes (1 Mio),
+écrites dans data/pq_thresholds.bin.
 Usage : generate_pq_thresholds.py [--check]   (--check : régénère et compare au fichier)
 """
 from __future__ import annotations
@@ -35,8 +38,8 @@ def eotf(signal: Decimal) -> Decimal:
     return (((p - C1) / (C2 - C3 * p)).ln() / M1).exp()
 
 
-def round_down(value: Decimal) -> float:
-    """Plus grand double inférieur ou égal à la valeur exacte."""
+def round_down(value: Decimal) -> tuple[float, float]:
+    """Plus grand double inférieur ou égal à la valeur exacte, et reste au plus proche."""
     result = float(value)
     if Decimal(result) > value:
         result = math.nextafter(result, -math.inf)
@@ -46,14 +49,15 @@ def round_down(value: Decimal) -> float:
     # Marge : la valeur exacte ne doit pas coller à un double (précision de calcul 60 chiffres).
     if min(value - Decimal(result), Decimal(upper) - value) < value * Decimal("1e-40"):
         raise ArithmeticError(f"Seuil trop proche d'un double : {value}")
-    return result
+    low = float(value - Decimal(result))
+    if not 0 < low <= upper - result:
+        raise ArithmeticError(f"Partie basse invalide pour {value}")
+    return result, low
 
 
 def thresholds() -> bytes:
-    data = bytearray()
-    for k in range(COUNT):
-        data += struct.pack("<d", round_down(eotf((Decimal(k) + Decimal("0.5")) / Decimal(65535))))
-    return bytes(data)
+    pairs = [round_down(eotf((Decimal(k) + Decimal("0.5")) / Decimal(65535))) for k in range(COUNT)]
+    return struct.pack(f"<{2*COUNT}d", *(high for high, _ in pairs), *(low for _, low in pairs))
 
 
 def main() -> None:
@@ -61,7 +65,7 @@ def main() -> None:
     parser.add_argument("--check", action="store_true", help="Comparer au fichier versionné")
     args = parser.parse_args()
     table = thresholds()
-    values = struct.unpack(f"<{COUNT}d", table)
+    values = struct.unpack(f"<{COUNT}d", table[:8*COUNT])
     if any(not b > a for a, b in zip(values, values[1:])) or not (0 < values[0] and values[-1] < 1):
         raise ArithmeticError("Seuils non strictement croissants ou hors de ]0, 1[")
     if args.check:

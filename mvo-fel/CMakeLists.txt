@@ -18,7 +18,7 @@ add_custom_command(OUTPUT ${MVO_FEL_PQ_SOURCE}
           -DOUTPUT=${MVO_FEL_PQ_SOURCE} -DSYMBOL=fel_pq_threshold_bytes
           -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_bytes.cmake
   DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/data/pq_thresholds.bin ${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_bytes.cmake)
-add_library(fel_math STATIC src/reconstruction.cpp ${MVO_FEL_PQ_SOURCE})
+add_library(fel_math STATIC src/reconstruction.cpp src/certified.cpp ${MVO_FEL_PQ_SOURCE})
 target_include_directories(fel_math PUBLIC include)
 target_link_libraries(fel_math PUBLIC PkgConfig::AV)
 set_target_properties(fel_math PROPERTIES CXX_VISIBILITY_PRESET hidden C_VISIBILITY_PRESET hidden)
@@ -67,6 +67,8 @@ else()
   # Exceptions flottantes masquées : sélections sans branche, boucles PQ vectorisées.
   # Aucun changement de résultat (pas de réassociation, contrairement à -ffast-math).
   target_compile_options(fel_math PRIVATE -Wall -Wextra -Wpedantic -fno-trapping-math)
+  # Reprises double-double : transformations exactes, aucune contraction en FMA.
+  set_source_files_properties(src/certified.cpp PROPERTIES COMPILE_OPTIONS -ffp-contract=off)
 endif()
 
 include(CTest)
@@ -85,6 +87,10 @@ if(BUILD_TESTING)
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/layers.py $<TARGET_FILE:mvo_fel>)
     add_test(NAME fel_pq_thresholds COMMAND ${Python3_EXECUTABLE}
         ${CMAKE_CURRENT_SOURCE_DIR}/scripts/generate_pq_thresholds.py --check)
+    add_executable(fel_certified_dump tests/certified_dump.cpp)
+    target_link_libraries(fel_certified_dump PRIVATE fel_math)
+    add_test(NAME fel_certified_eotf COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/certified_eotf.py $<TARGET_FILE:fel_certified_dump>)
   endif()
   if(MVO_FEL_REFERENCE_TESTS)
     pkg_check_modules(PLACEBO REQUIRED IMPORTED_TARGET libplacebo>=7.374.0)

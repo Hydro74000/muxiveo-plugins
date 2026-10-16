@@ -54,3 +54,10 @@ Ordre d'exécution : C0 → C1 → A1 → B0 → R → A2 → B1 (si go) → V. 
 | Synchronisation GPU → CPU pour les reprises | Liste minuscule (moins d'un pixel sur 10⁶ attendu en A1) ; rapatriement groupé par image ; coût mesuré |
 | Écart entre l'ancienne référence et la référence certifiée | Écarts comptés et expliqués (proximité d'une frontière) avant de changer de référence |
 | Taille de la table (512 Kio) | Intégrée au plugin et partagée par toutes les images ; générateur et empreinte versionnés |
+
+## Avancement
+
+| Lot | État |
+|---|---|
+| C0 | Fait : table des seuils (parties haute et basse), `scripts/generate_pq_thresholds.py` |
+| C1 | Fait : [CPU certifié](2026-10-16-cpu-certifie.md) |

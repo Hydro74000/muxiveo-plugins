@@ -31,8 +31,8 @@ ou une source sans EL donnent une opération sans effet annoncée au journal.
 face à l'oracle `kernel64`, pour une limite de 2. Cette borne GPU est mesurée sur
 contenu réel : les shaders calculent en float32, comme libplacebo, et sur le
 domaine synthétique une composante proche de zéro dans une couleur saturée très
-lumineuse peut la dépasser. Le CPU calcule la PQ et les matrices en double et
-respecte la borne sur tout le domaine testé (≤ 2 codes 16 bits face à la référence).
+lumineuse peut la dépasser. Le CPU produit la référence certifiée : l'arrondi exact de la
+formule, voir [CPU certifié](docs/2026-10-16-cpu-certifie.md).
 
 Débit du plugin seul, 300 images UHD, sortie 10 bits finale (Ryzen 7800X3D) :
 
@@ -40,15 +40,15 @@ Débit du plugin seul, 300 images UHD, sortie 10 bits finale (Ryzen 7800X3D) :
 |---|---:|---:|
 | RTX 4070 Ti SUPER | 12,3 i/s (callback Python, RGB) | 85–88 i/s |
 | iGPU AMD Raphael | ~14 i/s | 22,8 i/s |
-| CPU, 12 threads | 0,7 i/s | 8,1 i/s |
+| CPU, 12 threads | 0,7 i/s | 7,9 i/s (certifié) |
 
 Les durées de workflow complètes (x265, NVEncC, FFmpeg/NVENC NUT et direct) sont
 consignées avec le plan de continuation.
 
 ## Précision du rendu GPU
 
-Muxiveo propose trois modes (`mvo_fel_set_precision`, capacité `precision`). Le CPU calcule
-toujours en double : il est exact quel que soit le mode.
+Muxiveo propose trois modes (`mvo_fel_set_precision`, capacité `precision`). Le CPU produit
+toujours la référence certifiée, quel que soit le mode.
 
 | Mode | Calcul GPU | Écart au CPU | RTX 4070 Ti SUPER | iGPU Raphael |
 |---|---|---|---:|---:|
@@ -56,7 +56,7 @@ toujours en double : il est exact quel que soit le mode.
 | `standard` | float32 reformulé, borne d'erreur par pixel, recalcul en double au-delà de 0,4 code | ≤ 1 code 16 bits | 66,7 i/s | 8,1 i/s |
 | `fast` (défaut de l'ABI) | décodage Dolby Vision libplacebo en float32 | jusqu'à ~300 codes PQ12 aux couleurs extrêmes | 67 i/s | 20,8 i/s |
 
-Débit du plugin seul, 300 images UHD, sortie 10 bits finale ; CPU (7800X3D) : 8,1 i/s.
+Débit du plugin seul, 300 images UHD, sortie 10 bits finale ; CPU (7800X3D) : 7,9 i/s.
 
 Dans les modes `exact` et `standard` :
 
@@ -104,11 +104,12 @@ Choix automatique du GPU :
   résiduels EL, avec zéro et signe du résiduel exacts. Viennent ensuite le shader
   couleur Muxiveo (modes `exact`/`standard`) ou les shaders libplacebo (mode `fast`),
   puis la conversion de sortie (en double en mode `exact`).
-- **Rendu CPU** : même arithmétique entière, passes séparables, PQ et matrice
-  LMS→RGB en double vectorisées (AVX2+FMA choisi à l'exécution, NEON sur arm64) :
-  identique à la référence en double sur les scènes réelles, ≤ 2 codes 16 bits sur
-  le domaine synthétique (le float32 dépassait la borne pour les couleurs saturées
-  lumineuses). Repli en double pour une géométrie non rationnelle.
+- **Rendu CPU certifié** : même arithmétique entière, passes séparables, PQ et matrice
+  LMS→RGB en double vectorisées (AVX2+FMA choisi à l'exécution, NEON sur arm64) avec
+  une borne d'erreur démontrée par composante, classement entre seuils PQ précalculés
+  et reprise en double-double des rares cas indécidés (≈ 10⁻⁷) : le code est l'arrondi
+  exact de la formule ([détails](docs/2026-10-16-cpu-certifie.md)). Conversion Y'CbCr en
+  entiers exacts. Repli en double non certifié pour une géométrie non rationnelle.
 - **Décodage Vulkan Video** : au départ du job, 48 images par couche sont
   décodées deux fois sur le GPU et comparées au décodage logiciel. Au moindre
   écart, ou sans l'extension, le décodage reste sur CPU.

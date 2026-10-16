@@ -58,7 +58,7 @@ MVO_FEL_EXPORT int mvo_fel_set_timestamps(mvo_fel_context *, const char *mode);
 /* Extension additive ABI 1 ; modes listés par capabilities.precision. Avant run, rendu GPU :
  * "fast" (défaut, float32 libplacebo), "standard" (hybride borné, ≤ 1 code 16 bits du CPU)
  * ou "exact" (double natif partout). Les deux derniers exigent un GPU calculant en double
- * (devices : float64) ; sinon le rendu passe sur CPU, qui calcule toujours en double. */
+ * (devices : float64) ; sinon le rendu passe sur CPU (référence certifiée). */
 MVO_FEL_EXPORT int mvo_fel_set_precision(mvo_fel_context *, const char *mode);
 MVO_FEL_EXPORT int mvo_fel_set_output(mvo_fel_context *, const char *pixel_format,
     const char *chroma_location, const char *dither);

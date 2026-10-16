@@ -3,6 +3,7 @@
 // et utils/libav_internal.h. Révision et attributions dans NOTICES.md.
 #include "reconstruction.hpp"
 #include "blue_noise.h"
+#include "certified.hpp"
 #include <algorithm>
 #include <cmath>
 #include <cstring>
@@ -64,6 +65,7 @@ Mapping::Mapping(const AVDOVIMetadata &metadata) {
     const double scale = std::ldexp(1.0, -h.coef_log2_denom);
     const double bl_max = (1u << h.bl_bit_depth) - 1;
     const double el_max = (1u << h.el_bit_depth) - 1;
+    this->bl_max = bl_max;
     residual = !h.disable_residual_flag;
     if (residual && m.nlq_method_idc != AV_DOVI_NLQ_LINEAR_DZ)
         throw std::runtime_error("Méthode NLQ non prise en charge");
@@ -96,13 +98,16 @@ Mapping::Mapping(const AVDOVIMetadata &metadata) {
                 if (src.poly_order[p] > 2) throw std::runtime_error("Ordre polynomial RPU invalide");
                 for (unsigned k = 0; k <= src.poly_order[p]; ++k)
                     dst.poly[p][k] = src.poly_coef[p][k] * scale;
+                dst.weight[p] = 15*(std::abs(dst.poly[p][0]) + std::abs(dst.poly[p][1]) + std::abs(dst.poly[p][2]));
             } else if (src.mapping_idc[p] == AV_DOVI_MAPPING_MMR) {
                 dst.order[p] = src.mmr_order[p];
                 if (dst.order[p] < 1 || dst.order[p] > 3)
                     throw std::runtime_error("Ordre MMR RPU invalide");
                 dst.constant[p] = src.mmr_constant[p] * scale;
+                double magnitude = std::abs(dst.constant[p]);
                 for (unsigned k = 0; k < dst.order[p]; ++k)
-                    for (int j = 0; j < 7; ++j) dst.mmr[p][k][j] = src.mmr_coef[p][k][j] * scale;
+                    for (int j = 0; j < 7; ++j) magnitude += std::abs(dst.mmr[p][k][j] = src.mmr_coef[p][k][j] * scale);
+                dst.weight[p] = 80*magnitude;
             } else throw std::runtime_error("Mapping RPU inconnu");
         }
     }
@@ -130,6 +135,12 @@ double pq_threshold(int k) {
     std::memcpy(&value, fel_pq_threshold_bytes + 8*static_cast<size_t>(k), sizeof(value));  // petit-boutiste
     return value;
 }
+double pq_threshold_low(int k) {
+    double value;
+    std::memcpy(&value, fel_pq_threshold_bytes + 8*(static_cast<size_t>(PQ_THRESHOLDS) + k), sizeof(value));
+    return value;
+}
+const Mat &lms_to_rgb_matrix() { return lms_to_rgb; }
 Vec reshape(const Mapping &mapping, const Vec &bl, const std::array<unsigned, 3> &piece) {
     Vec sig{}, out{};
     for (int c = 0; c < 3; ++c) sig[c] = std::clamp(bl[c], 0.0, 1.0);
@@ -313,24 +324,16 @@ void reconstruct_rows(const AVFrame &bl, const AVFrame &el, const Mapping &mappi
                      FrameSampler(el, bl.width, bl.height, true), mapping, rgb, first_row, last_row);
 }
 namespace {
-constexpr double kr = 0.2627, kb = 0.0593, kg = 1 - kr - kb;
-double code(const AVFrame &rgb, int plane, int x, int y) {
-    const auto *p = rgb.data[plane] + y*rgb.linesize[plane] + 2*x;
-    return (p[0] | (p[1] << 8)) / 65535.0;
-}
 // gbrp16le : plan 0 = G, 1 = B, 2 = R.
-Vec rgb_at(const AVFrame &rgb, int x, int y) {
+int64_t code(const AVFrame &rgb, int plane, int x, int y) {
     x = std::clamp(x, 0, rgb.width-1); y = std::clamp(y, 0, rgb.height-1);
-    return {code(rgb, 2, x, y), code(rgb, 0, x, y), code(rgb, 1, x, y)};
+    const auto *p = rgb.data[plane] + y*rgb.linesize[plane] + 2*x;
+    return p[0] | (p[1] << 8);
 }
 void store(AVFrame &yuv, int plane, int x, int y, unsigned value, int depth) {
     auto *p = yuv.data[plane] + y*yuv.linesize[plane];
     if (depth == 8) { p[x] = static_cast<uint8_t>(value); return; }
     p[2*x] = value & 255; p[2*x+1] = static_cast<uint8_t>(value >> 8);
-}
-unsigned quantize(double value, double threshold, int depth) {
-    const double maximum = (1u << depth) - 1;
-    return static_cast<unsigned>(std::clamp(std::floor(value + threshold), 0.0, maximum));
 }
 // Poids bilinéaires (triangle étiré ×2) autour du centre 2i+offset.
 void taps(double offset, std::array<double, 4> &weights, int &first) {
@@ -408,14 +411,38 @@ namespace {
     const double value = fast_exp2(y*fast_log2(std::max(x, 1e-300)));
     return x > 0 ? value : 0.0;
 }
-// PQ en place sur un tableau ; NaN si le dénominateur s'annule (refusé ensuite comme non fini).
+// EOTF PQ, conditionnement relatif κ = d ln L / d ln x (infini au zéro de l'EOTF) et majorant de
+// |log2 L| ; NaN au-delà du pôle (refusé ensuite comme non fini).
+[[gnu::always_inline]] inline double eotf_kappa(double x, double &kappa, double &magnitude) {
+    const double p = fast_pow(x, 1/m2);
+    const double d = c2 - c3*p, n = p - c1;
+    const double g = std::max(n, 0.0)/std::max(d, 1e-300);
+    const double t = (1/m1)*fast_log2(std::max(g, 1e-300));
+    kappa = n > 0 && d > 0 ? p*(1/(m1*m2))*(1/n + c3/d) : INFINITY;
+    magnitude = std::abs(t) + 1;
+    return d > 0 ? (g > 0 ? fast_exp2(t) : 0.0) : NAN;
+}
+// PQ par tableaux ; bounded : L et son encadrement à partir du signal x et de son erreur e (en
+// place), borne démontrée : erreur de l'EOTF calculée (certified::eotf_relative_error, |log2 L|
+// majoré par |t| + 1) et propagation κ·e/x, valable si κ·e et e ≤ 10^-6·x. L nul et exact sous
+// le zéro de l'EOTF ; encadrement infini (reprise) à cheval sur ce zéro ou trop large.
 #define FEL_PQ_ROWS(SUFFIX, ATTRIBUTES) \
-    ATTRIBUTES void pq_eotf_row##SUFFIX(double *v, int count) { \
+    ATTRIBUTES void pq_eotf_kappa_row##SUFFIX(double *v, double *kappa, int count) { \
         for (int i = 0; i < count; ++i) { \
-            const double p = fast_pow(v[i], 1/m2); \
-            const double d = c2 - c3*p; \
-            const double value = fast_pow(std::max(p - c1, 0.0)/std::max(d, 1e-300), 1/m1); \
-            v[i] = d > 0 ? value : NAN; \
+            double magnitude; \
+            v[i] = eotf_kappa(v[i], kappa[i], magnitude); \
+        } \
+    } \
+    ATTRIBUTES void pq_eotf_bounded_row##SUFFIX(const double *x, double *error, double *out, int count) { \
+        constexpr double u = 0x1p-53; \
+        for (int i = 0; i < count; ++i) { \
+            double kappa, magnitude; \
+            const double value = eotf_kappa(x[i], kappa, magnitude), s = x[i], e = error[i]; \
+            const bool zero = s + e <= certified::PQ_ZERO_LOW; \
+            const bool ok = s - e > certified::PQ_ZERO_HIGH && kappa*e <= 1e-6*s && e <= 1e-6*s; \
+            const double bound = value*((800*kappa + 60 + 4.2*magnitude)*u + 1.01*kappa*e/s) + 1e-300; \
+            out[i] = zero ? 0.0 : value; \
+            error[i] = zero ? 0.0 : ok ? bound : INFINITY; \
         } \
     } \
     ATTRIBUTES void pq_oetf_row##SUFFIX(double *v, int count) { \
@@ -439,11 +466,18 @@ bool pq_avx2() {
     return supported;
 }
 #endif
-void pq_eotf_row(double *v, int count) {
+// EOTF et conditionnement relatif κ = d ln L / d ln x (infini au zéro de l'EOTF).
+void pq_eotf_kappa_row(double *v, double *kappa, int count) {
 #ifdef MVO_FEL_AVX2
-    if (pq_avx2()) return pq_eotf_row_avx2(v, count);
+    if (pq_avx2()) return pq_eotf_kappa_row_avx2(v, kappa, count);
 #endif
-    pq_eotf_row_default(v, count);
+    pq_eotf_kappa_row_default(v, kappa, count);
+}
+void pq_eotf_bounded_row(const double *x, double *error, double *out, int count) {
+#ifdef MVO_FEL_AVX2
+    if (pq_avx2()) return pq_eotf_bounded_row_avx2(x, error, out, count);
+#endif
+    pq_eotf_bounded_row_default(x, error, out, count);
 }
 void pq_oetf_row(double *v, int count) {
 #ifdef MVO_FEL_AVX2
@@ -452,6 +486,8 @@ void pq_oetf_row(double *v, int count) {
     pq_oetf_row_default(v, count);
 }
 }
+
+void pq_eotf_kappa(double *values, double *kappa, int count) { pq_eotf_kappa_row(values, kappa, count); }
 
 bool IntegerAxis::build(int count, int size, double ratio, double layer, double chroma, int subsample) {
     index.resize(count); weight.resize(count); denominator.resize(count);
@@ -531,20 +567,41 @@ bool FastReconstruction::bind(const AVFrame &bl, const AVFrame &el, const AVDOVI
     return true;
 }
 
-void FastReconstruction::rows(const Mapping &mapping, AVFrame &rgb, int first_row, int last_row) const {
+CertifiedStats FastReconstruction::rows(const Mapping &mapping, AVFrame &rgb, int first_row, int last_row,
+                                        bool extended) const {
+    // Bornes d'erreur démontrées (docs/2026-10-16-cpu-certifie.md), unité d'arrondi u = 2^-53.
+    constexpr double u = 0x1p-53;
     // Passe verticale par colonne source (int32), puis horizontale : 4 + 4 prises au lieu de 16.
     std::array<std::vector<int32_t>, 5> vertical;
     const Plane *planes[5] = {&base_chroma[0], &base_chroma[1], &enhancement[0], &enhancement[1], &enhancement[2]};
     for (int k = 0; k < 5; ++k) vertical[k].resize(planes[k]->width);
     std::vector<double> scale(5);
-    std::vector<double> lms(3*width), linear(3*width);
-    // LMS → RGB : produit lms_to_rgb · linear (matrice du RPU).
-    double matrix[3][3];
+    const size_t count = 3*size_t(width);
+    std::vector<double> signal(count), signal_error(count), lms(count), linear(count), linear_error(count);
+    std::vector<uint16_t> codes(count), legacy(count);
+    std::vector<unsigned char> uncertain(width);
+    // LMS → RGB : produit lms_to_rgb · linear (matrice du RPU) ; |M̂ - M| ≤ 3,01u·Σ|A·B|.
+    // Coefficients de l'encadrement de R : de l'erreur des L (premier ordre) et des L eux-mêmes.
+    double matrix[3][3], first_order[3][3], zero_order[3][3], absolute[3][3];
     for (int c = 0; c < 3; ++c)
         for (int k = 0; k < 3; ++k) {
+            double magnitude = 0;
             matrix[c][k] = 0;
-            for (int j = 0; j < 3; ++j) matrix[c][k] += lms_to_rgb[c][j]*mapping.linear[j][k];
+            for (int j = 0; j < 3; ++j) {
+                matrix[c][k] += lms_to_rgb[c][j]*mapping.linear[j][k];
+                magnitude += std::abs(lms_to_rgb[c][j]*mapping.linear[j][k]);
+            }
+            const double dM = 3.01*u*magnitude;
+            first_order[c][k] = std::abs(matrix[c][k])*(1 + 4*u) + dM;
+            zero_order[c][k] = dM + 3.01*u*std::abs(matrix[c][k]);
+            absolute[c][k] = std::abs(mapping.nonlinear[c][k]);
         }
+    // Part constante de l'erreur d'une composante par segment : mapping et décalage (2,02u·|offset|).
+    double segment_error[3][8];
+    for (int c = 0; c < 3; ++c)
+        for (int p = 0; p < 8; ++p)
+            segment_error[c][p] = (mapping.curves[c].weight[p] + 1)*u + 2.02*u*std::abs(mapping.nonlinear_offset[c]);
+    CertifiedStats stats;
     for (int y = first_row; y < last_row; ++y) {
         for (int k = 0; k < 5; ++k) {
             const Plane &p = *planes[k];
@@ -559,101 +616,196 @@ void FastReconstruction::rows(const Mapping &mapping, AVFrame &rgb, int first_ro
             scale[k] = 1.0/(double(p.vertical.denominator[y])*1023.0);
         }
         const auto *row = reinterpret_cast<const uint16_t *>(luma + y*luma_stride);
-        const int64_t vertical_den[2] = {base_chroma[0].vertical.denominator[y], base_chroma[1].vertical.denominator[y]};
-        // Signal non linéaire (mapping, NLQ, matrice Y'CbCr→LMS') par pixel, puis PQ par
-        // tableaux contigus : boucles sans branche vectorisées par le compilateur.
-        for (int x = 0; x < width; ++x) {
-            double value[5];
-            int32_t sums[5];
+        // Sommes horizontales exactes (BL Cb, Cr ; EL Y, Cb, Cr) et dénominateurs Dx·Dy.
+        auto sums_at = [&](int x, int32_t (&sums)[5], int64_t (&den)[5]) {
             for (int k = 0; k < 5; ++k) {
                 const Plane &p = *planes[k];
                 const auto &i = p.horizontal.index[x];
                 const auto &w = p.horizontal.weight[x];
                 const int32_t *v = vertical[k].data();
-                const int32_t sum = w[0]*v[i[0]] + w[1]*v[i[1]] + w[2]*v[i[2]] + w[3]*v[i[3]];
-                sums[k] = sum;
-                value[k] = sum ? sum*scale[k]/p.horizontal.denominator[x] : 0.0;
+                sums[k] = w[0]*v[i[0]] + w[1]*v[i[1]] + w[2]*v[i[2]] + w[3]*v[i[3]];
+                den[k] = int64_t(p.vertical.denominator[y])*p.horizontal.denominator[x];
             }
-            // Segment de mapping choisi sur les valeurs exactes : code BL face au pivot, et
-            // somme chroma bornée à [0, 1023·D] face à pivot·D (D = dénominateurs entiers).
+        };
+        // Segment de mapping choisi sur les valeurs exactes : code BL face au pivot, et
+        // somme chroma bornée à [0, 1023·D] face à pivot·D (D = dénominateurs entiers).
+        auto pieces_at = [&](int x, const int32_t (&sums)[5], const int64_t (&den)[5]) {
             std::array<unsigned, 3> piece{};
             for (int c = 0; c < 3; ++c) {
                 const auto &curve = mapping.curves[c];
-                const int64_t den = c ? vertical_den[c-1] * base_chroma[c-1].horizontal.denominator[x] : 1;
-                const int64_t numerator = std::clamp<int64_t>(c ? sums[c-1] : row[x], 0, 1023*den);
-                while (piece[c]+2 < curve.count && numerator >= int64_t(curve.codes[piece[c]+1]) * den) ++piece[c];
+                const int64_t d = c ? den[c-1] : 1;
+                const int64_t numerator = std::clamp<int64_t>(c ? sums[c-1] : row[x], 0, 1023*d);
+                while (piece[c]+2 < curve.count && numerator >= int64_t(curve.codes[piece[c]+1]) * d) ++piece[c];
             }
+            return piece;
+        };
+        // Signal non linéaire (mapping, NLQ, matrice Y'CbCr→LMS') et sa borne d'erreur par pixel,
+        // puis PQ par tableaux contigus : boucles sans branche vectorisées par le compilateur.
+        for (int x = 0; x < width; ++x) {
+            int32_t sums[5];
+            int64_t den[5];
+            sums_at(x, sums, den);
+            double value[5];
+            for (int k = 0; k < 5; ++k)
+                value[k] = sums[k] ? sums[k]*scale[k]/planes[k]->horizontal.denominator[x] : 0.0;
+            const auto piece = pieces_at(x, sums, den);
             Vec out = reshape(mapping, {row[x]/1023.0, value[0], value[1]}, piece);
+            // Erreur de chaque composante, produit matriciel compris (3,01u·|v|) : mapping, NLQ, décalage.
+            double ev[3];
+            for (int c = 0; c < 3; ++c) ev[c] = segment_error[c][piece[c]];
             // Résiduel EL exact : un zéro entier n'applique ni seuil ni pente NLQ.
             if (mapping.residual) for (int c = 0; c < 3; ++c) {
                 const double d = value[2+c];
-                if (d != 0) out[c] += sign(d)*(std::abs(d)*mapping.slope[c] + mapping.threshold[c]);
+                if (d != 0) {
+                    out[c] += sign(d)*(std::abs(d)*mapping.slope[c] + mapping.threshold[c]);
+                    ev[c] += 5.3*u*(std::abs(d)*std::abs(mapping.slope[c]) + std::abs(mapping.threshold[c]));
+                }
             }
-            for (int c = 0; c < 3; ++c) out[c] -= mapping.nonlinear_offset[c];
-            for (int c = 0; c < 3; ++c)
-                lms[c*width + x] = mapping.nonlinear[c][0]*out[0] + mapping.nonlinear[c][1]*out[1] +
-                                   mapping.nonlinear[c][2]*out[2];
+            for (int c = 0; c < 3; ++c) {
+                out[c] -= mapping.nonlinear_offset[c];
+                ev[c] += 5.03*u*std::abs(out[c]);
+            }
+            for (int c = 0; c < 3; ++c) {
+                signal[c*width + x] = mapping.nonlinear[c][0]*out[0] + mapping.nonlinear[c][1]*out[1] +
+                                      mapping.nonlinear[c][2]*out[2];
+                signal_error[c*width + x] = 1.01*(absolute[c][0]*ev[0] + absolute[c][1]*ev[1] + absolute[c][2]*ev[2]);
+            }
         }
-        pq_eotf_row(lms.data(), 3*width);
+        pq_eotf_bounded_row(signal.data(), signal_error.data(), lms.data(), int(count));
+        // Valeurs linéaires RGB encadrées : erreur des L (EOTF et signal), matrice et sommes.
+        // Encadrement infini (ou NaN) : reprise.
         for (int x = 0; x < width; ++x) {
-            const double l[3] = {lms[x], lms[width + x], lms[2*width + x]};
-            for (int c = 0; c < 3; ++c)
-                linear[c*width + x] = l[0]*matrix[c][0] + l[1]*matrix[c][1] + l[2]*matrix[c][2];
+            const double L[3] = {lms[x], lms[width + x], lms[2*width + x]};
+            const double eL[3] = {signal_error[x], signal_error[width + x], signal_error[2*width + x]};
+            for (int c = 0; c < 3; ++c) {
+                const double R = L[0]*matrix[c][0] + L[1]*matrix[c][1] + L[2]*matrix[c][2];
+                const double e = first_order[c][0]*eL[0] + first_order[c][1]*eL[1] + first_order[c][2]*eL[2] +
+                                 zero_order[c][0]*L[0] + zero_order[c][1]*L[1] + zero_order[c][2]*L[2];
+                linear[c*width + x] = R;
+                linear_error[c*width + x] = e*(1 + 1e-12) + 4*u*std::abs(R) + 1e-300;
+            }
         }
-        pq_oetf_row(linear.data(), 3*width);
+        std::copy(linear.begin(), linear.end(), lms.begin());
+        pq_oetf_row(lms.data(), int(count));
+        // Classement par seuils PQ : code k si T(k-½) ≤ R < T(k+½) pour tout R de l'encadrement
+        // (seuils arrondis vers le bas : T_bas < T exact < suivant(T_bas)). Candidat : arrondi de
+        // l'OETF rapide ; un candidat faux (R au voisinage d'un seuil) échoue au test et part en reprise.
+        bool finite = true;
+        for (int c = 0; c < 3; ++c)
+            for (int x = 0; x < width; ++x) {
+                const size_t k = c*size_t(width) + x;
+                const double R = linear[k], e = linear_error[k];
+                finite &= std::isfinite(R);
+                const int code = static_cast<int>(std::lround(std::clamp(lms[k], 0.0, 1.0)*65535.0));
+                const double below = code > 0 ? pq_threshold(std::max(code - 1, 0)) : -INFINITY;
+                const double above = code < PQ_THRESHOLDS ? pq_threshold(std::min(code, PQ_THRESHOLDS - 1)) : INFINITY;
+                const bool certain = R - e > below && R + e <= above;
+                codes[k] = legacy[k] = static_cast<uint16_t>(code);
+                uncertain[x] |= static_cast<unsigned char>((extended || !certain) << c);
+            }
+        if (!finite) throw std::runtime_error("Pixel reconstruit non fini");
+        // Reprises en double-double des composantes non décidées (liste compacte par ligne).
+        for (int x = 0; x < width; ++x) {
+            if (!uncertain[x]) continue;
+            int32_t sums[5];
+            int64_t den[5];
+            sums_at(x, sums, den);
+            certified::ExactPixel pixel;
+            pixel.luma = row[x];
+            for (int c = 0; c < 2; ++c) { pixel.chroma[c] = sums[c]; pixel.chroma_den[c] = den[c]; }
+            for (int c = 0; c < 3; ++c) { pixel.residual[c] = sums[2+c]; pixel.residual_den[c] = den[2+c]; }
+            pixel.piece = pieces_at(x, sums, den);
+            std::array<uint16_t, 3> exact{};
+            std::array<certified::DD, 3> value{};
+            const unsigned undecided = certified::classify(mapping, pixel, uncertain[x], exact, &value);
+            for (int c = 0; c < 3; ++c) {
+                if (!(uncertain[x] >> c & 1)) continue;
+                const size_t k = c*size_t(width) + x;
+                // Contrôle de la borne du chemin double (reprises et mode étendu).
+                if (std::isfinite(linear_error[k]))
+                    stats.worst_ratio = std::max(stats.worst_ratio,
+                        std::abs((linear[k] - value[c].hi) - value[c].lo)/linear_error[k]);
+                codes[k] = exact[c];
+                ++stats.rescued;
+                stats.undecided += undecided >> c & 1;
+            }
+            uncertain[x] = 0;
+        }
         for (int c = 0; c < 3; ++c) {
             const int plane = c == 0 ? 2 : c == 1 ? 0 : 1;
             auto *p = reinterpret_cast<uint16_t *>(rgb.data[plane] + y*rgb.linesize[plane]);
             for (int x = 0; x < width; ++x) {
-                const double v = linear[c*width + x];
-                if (!std::isfinite(v)) throw std::runtime_error("Pixel reconstruit non fini");
-                p[x] = static_cast<uint16_t>(std::lround(std::clamp(v, 0.0, 1.0)*65535.0));
+                const size_t k = c*size_t(width) + x;
+                p[x] = codes[k];
+                stats.changed += codes[k] != legacy[k];
             }
         }
+        stats.components += static_cast<long long>(count);
     }
-}
+    return stats;
 }
 
+}
+
+namespace {
+constexpr uint8_t bayer[8][8] = {
+    {0,32,8,40,2,34,10,42},{48,16,56,24,50,18,58,26},{12,44,4,36,14,46,6,38},{60,28,52,20,62,30,54,22},
+    {3,35,11,43,1,33,9,41},{51,19,59,27,49,17,57,25},{15,47,7,39,13,45,5,37},{63,31,55,23,61,29,53,21}};
+// Seuil de tramage en 8192es : (b+½)/64, (v+½)/4096 ou ½ sans tramage.
+int64_t dither_numerator(int dither, int x, int y) {
+    if (dither == FEL_DITHER_ORDERED) return (2*bayer[y & 7][x & 7] + 1)*64;
+    if (dither == FEL_DITHER_BLUE) return 2*fel_blue_noise[(y & 63)*64 + (x & 63)] + 1;
+    return 4096;
+}
+}
 extern "C" double fel_dither_threshold(int dither, int x, int y) {
-    static const uint8_t bayer[8][8] = {
-        {0,32,8,40,2,34,10,42},{48,16,56,24,50,18,58,26},{12,44,4,36,14,46,6,38},{60,28,52,20,62,30,54,22},
-        {3,35,11,43,1,33,9,41},{51,19,59,27,49,17,57,25},{15,47,7,39,13,45,5,37},{63,31,55,23,61,29,53,21}};
-    if (dither == FEL_DITHER_ORDERED) return (bayer[y & 7][x & 7] + 0.5) / 64;
-    if (dither == FEL_DITHER_BLUE) return (fel_blue_noise[(y & 63)*64 + (x & 63)] + 0.5) / 4096;
-    return 0.5;
+    return dither_numerator(dither, x, y) / 8192.0;
 }
 
 namespace muxiveo::fel {
 void convert_rows(const AVFrame &rgb, AVFrame &yuv, const fel_output &output, int first, int last) {
+    // BT.2020 : kr = 2627/10000, kb = 593/10000, kg = 6780/10000. Codes RGB c/65535.
+    // Y' = (219·Y + 16)·2^(d-8) + t, Cb = (224·cb + 128)·2^(d-8) + t, quantifiés par floor ;
+    // numérateurs et dénominateurs entiers (< 4·10^17, int64).
     const int depth = fel_output_depth(output.format);
-    const double scale = std::ldexp(1.0, depth - 8);
+    const int64_t scale = int64_t(1) << (depth - 8), maximum = (int64_t(1) << depth) - 1;
     double ox, oy;
     fel_chroma_offset(output.chroma, &ox, &oy);
     std::array<double, 4> wx{}, wy{};
     int fx, fy;
     taps(ox, wx, fx); taps(oy, wy, fy);
+    std::array<int64_t, 4> ix{}, iy{};  // poids en 8es (sommes 8 par axe, 64 au total)
+    for (int k = 0; k < 4; ++k) { ix[k] = std::lround(wx[k]*8); iy[k] = std::lround(wy[k]*8); }
+    constexpr int64_t luma_den = 655350000LL*8192;  // 10000·65535·8192
+    // Cb (k = 9407, X = 9407·B - 2627·R - 6780·G) et Cr (k = 7373, X = 7373·R - 6780·G - 593·B), sommes
+    // pondérées sur 64 : 224·cb = 7·X/(4·k·65535) ; dénominateur commun k·65535·8192.
+    auto chroma = [&](int64_t x, int64_t k, int64_t t) {
+        const int64_t den = k*65535*8192;
+        return std::min(((7*x*2048 + 128*den)*scale + t*k*65535)/den, maximum);
+    };
     for (int j = first; j < last; ++j) {
         for (int dy = 0; dy < 2; ++dy) {
             const int y = 2*j + dy;
             for (int x = 0; x < output.width; ++x) {
-                const Vec c = rgb_at(rgb, output.crop_x + x, output.crop_y + y);
-                const double luma = kr*c[0] + kg*c[1] + kb*c[2];
-                store(yuv, 0, x, y, quantize((219*luma + 16)*scale,
-                      fel_dither_threshold(output.dither, x, y), depth), depth);
+                const int cx = output.crop_x + x, cy = output.crop_y + y;
+                const int64_t s = 2627*code(rgb, 2, cx, cy) + 6780*code(rgb, 0, cx, cy) + 593*code(rgb, 1, cx, cy);
+                const int64_t numerator = (219*s*8192 + 16*luma_den)*scale +
+                                          dither_numerator(output.dither, x, y)*655350000LL;
+                store(yuv, 0, x, y, static_cast<unsigned>(std::min(numerator/luma_den, maximum)), depth);
             }
         }
         for (int i = 0; i < output.width/2; ++i) {
-            Vec sum{};
-            for (int b = 0; b < 4; ++b) for (int a = 0; a < 4; ++a) {
-                const double w = wx[a]*wy[b];
+            int64_t r = 0, g = 0, b = 0;
+            for (int bb = 0; bb < 4; ++bb) for (int a = 0; a < 4; ++a) {
+                const int64_t w = ix[a]*iy[bb];
                 if (w == 0) continue;
-                const Vec c = rgb_at(rgb, output.crop_x + 2*i + fx + a, output.crop_y + 2*j + fy + b);
-                for (int k = 0; k < 3; ++k) sum[k] += w*c[k];
+                const int cx = output.crop_x + 2*i + fx + a, cy = output.crop_y + 2*j + fy + bb;
+                r += w*code(rgb, 2, cx, cy); g += w*code(rgb, 0, cx, cy); b += w*code(rgb, 1, cx, cy);
             }
-            const double luma = kr*sum[0] + kg*sum[1] + kb*sum[2];
-            const double cb = (sum[2] - luma) / (2*(1 - kb)), cr = (sum[0] - luma) / (2*(1 - kr));
-            store(yuv, 1, i, j, quantize((224*cb + 128)*scale, fel_dither_threshold(output.dither, i+21, j+11), depth), depth);
-            store(yuv, 2, i, j, quantize((224*cr + 128)*scale, fel_dither_threshold(output.dither, i+43, j+37), depth), depth);
+            store(yuv, 1, i, j, static_cast<unsigned>(chroma(9407*b - 2627*r - 6780*g, 9407,
+                  dither_numerator(output.dither, i+21, j+11))), depth);
+            store(yuv, 2, i, j, static_cast<unsigned>(chroma(7373*r - 6780*g - 593*b, 7373,
+                  dither_numerator(output.dither, i+43, j+37))), depth);
         }
     }
 }

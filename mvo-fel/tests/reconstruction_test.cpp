@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: LGPL-2.1-or-later
 #include "reconstruction.hpp"
+#include <algorithm>
 #include <cmath>
 #include <cstdlib>
+#include <cstring>
 #include <iostream>
 #include <random>
 #include <stdexcept>
@@ -29,6 +31,7 @@ AVFrame *layer(int width, int height, std::mt19937 &random, int low = 0, int hig
 
 // Écart maximal (codes 16 bits) du chemin rapide (entier séparable + PQ vectorisée) face aux
 // échantillonneurs et à la PQ de référence en double, sur des couches aléatoires.
+CertifiedStats totals;
 int fast_error(const AVDOVIMetadata &metadata, std::mt19937 &random, int low, int high) {
     AVFrame *bl = layer(64, 32, random, low, high), *el = layer(32, 16, random, low, high);
     AVFrame *a = av_frame_alloc(), *b = av_frame_alloc();
@@ -40,7 +43,27 @@ int fast_error(const AVDOVIMetadata &metadata, std::mt19937 &random, int low, in
     reconstruct_rows(*bl, *el, m, *a, 0, 32);
     FastReconstruction fast(*bl, *el);
     if (!fast.valid() || !fast.bind(*bl, *el, metadata)) std::exit(1);
-    fast.rows(m, *b, 0, 32);
+    const auto stats = fast.rows(m, *b, 0, 32);
+    // Chemin certifié = toutes les composantes en double-double, aucune indécise.
+    AVFrame *d = av_frame_alloc();
+    d->format = AV_PIX_FMT_GBRP16LE; d->width = 64; d->height = 32;
+    if (av_frame_get_buffer(d, 0) < 0) std::exit(1);
+    const auto extended = fast.rows(m, *d, 0, 32, true);
+    for (int c = 0; c < 3; ++c)
+        for (int y = 0; y < 32; ++y)
+            if (std::memcmp(b->data[c] + y*b->linesize[c], d->data[c] + y*d->linesize[c], 128)) {
+                std::cerr << "chemin certifié différent de la reprise double-double\n";
+                std::exit(1);
+            }
+    if (stats.undecided || extended.undecided || extended.rescued != extended.components ||
+        !(extended.worst_ratio <= 0.5)) {
+        std::cerr << "borne du chemin double : " << extended.worst_ratio << '\n';
+        std::cerr << "composantes indécises : " << stats.undecided << ' ' << extended.undecided << '\n';
+        std::exit(1);
+    }
+    totals += stats;
+    totals.worst_ratio = std::max(totals.worst_ratio, extended.worst_ratio);
+    av_frame_free(&d);
     int worst = 0;
     for (int c = 0; c < 3; ++c)
         for (int y = 0; y < 32; ++y)
@@ -94,8 +117,71 @@ void pq_thresholds_consistent() {
         near(pq_oetf(threshold), signal, 1e-12);
     }
 }
+// Y'CbCr entier exact face à la formule en double, hors voisinage immédiat d'une frontière.
+void yuv_matches_double() {
+    std::mt19937 random(7);
+    std::uniform_int_distribution<int> value(0, 65535);
+    AVFrame *rgb = av_frame_alloc(), *yuv = av_frame_alloc();
+    rgb->format = AV_PIX_FMT_GBRP16LE; rgb->width = 64; rgb->height = 32;
+    yuv->format = AV_PIX_FMT_YUV420P10LE; yuv->width = 64; yuv->height = 32;
+    if (av_frame_get_buffer(rgb, 0) < 0 || av_frame_get_buffer(yuv, 0) < 0) std::exit(1);
+    auto at = [&](int plane, int x, int y) {
+        x = std::clamp(x, 0, 63); y = std::clamp(y, 0, 31);
+        return reinterpret_cast<uint16_t *>(rgb->data[plane] + y*rgb->linesize[plane])[x] / 65535.0;
+    };
+    const double kr = 0.2627, kb = 0.0593, kg = 1 - kr - kb;
+    long long checked = 0;
+    for (int dither : {FEL_DITHER_NONE, FEL_DITHER_ORDERED, FEL_DITHER_BLUE})
+        for (int chroma : {1, 2, 3, 5}) {
+            for (int c = 0; c < 3; ++c)
+                for (int y = 0; y < 32; ++y)
+                    for (int x = 0; x < 64; ++x)
+                        reinterpret_cast<uint16_t *>(rgb->data[c] + y*rgb->linesize[c])[x] = uint16_t(value(random));
+            fel_output output{};
+            output.format = FEL_OUT_YUV420P10; output.width = 64; output.height = 32;
+            output.dither = dither; output.chroma = chroma;
+            convert_rows(*rgb, *yuv, output, 0, 16);
+            auto check = [&](double v, double t, int plane, int x, int y) {
+                const double q = v*4 + t;
+                if (std::abs(q - std::round(q)) < 1e-9) return;  // frontière : arbitrage exact
+                const int expected = std::clamp(int(std::floor(q)), 0, 1023);
+                if (reinterpret_cast<uint16_t *>(yuv->data[plane] + y*yuv->linesize[plane])[x] != expected) {
+                    std::cerr << "Y'CbCr entier différent du double : plan " << plane << '\n';
+                    std::exit(1);
+                }
+                ++checked;
+            };
+            for (int y = 0; y < 32; ++y)
+                for (int x = 0; x < 64; ++x)
+                    check(219*(kr*at(2, x, y) + kg*at(0, x, y) + kb*at(1, x, y)) + 16,
+                          fel_dither_threshold(dither, x, y), 0, x, y);
+            double ox, oy;
+            fel_chroma_offset(chroma, &ox, &oy);
+            for (int j = 0; j < 16; ++j)
+                for (int i = 0; i < 32; ++i) {
+                    Vec sum{};
+                    double total = 0;
+                    for (int b = -1; b <= 2; ++b)
+                        for (int a = -1; a <= 2; ++a) {
+                            const double w = std::max(0.0, 1 - std::abs(a - ox)/2)/2 *
+                                             std::max(0.0, 1 - std::abs(b - oy)/2)/2;
+                            total += w;
+                            sum[0] += w*at(2, 2*i + a, 2*j + b);
+                            sum[1] += w*at(0, 2*i + a, 2*j + b);
+                            sum[2] += w*at(1, 2*i + a, 2*j + b);
+                        }
+                    if (std::abs(total - 1) > 1e-12) { std::cerr << "poids chroma\n"; std::exit(1); }
+                    const double l = kr*sum[0] + kg*sum[1] + kb*sum[2];
+                    check(224*(sum[2] - l)/(2*(1 - kb)) + 128, fel_dither_threshold(dither, i+21, j+11), 1, i, j);
+                    check(224*(sum[0] - l)/(2*(1 - kr)) + 128, fel_dither_threshold(dither, i+43, j+37), 2, i, j);
+                }
+        }
+    av_frame_free(&rgb); av_frame_free(&yuv);
+    if (checked < 12*(64*32 + 2*32*16)*9/10) { std::cerr << "trop peu de valeurs vérifiées\n"; std::exit(1); }
+}
 int main() {
     pq_thresholds_consistent();
+    yuv_matches_double();
     auto *metadata = av_dovi_metadata_alloc(nullptr);
     auto &header = *av_dovi_get_header(metadata);
     auto &mapping = *av_dovi_get_mapping(metadata);
@@ -147,6 +233,8 @@ int main() {
         near(spline16(x+1)+spline16(x)+spline16(x-1)+spline16(x-2), 1);
     }
     fast_matches_reference(*metadata);
+    std::cout << "certifié : " << totals.components << " composantes, " << totals.rescued << " reprises, "
+              << totals.changed << " différentes de l'arrondi double ; écart / borne ≤ " << totals.worst_ratio << '\n';
     mapping.curves[0].num_pivots = 10;
     try { Mapping bad(*metadata); return 1; } catch (const std::runtime_error &) {}
     av_free(metadata);
