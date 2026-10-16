@@ -123,7 +123,7 @@ void yuv_matches_double() {
     std::uniform_int_distribution<int> value(0, 65535);
     AVFrame *rgb = av_frame_alloc(), *yuv = av_frame_alloc();
     rgb->format = AV_PIX_FMT_GBRP16LE; rgb->width = 64; rgb->height = 32;
-    yuv->format = AV_PIX_FMT_YUV420P10LE; yuv->width = 64; yuv->height = 32;
+    yuv->format = AV_PIX_FMT_YUV420P16LE; yuv->width = 64; yuv->height = 32;
     if (av_frame_get_buffer(rgb, 0) < 0 || av_frame_get_buffer(yuv, 0) < 0) std::exit(1);
     auto at = [&](int plane, int x, int y) {
         x = std::clamp(x, 0, 63); y = std::clamp(y, 0, 31);
@@ -131,21 +131,25 @@ void yuv_matches_double() {
     };
     const double kr = 0.2627, kb = 0.0593, kg = 1 - kr - kb;
     long long checked = 0;
+    for (int format : {FEL_OUT_YUV420P8, FEL_OUT_YUV420P10, FEL_OUT_YUV420P16})
     for (int dither : {FEL_DITHER_NONE, FEL_DITHER_ORDERED, FEL_DITHER_BLUE})
         for (int chroma : {1, 2, 3, 5}) {
+            const int depth = fel_output_depth(format);
+            const double scale = std::ldexp(1.0, depth - 8);
             for (int c = 0; c < 3; ++c)
                 for (int y = 0; y < 32; ++y)
                     for (int x = 0; x < 64; ++x)
                         reinterpret_cast<uint16_t *>(rgb->data[c] + y*rgb->linesize[c])[x] = uint16_t(value(random));
             fel_output output{};
-            output.format = FEL_OUT_YUV420P10; output.width = 64; output.height = 32;
+            output.format = format; output.width = 64; output.height = 32;
             output.dither = dither; output.chroma = chroma;
             convert_rows(*rgb, *yuv, output, 0, 16);
             auto check = [&](double v, double t, int plane, int x, int y) {
-                const double q = v*4 + t;
+                const double q = v*scale + t;
                 if (std::abs(q - std::round(q)) < 1e-9) return;  // frontière : arbitrage exact
-                const int expected = std::clamp(int(std::floor(q)), 0, 1023);
-                if (reinterpret_cast<uint16_t *>(yuv->data[plane] + y*yuv->linesize[plane])[x] != expected) {
+                const int expected = std::clamp(int(std::floor(q)), 0, (1 << depth) - 1);
+                const auto *row = yuv->data[plane] + y*yuv->linesize[plane];
+                if ((depth == 8 ? row[x] : reinterpret_cast<const uint16_t *>(row)[x]) != expected) {
                     std::cerr << "Y'CbCr entier différent du double : plan " << plane << '\n';
                     std::exit(1);
                 }
@@ -177,7 +181,7 @@ void yuv_matches_double() {
                 }
         }
     av_frame_free(&rgb); av_frame_free(&yuv);
-    if (checked < 12*(64*32 + 2*32*16)*9/10) { std::cerr << "trop peu de valeurs vérifiées\n"; std::exit(1); }
+    if (checked < 36*(64*32 + 2*32*16)*9/10) { std::cerr << "trop peu de valeurs vérifiées\n"; std::exit(1); }
 }
 int main() {
     pq_thresholds_consistent();

@@ -696,7 +696,9 @@ CertifiedStats FastReconstruction::rows(const Mapping &mapping, AVFrame &rgb, in
                 const size_t k = c*size_t(width) + x;
                 const double R = linear[k], e = linear_error[k];
                 finite &= std::isfinite(R);
-                const int code = static_cast<int>(std::lround(std::clamp(lms[k], 0.0, 1.0)*65535.0));
+                // NaN (pixel non fini, refusé après la boucle) : candidat 0, sans indice hors table.
+                const double pq = lms[k] > 0 ? std::min(lms[k], 1.0) : 0.0;
+                const int code = static_cast<int>(std::lround(pq*65535.0));
                 const double below = code > 0 ? pq_threshold(std::max(code - 1, 0)) : -INFINITY;
                 const double above = code < PQ_THRESHOLDS ? pq_threshold(std::min(code, PQ_THRESHOLDS - 1)) : INFINITY;
                 const bool certain = R - e > below && R + e <= above;
