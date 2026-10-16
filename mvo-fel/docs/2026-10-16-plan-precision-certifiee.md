@@ -34,14 +34,15 @@ Conventions :
 | **B0** | Banc du mapping en entiers multi-mots (Raphael) | Le bloc complet (signaux, produits, polynôme ou MMR, NLQ, matrice Y'CbCr→LMS') en virgule fixe sur plusieurs mots `uint32`, précision ≤ 10⁻¹² des termes, comparé au même bloc en double | **Go si au moins 2 fois plus rapide** que le double sur Raphael ; sinon arrêt de B |
 | **B1** | Certificat entier (si B0 go) | EOTF et matrice en virgule fixe à borne démontrée, classement par seuils, reprises vers le CPU ; aucun `shaderFloat64` requis | 0 différence avec C1 ; débit iGPU face au Standard actuel ; exactitude possible sur Intel Arc et Mac |
 | **R** | Rapide amélioré | Shader float32 Muxiveo à la place de libplacebo : pivots et zéro NLQ exacts, EOTF et OETF sans annulation | Écart au CPU mesuré (stress et réel), en baisse nette ; coût iGPU acceptable ; tous GPU |
-| **A2** | Étage float32 du Standard | Étage float32 avant A1 ; borne float32 **démontrée** (Gappa, à installer dans le distrobox de développement) ; liste compacte vers A1 | 0 différence avec C1 ; débit proche du Standard actuel sur GPU dédié |
+| ~~A2~~ | ~~Étage float32 du Standard~~ | Remplacé par A2' (décision du 16/10) : l'erreur relative de L en float32 plafonne vers 10⁻⁶ (L = g^6,28 amplifie l'erreur de g = num/den), borne réaliste 6·10⁻⁶ à 1,5·10⁻⁵ ; 15 à 80 % des pixels resteraient à recalculer, gain ≈ 1,3× au mieux | — |
+| **A2'** | Lent en virgule fixe multi-mots | Mapping (B0) **et EOTF** en entiers 64 bits : logarithme et exponentielle par table de 64 entrées et polynôme court, num = c₁·expm1(ln(x/x₀)/m2) sans annulation, inverse par Newton ; matrice LMS→RGB et seuils PQ en virgule fixe 96 bits ; erreurs de méthode bornées analytiquement, erreurs d'arrondi démontrées (Gappa, installé) ; même classement, mêmes reprises CPU et même auto-test qu'A1 ; variante choisie au démarrage là où elle bat le double (NVIDIA) | 0 différence avec C1 (stress, réel, attestation) ; débit Lent RTX ≈ 2× A1 |
 | **T0** | Banc Tensor Cores (RTX) | Mapping MMR et matrices en virgule fixe découpée en tranches INT8, produits partiels **exacts** accumulés en INT32 sur les unités matricielles (schéma d'Ozaki, `VK_KHR_cooperative_matrix`) ; pipeline de calcul hors libplacebo si l'extension GLSL ne peut pas y être activée ; même précision des termes que B0 (≤ 10⁻¹²), comparé au mapping en double d'A2 | **Go si au moins 2 fois plus rapide** que le mapping en double sur RTX ; sinon arrêt de T |
 | **T1** | Mapping sur Tensor Cores (si T0 go) | Intégration dans le Lent et le Standard : mapping exact à erreur bornée sur unités matricielles, le reste inchangé (étage float32 d'A2, classement par seuils, reprises vers le CPU) ; repli double sans l'extension | 0 différence avec C1 ; débit face à A2 sur RTX ; exactitude sans `shaderFloat64` possible sur Intel Arc (XMX), non testable localement |
 | **V** | Validation et livraison | Attestation de schéma 5 (référence certifiée, compteurs de reprises) ; documentation ; textes de Muxiveo (débits et précisions) | Attestation réussie ; tests Muxiveo et natifs verts |
 
-Ordre d'exécution : C0 → C1 → A1 → B0 → R → A2 → B1 (si go) → T0 → T1 (si go) → V. Chaque lot est commité séparément puis audité.
+Ordre d'exécution : C0 → C1 → A1 → B0 → R → A2' → B1 (arrêté) → T0 → T1 (si go) → V. Chaque lot est commité séparément puis audité.
 
-T vient après A2 : tant que l'EOTF en double domine (A1), accélérer le mapping ne change presque rien. Une fois l'EOTF passée dans l'étage float32 d'A2, le mapping, qui reste en précision étendue à cause des annulations du MMR, devient le poste dominant sur GPU dédié.
+T vient après A2' : sa référence à battre est la virgule fixe multi-mots d'A2' sur RTX, et non plus le double.
 
 Ce que les Tensor Cores ne couvrent pas :
 
