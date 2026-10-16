@@ -56,7 +56,7 @@ MVO_FEL_EXPORT int mvo_fel_set_start(mvo_fel_context *, int64_t start_us);
 MVO_FEL_EXPORT int mvo_fel_set_crop(mvo_fel_context *, int left, int top, int right, int bottom);
 MVO_FEL_EXPORT int mvo_fel_set_timestamps(mvo_fel_context *, const char *mode);
 /* Extension additive ABI 1 ; modes listés par capabilities.precision. Avant run, rendu GPU :
- * "fast" (défaut, float32 libplacebo), "standard" (hybride borné, ≤ 1 code 16 bits du CPU)
+ * "fast" (défaut, shader float32 Muxiveo, tous GPU), "standard" (hybride borné, ≤ 1 code 16 bits du CPU)
  * ou "exact" (double natif, classement certifié : identique au CPU). Les deux derniers exigent un GPU calculant en double
  * (devices : float64) ; sinon le rendu passe sur CPU (référence certifiée). */
 MVO_FEL_EXPORT int mvo_fel_set_precision(mvo_fel_context *, const char *mode);

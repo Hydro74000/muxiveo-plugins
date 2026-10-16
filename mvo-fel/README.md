@@ -54,7 +54,7 @@ toujours la référence certifiée, quel que soit le mode.
 |---|---|---|---:|---:|
 | `exact` (Lent, recommandé) | double natif, classement certifié entre seuils PQ, reprises par le CPU certifié, Y'CbCr en entiers exacts ([détails](docs/2026-10-16-gpu-exact-certifie.md)) | identique au bit près (référence certifiée) | 33–34,5 i/s | 2,5 i/s |
 | `standard` | float32 reformulé, borne d'erreur par pixel, recalcul en double au-delà de 0,4 code | ≤ 1 code 16 bits | 66,7 i/s | 8,1 i/s |
-| `fast` (défaut de l'ABI) | décodage Dolby Vision libplacebo en float32 | jusqu'à ~300 codes PQ12 aux couleurs extrêmes | 67 i/s | 20,8 i/s |
+| `fast` (défaut de l'ABI) | shader float32 Muxiveo : sommes, segments et zéro NLQ exacts, EOTF et OETF sans annulation ([détails](docs/2026-10-16-rapide-ameliore.md)) | 1 code 16 bits sur scènes réelles ; jusqu'à 112 codes 16 bits sur le stress synthétique le plus défavorable | 74–78 i/s | 19,8 i/s |
 
 Débit du plugin seul, 300 images UHD, sortie 10 bits finale ; CPU (7800X3D) : 7,9 i/s.
 

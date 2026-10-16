@@ -695,7 +695,7 @@ static int upload_coefficients(struct fel_gpu *p, const AVDOVIMetadata *metadata
 
 /* Double natif : ln (série atanh jusqu'à s^19), e^x = 2^n·(1+u) (réduction par ln 2 puis /32,
  * Taylor jusqu'à r^7, cinq carrés sous forme expm1). Constantes en littéraux décimaux fixes. */
-static const char fel_precise_header[] =
+static const char fel_double_header[] =
     "double fel_d(int i){uvec4 t=texelFetch(fel_coef,ivec2(i>>1,0),0);return packDouble2x32((i&1)==0?t.xy:t.zw);}\n"
     "double fel_pow2(int n){return packDouble2x32(uvec2(0u,uint(clamp(n,-1022,1023)+1023)<<20));}\n"
     "double fel_ln(double x){uvec2 w=unpackDouble2x32(x);int e=int((w.y>>20)&0x7ffu)-1023;"
@@ -724,6 +724,21 @@ static const char fel_precise_header[] =
     "if(num<=0.0LF){kappa=1.0e300LF;return 0.0LF;}kappa=(1.0LF+u)/12.56011962890625LF*(1.0LF/num+18.6875LF/den);"
     "double t=fel_ln(num/den)*(8192.0LF/1305.0LF);mag=abs(t)*1.4426950408889634LF+1.0LF;return fel_exp(t);}\n"
     "double fel_T(int k){return packDouble2x32(texelFetch(fel_thr,ivec2(k&255,k>>8),0).xy);}\n"
+    ;
+
+/* Partie commune sans double (tous les GPU, mode rapide compris). */
+static const char fel_common_header[] =
+    /* Mode rapide : EOTF et OETF float32 sans annulation, à coût réduit. EOTF : p - 1 = expm1(ln(x)/m2)
+     * par polynôme (|t| ≤ 0,18 utile, reste < 3e-11), p - c1 = h + u, c2 - c3·p = h - c3·u ; OETF :
+     * (c1 + c2·v)/(1 + c3·v) = 1 - h(1 - v)/(1 + c3·v), puis exp(m2·log1p(…)). log2/exp2/pow natifs
+     * là où l'erreur relative suffit. */
+    "float g_eotf(float x){if(x<=0.0)return 0.0;float t=log2(x)*0.0087914030;if(t<-0.18)return 0.0;"
+    "float u=t*(1.0+t*(0.5+t*(0.16666667+t*(0.041666668+t*(0.0083333338+t*(0.0013888889+t*0.00019841270))))));"
+    "float num=0.1640625+u,den=0.1640625-18.6875*u;if(den<=0.0)return 1.0e30;if(num<=0.0)return 0.0;"
+    "return exp2(log2(num/den)*6.277394636015326);}\n"
+    "float g_log1p(float z){float s=z/(2.0+z),s2=s*s;return 2.0*s*(1.0+s2*(0.33333333+s2*(0.2+s2*(0.14285714+s2*0.11111111))));}\n"
+    "float g_oetf(float y){if(y<=0.0)return 7.3095590e-7;float v=pow(y,0.1593017578125);"
+    "return exp2(113.74749*g_log1p(-0.1640625*(1.0-v)/(1.0+18.6875*v)));}\n"
     /* Comparaisons entières exactes sur 64 bits (hi, lo). */
     "uvec2 fel_mul64(uint a,uint b){uint hi,lo;umulExtended(a,b,hi,lo);return uvec2(hi,lo);}\n"
     "bool fel_ge64(uvec2 a,uvec2 b){return a.x>b.x||(a.x==b.x&&a.y>=b.y);}\n"
@@ -858,10 +873,12 @@ static int resolve_rescues(struct fel_gpu *p, const AVDOVIMetadata *metadata, co
 
 /* En-tête du rendu précis : fonctions communes et entrées exactes d'un pixel (code BL Y, sommes
  * Spline16 entières et dénominateurs), offsets NLQ de l'image. */
-static int precise_header(char *header, size_t size, const AVDOVIMetadata *metadata)
+#define FEL_HEADER_SIZE (sizeof(fel_double_header) + sizeof(fel_common_header) + 4096)
+/* with_double : fonctions double des modes exact et standard ; sinon float32 seul (mode rapide). */
+static int precise_header(char *header, size_t size, const AVDOVIMetadata *metadata, int with_double)
 {
     const AVDOVIDataMapping *mapping = av_dovi_get_mapping(metadata);
-    const int used = snprintf(header, size, "%s"
+    const int used = snprintf(header, size, "%s%s"
         "void fel_inputs(ivec2 xy,out int code,out int tb,out int tr,out int Db,out int te0,out int te1,out int te2,"
         "out int Dl,out int Dc){code=clamp(int(round(texelFetch(fb0,xy,0).r*65535.0)),0,1023);"
         "tb=0;tr=0;te0=0;te1=0;te2=0;"
@@ -876,7 +893,9 @@ static int precise_header(char *header, size_t size, const AVDOVIMetadata *metad
         "for(int b=0;b<4;b++){int r1=0,r2=0;for(int a=0;a<4;a++){ivec2 q=ivec2(ix[a],iy[b]);"
         "r1+=nx[a]*(int(round(texelFetch(fe1,q,0).r*65535.0))-%d);r2+=nx[a]*(int(round(texelFetch(fe2,q,0).r*65535.0))-%d);}"
         "te1+=ny[b]*r1;te2+=ny[b]*r2;}Dc=D;}}\n",
-        fel_precise_header, mapping->nlq[0].nlq_offset, mapping->nlq[1].nlq_offset, mapping->nlq[2].nlq_offset);
+        with_double ? fel_double_header : "float fel_f(int i){return fel_cf[i>>2][i&3];}\n",
+        fel_common_header,
+        mapping->nlq[0].nlq_offset, mapping->nlq[1].nlq_offset, mapping->nlq[2].nlq_offset);
     return used > 0 && used < (int)size;
 }
 
@@ -904,8 +923,8 @@ static int render_precise(struct fel_gpu *p, const AVDOVIMetadata *metadata)
     if (!upload_coefficients(p, metadata) || !prepare_exact(p)) return 0;
     static const uint32_t zero = 0;
     if (exact) pl_buf_write(p->vk->gpu, p->rescue, 0, &zero, sizeof(zero));
-    char header[sizeof(fel_precise_header) + 4096];
-    if (!precise_header(header, sizeof(header), metadata)) return 0;
+    char header[FEL_HEADER_SIZE];
+    if (!precise_header(header, sizeof(header), metadata, 1)) return 0;
     struct pl_buffer_var rescue_vars[2];
     const int diag_rows = p->diag_stride > 0 ? (p->height + p->diag_stride - 1) / p->diag_stride : 0;
     struct pl_buffer_var diag_var = uint_array("fel_diag", diag_rows ? FEL_DIAG_WORDS * diag_rows * p->width : 1, 0);
@@ -1155,6 +1174,64 @@ int fel_gpu_float64(const void *context)
     return p && p->float64;
 }
 
+/* Mode rapide (lot R) : float32 seul, aucun double requis. Sommes Spline16 entières, segment et
+ * zéro NLQ exacts comme en mode exact ; mapping, NLQ et matrices en float32 ; EOTF et OETF
+ * reformulées sans annulation (g_eotf, g_oetf). */
+static int render_fast(struct fel_gpu *p, const AVDOVIMetadata *metadata)
+{
+    char header[FEL_HEADER_SIZE];
+    if (!upload_coefficients(p, metadata) || !precise_header(header, sizeof(header), metadata, 0)) return 0;
+    struct pl_shader_desc d[16];
+    struct pl_buffer_var unused[2];
+    precise_descriptors(p, d, unused, PL_DESC_ACCESS_READONLY);   /* sources et axes : 12 premiers */
+    /* Coefficients en tableau uniforme (cache de constantes), non en texture : ~100 lectures par pixel. */
+    float floats[4 * ((FEL_COEFFICIENTS + 3) / 4)] = {0};
+    for (int k = 0; k < FEL_COEFFICIENTS; ++k) floats[k] = (float)p->coef_values[k];
+    const struct pl_shader_var coefficients = {.var = {.name = "fel_cf", .type = PL_VAR_FLOAT, .dim_v = 4, .dim_m = 1,
+        .dim_a = (FEL_COEFFICIENTS + 3) / 4}, .data = floats, .dynamic = true};
+    const int H = FEL_CHANNEL, G = FEL_GLOBAL;
+    char body[8192];
+    const int used = snprintf(body, sizeof(body),
+        "ivec2 xy=ivec2(gl_FragCoord.xy);"
+        "int code,tb,tr,Db,te0,te1,te2,Dl,Dc;fel_inputs(xy,code,tb,tr,Db,te0,te1,te2,Dl,Dc);"
+        "uvec2 full64=fel_mul64(1023u,uint(Db));uvec2 X64[3];X64[0]=uvec2(0u,uint(code));"
+        "X64[1]=uvec2(0u,uint(max(tb,0)));X64[2]=uvec2(0u,uint(max(tr,0)));"
+        "for(int c=1;c<3;++c)X64[c]=fel_ge64(X64[c],full64)?full64:X64[c];"
+        "int piece[3];"
+        "for(int c=0;c<3;++c){int B=c*%d,count=int(fel_f(B)),p=0;"
+        "while(p+2<count){uint pc=uint(fel_f(B+2+p));if(!fel_ge64(X64[c],c==0?uvec2(0u,pc):fel_mul64(pc,uint(Db))))break;++p;}"
+        "piece[c]=B+14+24*p;}"
+        "float full=1023.0*float(Db);"
+        "float sig[3];sig[0]=float(code)/1023.0;sig[1]=X64[1]==full64?1.0:float(X64[1].y)/full;"
+        "sig[2]=X64[2]==full64?1.0:float(X64[2].y)/full;"
+        "float t7[7];t7[0]=sig[0];t7[1]=sig[1];t7[2]=sig[2];t7[3]=sig[0]*sig[1];t7[4]=sig[0]*sig[2];"
+        "t7[5]=sig[1]*sig[2];t7[6]=t7[3]*sig[2];"
+        "float res[3];"
+        "for(int c=0;c<3;++c){int P=piece[c],B=c*%d;float s;"
+        "if(fel_f(P)==0.0)s=(fel_f(P+4)*sig[c]+fel_f(P+3))*sig[c]+fel_f(P+2);"
+        "else{s=fel_f(P+2);int order=int(fel_f(P+1));"
+        "for(int j=0;j<7;++j){float acc=fel_f(P+3+7*(order-1)+j);"
+        "for(int k=order-2;k>=0;--k)acc=acc*t7[j]+fel_f(P+3+7*k+j);s+=acc*t7[j];}}"
+        "res[c]=clamp(s,fel_f(B+10),fel_f(B+11));}"
+        "if(fel_f(%d)!=0.0){int te[3]=int[3](te0,te1,te2);int De[3]=int[3](Dl,Dc,Dc);"
+        "for(int c=0;c<3;++c)if(te[c]!=0){float d=float(te[c])/(1023.0*float(De[c]));"
+        "res[c]+=sign(d)*(abs(d)*fel_f(c*%d+12)+fel_f(c*%d+13));}}"
+        "float L[3];for(int i=0;i<3;++i){float x=fel_f(%d+4+3*i)*(res[0]-fel_f(%d+1))+fel_f(%d+5+3*i)*(res[1]-fel_f(%d+2))"
+        "+fel_f(%d+6+3*i)*(res[2]-fel_f(%d+3));L[i]=g_eotf(x);}"
+        "vec3 out3;for(int i=0;i<3;++i){float y=fel_f(%d+13+3*i)*L[0]+fel_f(%d+14+3*i)*L[1]+fel_f(%d+15+3*i)*L[2];"
+        "out3[i]=(floor(clamp(g_oetf(y),0.0,1.0)*65535.0+0.5)+0.25)/65535.0;}"
+        "color=vec4(out3,1.0);",
+        H, H, G, H, H, G, G, G, G, G, G, G, G, G);
+    if (used <= 0 || used >= (int)sizeof(body)) return 0;
+    pl_shader sh = pl_dispatch_begin(p->dispatch);
+    int ok = pl_shader_custom(sh, &(struct pl_custom_shader){.header = header, .body = body,
+        .input = PL_SHADER_SIG_NONE, .output = PL_SHADER_SIG_COLOR, .descriptors = d, .num_descriptors = 12,
+        .variables = &coefficients, .num_variables = 1, .output_w = p->width, .output_h = p->height});
+    ok = ok && pl_dispatch_finish(p->dispatch, pl_dispatch_params(.timer = p->timers[3], .shader = &sh, .target = p->target));
+    pl_dispatch_abort(p->dispatch, &sh);
+    return ok;
+}
+
 static int render_target(struct fel_gpu *p, const AVDOVIMetadata *metadata,
                          const AVFrame *bl, const AVFrame *el)
 {
@@ -1166,6 +1243,8 @@ static int render_target(struct fel_gpu *p, const AVDOVIMetadata *metadata,
     if (fused ? !load_layer(p, bl, 0) || !load_layer(p, el, 1)
               : !scale_layer(p, bl, 0, metadata) || !scale_layer(p, el, 1, metadata)) return 0;
     if (p->precision != FEL_PRECISION_FAST) return render_precise(p, metadata);
+    /* Rapide : shader float32 Muxiveo ; MVO_FEL_GPU_LIBPLACEBO : décodage libplacebo (comparaisons). */
+    if (fused && !getenv("MVO_FEL_GPU_LIBPLACEBO")) return render_fast(p, metadata);
     struct pl_dovi_metadata dovi = {0};
     pl_map_dovi_metadata(&dovi, metadata);
     for (int c=0;c<3;++c) dovi.nlq[c].offset=0;
