@@ -1243,8 +1243,11 @@ static int render_target(struct fel_gpu *p, const AVDOVIMetadata *metadata,
     if (fused ? !load_layer(p, bl, 0) || !load_layer(p, el, 1)
               : !scale_layer(p, bl, 0, metadata) || !scale_layer(p, el, 1, metadata)) return 0;
     if (p->precision != FEL_PRECISION_FAST) return render_precise(p, metadata);
-    /* Rapide : shader float32 Muxiveo ; MVO_FEL_GPU_LIBPLACEBO : décodage libplacebo (comparaisons). */
-    if (fused && !getenv("MVO_FEL_GPU_LIBPLACEBO")) return render_fast(p, metadata);
+    /* Rapide : shader float32 Muxiveo si le RPU entre dans son cadre (10 bits, sans partition, NLQ
+     * linéaire) ; sinon, ou avec MVO_FEL_GPU_LIBPLACEBO (comparaisons), décodage libplacebo. */
+    double supported[FEL_COEFFICIENTS];
+    if (fused && !getenv("MVO_FEL_GPU_LIBPLACEBO") && fel_coefficients(metadata, supported))
+        return render_fast(p, metadata);
     struct pl_dovi_metadata dovi = {0};
     pl_map_dovi_metadata(&dovi, metadata);
     for (int c=0;c<3;++c) dovi.nlq[c].offset=0;
