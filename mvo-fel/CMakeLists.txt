@@ -18,7 +18,18 @@ add_custom_command(OUTPUT ${MVO_FEL_PQ_SOURCE}
           -DOUTPUT=${MVO_FEL_PQ_SOURCE} -DSYMBOL=fel_pq_threshold_bytes
           -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_bytes.cmake
   DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/data/pq_thresholds.bin ${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_bytes.cmake)
-add_library(fel_math STATIC src/reconstruction.cpp src/certified.cpp src/fixed_point.cpp ${MVO_FEL_PQ_SOURCE})
+# Shaders GLSL de la virgule fixe (lot A2') en chaînes C.
+set(MVO_FEL_GLSL_SOURCES)
+foreach(shader fixed_point fixed_render)
+  set(output ${CMAKE_CURRENT_BINARY_DIR}/glsl_${shader}.c)
+  add_custom_command(OUTPUT ${output}
+    COMMAND ${CMAKE_COMMAND} -DINPUT=${CMAKE_CURRENT_SOURCE_DIR}/src/shaders/${shader}.glsl
+            -DOUTPUT=${output} -DSYMBOL=fel_glsl_${shader} -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_text.cmake
+    DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/src/shaders/${shader}.glsl ${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_text.cmake)
+  list(APPEND MVO_FEL_GLSL_SOURCES ${output})
+endforeach()
+add_library(fel_math STATIC src/reconstruction.cpp src/certified.cpp src/fixed_point.cpp ${MVO_FEL_PQ_SOURCE}
+            ${MVO_FEL_GLSL_SOURCES})
 target_include_directories(fel_math PUBLIC include)
 target_link_libraries(fel_math PUBLIC PkgConfig::AV)
 set_target_properties(fel_math PROPERTIES CXX_VISIBILITY_PRESET hidden C_VISIBILITY_PRESET hidden)

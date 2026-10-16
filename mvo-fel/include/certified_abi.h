@@ -21,8 +21,11 @@ int fel_certified_codes(const AVDOVIMetadata *metadata, const uint32_t *entries,
  * double-double : *worst = max |R̂ - R| / borne ; renvoie le nombre de codes certains différents
  * du code certifié, -1 si la géométrie ou le RPU sort du chemin entier. */
 #define FEL_DIAG_WORDS 15
+/* Format virgule fixe (lot A2') : 6 mots par composante, R en Q0.96 sur 128 bits (complément à deux),
+ * borne en float32, puis code | certain << 16. */
+#define FEL_DIAG_WORDS_FIXED 18
 int fel_certified_check(const AVDOVIMetadata *metadata, const AVFrame *bl, const AVFrame *el,
-                        int stride, const uint32_t *diag, double *worst);
+                        int stride, int fixed_format, const uint32_t *diag, double *worst);
 #ifdef __cplusplus
 }
 #endif

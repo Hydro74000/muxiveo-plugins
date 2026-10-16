@@ -902,7 +902,7 @@ extern "C" int fel_certified_codes(const AVDOVIMetadata *metadata, const uint32_
 }
 
 extern "C" int fel_certified_check(const AVDOVIMetadata *metadata, const AVFrame *bl, const AVFrame *el,
-                                   int stride, const uint32_t *diag, double *worst) {
+                                   int stride, int fixed_format, const uint32_t *diag, double *worst) {
     using namespace muxiveo::fel;
     try {
         const Mapping mapping(*metadata);
@@ -920,17 +920,33 @@ extern "C" int fel_certified_check(const AVDOVIMetadata *metadata, const AVFrame
                 std::array<uint16_t, 3> codes{};
                 std::array<certified::DD, 3> linear{};
                 certified::classify(mapping, pixel, 7, codes, &linear);
-                const uint32_t *d = diag + size_t(FEL_DIAG_WORDS)*(size_t(y/stride)*bl->width + x);
-                for (int c = 0; c < 3; ++c, d += 5) {
-                    double value, bound;
-                    const uint64_t vb = d[0] | uint64_t(d[1]) << 32, eb = d[2] | uint64_t(d[3]) << 32;
-                    std::memcpy(&value, &vb, 8);
-                    std::memcpy(&bound, &eb, 8);
-                    if (bound < 1e299) {
-                        const double ratio = std::abs((value - linear[c].hi) - linear[c].lo)/bound;
+                const int words = fixed_format ? FEL_DIAG_WORDS_FIXED : FEL_DIAG_WORDS, per = words/3;
+                const uint32_t *d = diag + size_t(words)*(size_t(y/stride)*bl->width + x);
+                for (int c = 0; c < 3; ++c, d += per) {
+                    long double value;
+                    double bound;
+                    if (fixed_format) {
+                        __extension__ typedef unsigned __int128 u128;
+                        __extension__ typedef __int128 i128;
+                        const u128 bits = (u128)d[0] | (u128)d[1] << 32 | (u128)d[2] << 64 | (u128)d[3] << 96;
+                        value = std::ldexp((long double)(i128)bits, -96);
+                        float b;
+                        std::memcpy(&b, &d[4], 4);
+                        bound = b;
+                    } else {
+                        double v;
+                        const uint64_t vb = d[0] | uint64_t(d[1]) << 32, eb = d[2] | uint64_t(d[3]) << 32;
+                        std::memcpy(&v, &vb, 8);
+                        std::memcpy(&bound, &eb, 8);
+                        value = v;
+                    }
+                    const uint32_t code_word = d[per - 1];
+                    // Virgule fixe : une composante hors cadre n'a pas de borne valide (reprise CPU).
+                    if (bound < 1e299 && (!fixed_format || (code_word >> 16 & 1))) {
+                        const double ratio = (double)(std::abs((value - linear[c].hi) - linear[c].lo)/bound);
                         *worst = std::isfinite(ratio) ? std::max(*worst, ratio) : INFINITY;
                     }
-                    if ((d[4] >> 16 & 1) && (d[4] & 0xffff) != codes[c]) ++mismatches;
+                    if ((code_word >> 16 & 1) && (code_word & 0xffff) != codes[c]) ++mismatches;
                 }
             }
         return mismatches;

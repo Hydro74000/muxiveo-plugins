@@ -78,3 +78,4 @@ Ce que les Tensor Cores ne couvrent pas :
 | A1 | Fait : [Lent GPU certifié](2026-10-16-gpu-exact-certifie.md), identique au CPU certifié ; débit +20 à 25 % (au lieu de ×2 : l'EOTF en double domine, cible d'A2) |
 | B0 | Fait : [banc](2026-10-16-b0-entiers-multimots.md) ; Raphael 0,54× (critère 2× non atteint) : **B1 arrêté**. RTX : 2,64× plus rapide que le double, candidat pour le mapping d'A2 et référence de T0 |
 | R | Fait : [Rapide amélioré](2026-10-16-rapide-ameliore.md) ; stress : 9 151 → 1 code 16 bits (matrices réelles), 1 026 → 112 (identité) ; réel : 1 code ; iGPU −12 % |
+| A2' | Fait : [Lent en virgule fixe](2026-10-16-a2-virgule-fixe.md) ; RTX : composition 18,7 → 7,8 ms, Lent 34,4 → 43,6–51,4 i/s, 0 reprise sur scènes réelles ; iGPU : double conservé (choix par auto-test) |

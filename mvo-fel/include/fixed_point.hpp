@@ -54,7 +54,8 @@ bool prepare(const Mapping &mapping, const AVDOVIMetadata &metadata, Params &par
 
 // EOTF en virgule fixe : x > 0 à l'échelle 2^-fraction ; L = mant·2^(n-63). dl = ln(x/x0) (valeur
 // approchée, pour la borne). false hors cadre (x ≳ 1,33, vers le pôle). L = 0 (mant nul) si x ≤ x0.
-bool eotf(u128 x, int fraction, uint64_t &mant, int &n, double &dl);
+// kappa (facultatif) : conditionnement relatif, calculé sur num et den exacts.
+bool eotf(u128 x, int fraction, uint64_t &mant, int &n, double &dl, double *kappa = nullptr);
 
 // Valeurs linéaires R, G, B en Q0.96 (signées) et bornes d'erreur (valeur) d'un pixel ; masque
 // des composantes non certaines (domaine ou borne). Codes candidats classés sur la table Q0.96.

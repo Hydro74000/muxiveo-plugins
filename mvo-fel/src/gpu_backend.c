@@ -10,6 +10,7 @@
 #include <stdio.h>
 #include "output_format.h"
 #include "certified_abi.h"
+#include "fixed_abi.h"
 #include <math.h>
 #include <string.h>
 #include <inttypes.h>
@@ -18,6 +19,8 @@
 extern PFN_vkGetInstanceProcAddr fel_vk_get_proc_addr(void);
 /* Table des seuils PQ (data/pq_thresholds.bin) : 65 535 parties hautes puis basses. */
 extern const unsigned char fel_pq_threshold_bytes[];
+/* Shaders GLSL de la virgule fixe (src/shaders, intégrés par CMake). */
+extern const char fel_glsl_fixed_point[], fel_glsl_fixed_render[];
 /* Reprises par image au plus (0,8 % d'une image UHD) ; au-delà, échec explicite du rendu. */
 #define FEL_RESCUE_CAPACITY 65536
 
@@ -52,6 +55,12 @@ struct fel_gpu {
     pl_buf rescue, patch, diag;
     int diag_stride, self_test;
     int force_rescue;           /* tests : toutes les composantes reprises par le CPU certifié */
+    /* Variante du mode exact (lot A2') : 0 double, 1 virgule fixe multi-mots ; tables GLSL, seuils
+     * en Q0.96, paramètres de l'image (fixed_abi.h). */
+    int fixed_mode, fixed_ready;
+    uint32_t fixed_tables[FEL_FIXED_TABLE_WORDS];
+    pl_tex thr96;
+    uint32_t fixed_words[FEL_FIXED_WORDS];
     long long rescued, undecided;
 };
 
@@ -69,10 +78,34 @@ void fel_gpu_timings(void *context, double *milliseconds)
     for (int k = 0; k < 5; ++k) milliseconds[k] = p ? p->gpu_ns[k] / 1e6 : 0;
 }
 
+static int render_target(struct fel_gpu *p, const AVDOVIMetadata *metadata, const AVFrame *bl, const AVFrame *el);
+/* Tests : rendu exact en virgule fixe avec diagnostic de toutes les lignes (FEL_DIAG_WORDS_FIXED
+ * mots par pixel dans diag) ; 0 en cas d'échec. */
+int fel_gpu_debug_fixed(void *context, const AVDOVIMetadata *metadata, const AVFrame *bl, const AVFrame *el,
+                        uint32_t *diag)
+{
+    struct fel_gpu *p = context;
+    const size_t words = (size_t)FEL_DIAG_WORDS_FIXED * p->height * p->width;
+    p->fixed_mode = 1; p->diag_stride = 1;
+    p->diag = pl_buf_create(p->vk->gpu, pl_buf_params(.size = 4 * words, .storable = true, .host_readable = true));
+    const int ok = p->diag && fel_fixed_params(metadata, p->fixed_words, FEL_FIXED_WORDS) &&
+                   render_target(p, metadata, bl, el) && pl_buf_read(p->vk->gpu, p->diag, 0, diag, 4 * words);
+    pl_buf_destroy(p->vk->gpu, &p->diag);
+    p->diag_stride = 0;
+    return ok;
+}
+
 /* Tests : toutes les composantes du mode exact reprises par le CPU certifié (chaîne de reprise). */
 void fel_gpu_force_rescue(void *context, int enabled)
 {
     ((struct fel_gpu *)context)->force_rescue = enabled != 0;
+}
+
+/* Variante du mode exact retenue par l'auto-test : 1 virgule fixe, 0 double. */
+int fel_gpu_fixed_variant(const void *context)
+{
+    const struct fel_gpu *p = context;
+    return p && p->fixed_mode == 1;
 }
 
 /* Mode exact : pixels repris par le CPU certifié et composantes indécises, cumulés. */
@@ -114,6 +147,7 @@ void fel_gpu_destroy(void *context)
         pl_tex_destroy(p->vk->gpu, &p->dither);
         pl_tex_destroy(p->vk->gpu, &p->coef);
         pl_tex_destroy(p->vk->gpu, &p->thresholds);
+        pl_tex_destroy(p->vk->gpu, &p->thr96);
         pl_buf_destroy(p->vk->gpu, &p->rescue);
         pl_buf_destroy(p->vk->gpu, &p->patch);
         pl_buf_destroy(p->vk->gpu, &p->diag);
@@ -874,8 +908,10 @@ static int resolve_rescues(struct fel_gpu *p, const AVDOVIMetadata *metadata, co
 /* En-tête du rendu précis : fonctions communes et entrées exactes d'un pixel (code BL Y, sommes
  * Spline16 entières et dénominateurs), offsets NLQ de l'image. */
 #define FEL_HEADER_SIZE (sizeof(fel_double_header) + sizeof(fel_common_header) + 4096)
-/* with_double : fonctions double des modes exact et standard ; sinon float32 seul (mode rapide). */
-static int precise_header(char *header, size_t size, const AVDOVIMetadata *metadata, int with_double)
+/* prefix : fonctions propres au mode (double, float32 du mode rapide, virgule fixe) ; suffix : après
+ * fel_inputs (rendu en virgule fixe). */
+static int precise_header(char *header, size_t size, const AVDOVIMetadata *metadata, const char *prefix,
+                          const char *suffix)
 {
     const AVDOVIDataMapping *mapping = av_dovi_get_mapping(metadata);
     const int used = snprintf(header, size, "%s%s"
@@ -892,10 +928,9 @@ static int precise_header(char *header, size_t size, const AVDOVIMetadata *metad
         "{" FEL_EXACT_TAPS("fcx", "fcy")
         "for(int b=0;b<4;b++){int r1=0,r2=0;for(int a=0;a<4;a++){ivec2 q=ivec2(ix[a],iy[b]);"
         "r1+=nx[a]*(int(round(texelFetch(fe1,q,0).r*65535.0))-%d);r2+=nx[a]*(int(round(texelFetch(fe2,q,0).r*65535.0))-%d);}"
-        "te1+=ny[b]*r1;te2+=ny[b]*r2;}Dc=D;}}\n",
-        with_double ? fel_double_header : "float fel_f(int i){return fel_cf[i>>2][i&3];}\n",
-        fel_common_header,
-        mapping->nlq[0].nlq_offset, mapping->nlq[1].nlq_offset, mapping->nlq[2].nlq_offset);
+        "te1+=ny[b]*r1;te2+=ny[b]*r2;}Dc=D;}}\n%s",
+        prefix, fel_common_header,
+        mapping->nlq[0].nlq_offset, mapping->nlq[1].nlq_offset, mapping->nlq[2].nlq_offset, suffix);
     return used > 0 && used < (int)size;
 }
 
@@ -917,6 +952,29 @@ static int precise_descriptors(struct fel_gpu *p, struct pl_shader_desc *d, stru
     return 15;
 }
 
+/* Fin du corps du rendu exact (variables code, tb, …, seg, mask, out3, inside, xy) : reprise forcée
+ * (tests), liste compacte des composantes indécises, sortie. */
+static int rescue_epilogue(const struct fel_gpu *p, char *body, size_t size, int used)
+{
+    if (used <= 0 || used >= (int)size) return -1;
+    return used + snprintf(body + used, size - used,
+        "if(%d!=0)mask=7u;"
+        /* Zone uniforme : un pixel dont les entrées brutes égalent celles d'un voisin de gauche à
+         * distance ≤ 4 (phases Spline16 de période ≤ 4 : chroma EL suréchantillonnée ×4) a le même
+         * calcul, donc le même masque : il n'est pas listé, la passe de correctifs propage le code
+         * du premier pixel de la plage vers la droite. */
+        "bool head=true;for(int s=1;s<=4&&head&&mask!=0u;++s)if(xy.x>=s){int c1,b1,r1,d1,f0,f1,f2,l1,k1;"
+        "fel_inputs(xy-ivec2(s,0),c1,b1,r1,d1,f0,f1,f2,l1,k1);"
+        "head=!(c1==code&&b1==tb&&r1==tr&&d1==Db&&f0==te0&&f1==te1&&f2==te2&&l1==Dl&&k1==Dc);}"
+        "if(mask!=0u&&inside&&head){uint i=atomicAdd(fel_rescue_count,1u);if(i<%du){uint b=%du*i;"
+        "fel_rescue[b]=uint(xy.x)|(uint(xy.y)<<16);"
+        "fel_rescue[b+1u]=uint(code)|(uint(seg[0])<<16)|(uint(seg[1])<<20)|(uint(seg[2])<<24)|(mask<<28);"
+        "fel_rescue[b+2u]=uint(tb);fel_rescue[b+3u]=uint(tr);fel_rescue[b+4u]=uint(Db);fel_rescue[b+5u]=uint(te0);"
+        "fel_rescue[b+6u]=uint(te1);fel_rescue[b+7u]=uint(te2);fel_rescue[b+8u]=uint(Dl);fel_rescue[b+9u]=uint(Dc);}}"
+        "color=vec4(out3,1.0);",
+        p->force_rescue, FEL_RESCUE_CAPACITY, FEL_RESCUE_WORDS);
+}
+
 static int render_precise(struct fel_gpu *p, const AVDOVIMetadata *metadata)
 {
     const int exact = p->precision == FEL_PRECISION_EXACT;
@@ -924,7 +982,7 @@ static int render_precise(struct fel_gpu *p, const AVDOVIMetadata *metadata)
     static const uint32_t zero = 0;
     if (exact) pl_buf_write(p->vk->gpu, p->rescue, 0, &zero, sizeof(zero));
     char header[FEL_HEADER_SIZE];
-    if (!precise_header(header, sizeof(header), metadata, 1)) return 0;
+    if (!precise_header(header, sizeof(header), metadata, fel_double_header, "")) return 0;
     struct pl_buffer_var rescue_vars[2];
     const int diag_rows = p->diag_stride > 0 ? (p->height + p->diag_stride - 1) / p->diag_stride : 0;
     struct pl_buffer_var diag_var = uint_array("fel_diag", diag_rows ? FEL_DIAG_WORDS * diag_rows * p->width : 1, 0);
@@ -1024,22 +1082,8 @@ static int render_precise(struct fel_gpu *p, const AVDOVIMetadata *metadata)
             p->diag_stride, FEL_DIAG_WORDS, p->diag_stride, p->width);
     if (exact && used > 0 && used < (int)sizeof(body))
         used += snprintf(body + used, sizeof(body) - used,
-            "}"
-            "if(%d!=0)mask=7u;"
-            /* Zone uniforme : un pixel dont les entrées brutes égalent celles d'un voisin de gauche à
-             * distance ≤ 4 (phases Spline16 de période ≤ 4 : chroma EL suréchantillonnée ×4) a le même
-             * calcul, donc le même masque : il n'est pas listé, la passe de correctifs propage le code
-             * du premier pixel de la plage vers la droite. */
-            "bool head=true;for(int s=1;s<=4&&head&&mask!=0u;++s)if(xy.x>=s){int c1,b1,r1,d1,f0,f1,f2,l1,k1;"
-            "fel_inputs(xy-ivec2(s,0),c1,b1,r1,d1,f0,f1,f2,l1,k1);"
-            "head=!(c1==code&&b1==tb&&r1==tr&&d1==Db&&f0==te0&&f1==te1&&f2==te2&&l1==Dl&&k1==Dc);}"
-            "if(mask!=0u&&inside&&head){uint i=atomicAdd(fel_rescue_count,1u);if(i<%du){uint b=%du*i;"
-            "fel_rescue[b]=uint(xy.x)|(uint(xy.y)<<16);"
-            "fel_rescue[b+1u]=uint(code)|(uint(seg[0])<<16)|(uint(seg[1])<<20)|(uint(seg[2])<<24)|(mask<<28);"
-            "fel_rescue[b+2u]=uint(tb);fel_rescue[b+3u]=uint(tr);fel_rescue[b+4u]=uint(Db);fel_rescue[b+5u]=uint(te0);"
-            "fel_rescue[b+6u]=uint(te1);fel_rescue[b+7u]=uint(te2);fel_rescue[b+8u]=uint(Dl);fel_rescue[b+9u]=uint(Dc);}}"
-            "color=vec4(out3,1.0);",
-            p->force_rescue, FEL_RESCUE_CAPACITY, FEL_RESCUE_WORDS);
+            "}");
+    if (exact) used = rescue_epilogue(p, body, sizeof(body), used);
     if (used <= 0 || used >= (int)sizeof(body)) return 0;
     pl_shader sh = pl_dispatch_begin(p->dispatch);
     int ok = pl_shader_custom(sh, &(struct pl_custom_shader){.header = header, .body = body,
@@ -1049,6 +1093,98 @@ static int render_precise(struct fel_gpu *p, const AVDOVIMetadata *metadata)
     ok = ok && pl_dispatch_finish(p->dispatch, pl_dispatch_params(.timer = p->timers[3], .shader = &sh, .target = p->target));
     pl_dispatch_abort(p->dispatch, &sh);
     return ok && (!exact || resolve_rescues(p, metadata, header));
+}
+
+/* Virgule fixe (lot A2') : tables GLSL (une fois par contexte) et seuils PQ en Q0.96 (T·2^96 exact,
+ * T ≥ 2^-43), texture RGBA32UI 256 × 256, dernier texel au-delà de 1. */
+static int prepare_fixed(struct fel_gpu *p)
+{
+    if (p->fixed_ready && p->thr96) return 1;
+    if (!fel_fixed_tables(p->fixed_tables, FEL_FIXED_TABLE_WORDS)) return 0;
+    p->fixed_ready = 1;
+    pl_fmt fmt = pl_find_fmt(p->vk->gpu, PL_FMT_UINT, 4, 32, 32, PL_FMT_CAP_SAMPLEABLE);
+    uint32_t *data = malloc(65536 * 4 * sizeof(uint32_t));
+    if (!fmt || !data) { free(data); return 0; }
+    for (int k = 0; k < 65536; ++k) {
+        unsigned __int128 v = (unsigned __int128)2 << 96;                         /* au-delà de tout R ≤ 1 */
+        if (k < 65535) {
+            double t;
+            memcpy(&t, fel_pq_threshold_bytes + 8 * (size_t)k, sizeof(t));
+            int e;
+            const double m = frexp(t, &e);                                       /* t = m·2^e, m ∈ [0,5 ; 1) */
+            const uint64_t mant = (uint64_t)ldexp(m, 53);
+            v = (unsigned __int128)mant << (e + 43);                             /* t·2^96 = mant·2^(e+43) */
+        }
+        for (int w = 0; w < 4; ++w) data[4 * k + w] = (uint32_t)(v >> (32 * w));
+    }
+    const int ok = pl_tex_recreate(p->vk->gpu, &p->thr96, pl_tex_params(.w = 256, .h = 256, .format = fmt,
+                       .sampleable = true, .host_writable = true)) &&
+                   pl_tex_upload(p->vk->gpu, pl_tex_transfer_params(.tex = p->thr96, .ptr = data));
+    free(data);
+    return ok;
+}
+
+/* Mode exact en virgule fixe multi-mots (src/shaders/fixed_*.glsl, modèle src/fixed_point.cpp) ; mêmes
+ * liste de reprises, correctifs et diagnostic (format virgule fixe) que le mode exact en double. */
+static int render_fixed(struct fel_gpu *p, const AVDOVIMetadata *metadata)
+{
+    if (!upload_coefficients(p, metadata) || !prepare_exact(p) || !prepare_fixed(p)) return 0;
+    static const uint32_t zero = 0;
+    pl_buf_write(p->vk->gpu, p->rescue, 0, &zero, sizeof(zero));
+    const size_t prefix_size = strlen(fel_glsl_fixed_point) + 1024;
+    char *prefix = malloc(prefix_size), *header = malloc(prefix_size + FEL_HEADER_SIZE + strlen(fel_glsl_fixed_render)),
+         *patch_header = malloc(FEL_HEADER_SIZE);
+    int ok = prefix && header && patch_header;
+    if (ok) snprintf(prefix, prefix_size, "const int FX_CURVE0=%d;const int FX_CURVE=%d;const int FX_GLOBAL=%d;"
+                     "const int FXT_LNC=%d;const int FXT_INVC=%d;const int FXT_POW2=%d;const int FXT_EXPM1=%d;"
+                     "const int FXT_LNK=%d;const int FXT_EXPK=%d;const int FXT_EM1K=%d;const int FXT_CONST=%d;\n%s",
+                     FEL_FIXED_CURVE0, FEL_FIXED_CURVE, FEL_FIXED_GLOBAL, FXT_LNC, FXT_INVC, FXT_POW2, FXT_EXPM1,
+                     FXT_LNK, FXT_EXPK, FXT_EM1K, FXT_CONST, fel_glsl_fixed_point);
+    ok = ok && precise_header(header, prefix_size + FEL_HEADER_SIZE + strlen(fel_glsl_fixed_render), metadata,
+                              prefix, fel_glsl_fixed_render) &&
+         precise_header(patch_header, FEL_HEADER_SIZE, metadata, fel_double_header, "");
+    struct pl_buffer_var rescue_vars[2];
+    const int diag_rows = p->diag_stride > 0 ? (p->height + p->diag_stride - 1) / p->diag_stride : 0;
+    struct pl_buffer_var diag_var = uint_array("fel_diag", diag_rows ? FEL_DIAG_WORDS_FIXED * diag_rows * p->width : 1, 0);
+    struct pl_shader_desc d[16];
+    precise_descriptors(p, d, rescue_vars, PL_DESC_ACCESS_READWRITE);
+    d[12] = (struct pl_shader_desc){.desc = {.name = "fel_thr96", .type = PL_DESC_SAMPLED_TEX}, .binding = {.object = p->thr96}};
+    d[13] = d[14];                                                                /* liste de reprises */
+    d[14] = (struct pl_shader_desc){.desc = {.name = "fel_diag_buf", .type = PL_DESC_BUF_STORAGE,
+        .access = PL_DESC_ACCESS_WRITEONLY}, .binding = {.object = p->diag}, .buffer_vars = &diag_var, .num_buffer_vars = 1};
+    const struct pl_shader_var parameters[2] = {
+        {.var = {.name = "fel_fp", .type = PL_VAR_UINT, .dim_v = 4, .dim_m = 1, .dim_a = FEL_FIXED_WORDS / 4},
+         .data = p->fixed_words, .dynamic = true},
+        {.var = {.name = "fx_t", .type = PL_VAR_UINT, .dim_v = 4, .dim_m = 1, .dim_a = FEL_FIXED_TABLE_WORDS / 4},
+         .data = p->fixed_tables},
+    };
+    char body[8192];
+    int used = snprintf(body, sizeof(body),
+        "ivec2 xy0=ivec2(gl_FragCoord.xy);bool inside=xy0.x<%d&&xy0.y<%d;ivec2 xy=min(xy0,ivec2(%d,%d));"
+        "int code,tb,tr,Db,te0,te1,te2,Dl,Dc;fel_inputs(xy,code,tb,tr,Db,te0,te1,te2,Dl,Dc);"
+        "int seg[3];vec3 out3;uvec4 Rd[3];float Ed[3];uint qd[3];"
+        "uint mask=fx_render(code,tb,tr,Db,te0,te1,te2,Dl,Dc,seg,out3,Rd,Ed,qd);",
+        p->width, p->height, p->width - 1, p->height - 1);
+    if (diag_rows && used > 0 && used < (int)sizeof(body))
+        used += snprintf(body + used, sizeof(body) - used,
+            "if(inside&&xy.y%%%d==0){uint b=%du*(uint(xy.y/%d)*%du+uint(xy.x));for(int c=0;c<3;++c){uint o=b+6u*uint(c);"
+            "fel_diag[o]=Rd[c].x;fel_diag[o+1u]=Rd[c].y;fel_diag[o+2u]=Rd[c].z;fel_diag[o+3u]=Rd[c].w;"
+            "fel_diag[o+4u]=floatBitsToUint(Ed[c]);fel_diag[o+5u]=qd[c];}}",
+            p->diag_stride, FEL_DIAG_WORDS_FIXED, p->diag_stride, p->width);
+    used = rescue_epilogue(p, body, sizeof(body), used);
+    ok = ok && used > 0 && used < (int)sizeof(body);
+    if (ok) {
+        pl_shader sh = pl_dispatch_begin(p->dispatch);
+        ok = pl_shader_custom(sh, &(struct pl_custom_shader){.header = header, .body = body,
+            .input = PL_SHADER_SIG_NONE, .output = PL_SHADER_SIG_COLOR, .descriptors = d,
+            .num_descriptors = diag_rows ? 15 : 14, .variables = parameters, .num_variables = 2,
+            .output_w = p->width, .output_h = p->height, .compute = true, .compute_group_size = {16, 16}});
+        ok = ok && pl_dispatch_finish(p->dispatch, pl_dispatch_params(.timer = p->timers[3], .shader = &sh, .target = p->target));
+        pl_dispatch_abort(p->dispatch, &sh);
+        ok = ok && resolve_rescues(p, metadata, patch_header);
+    }
+    free(prefix); free(header); free(patch_header);
+    return ok;
 }
 
 /* Couche 4:2:0 10 bits aléatoire (générateur congruentiel), position chroma en haut à gauche. */
@@ -1111,45 +1247,76 @@ static void test_metadata(AVDOVIMetadata *metadata, int mmr)
  * de la valeur double-double, et chaque code certain égaler le code certifié du CPU. Échec :
  * mode exact refusé (rendu CPU). Le bilan est écrit sur stderr si MVO_FEL_GPU_SELF_TEST est défini. */
 static int render_target(struct fel_gpu *p, const AVDOVIMetadata *metadata, const AVFrame *bl, const AVFrame *el);
-static int fel_gpu_self_test(struct fel_gpu *p)
+/* Auto-test d'une variante du mode exact (0 double, 1 virgule fixe), à la taille de l'image, sur
+ * deux RPU : sur deux lignes, |R̂ - R| ≤ moitié de la borne face au double-double et codes certains
+ * identiques au CPU certifié. ms : temps GPU de composition des deux images. */
+static int self_test_variant(struct fel_gpu *p, int fixed, AVDOVIMetadata *metadata, double *worst, int *mismatches,
+                             double *ms)
 {
-    size_t size = 0;
-    AVDOVIMetadata *metadata = av_dovi_metadata_alloc(&size);
     uint32_t state = 12345;
-    int ok = metadata != NULL;
-    double worst = 0;
-    int mismatches = 0;
-    const long long rescued = p->rescued, undecided = p->undecided;
+    p->fixed_mode = fixed;
     p->diag_stride = p->height > 1 ? p->height / 2 : 1;
     const int rows = (p->height + p->diag_stride - 1) / p->diag_stride;
-    const size_t words = (size_t)FEL_DIAG_WORDS * rows * p->width;
+    const size_t words = (size_t)(fixed ? FEL_DIAG_WORDS_FIXED : FEL_DIAG_WORDS) * rows * p->width;
     uint32_t *diag = malloc(4 * words);
-    p->diag = ok && diag ? pl_buf_create(p->vk->gpu, pl_buf_params(.size = 4 * words, .storable = true,
-                                                                   .host_readable = true)) : NULL;
-    ok = ok && p->diag;
+    p->diag = diag ? pl_buf_create(p->vk->gpu, pl_buf_params(.size = 4 * words, .storable = true,
+                                                             .host_readable = true)) : NULL;
+    int ok = p->diag != NULL;
+    *worst = 0; *mismatches = 0; *ms = 0;
     for (int mmr = 0; ok && mmr < 2; ++mmr) {
         test_metadata(metadata, mmr);
         AVFrame *bl = test_layer(p->width, p->height, &state, mmr ? 0 : 200, mmr ? 1023 : 760);
         AVFrame *el = test_layer((p->width + 1) / 2, (p->height + 1) / 2, &state, mmr ? 0 : 200, mmr ? 1023 : 760);
         double ratio = 0;
-        ok = bl && el && render_target(p, metadata, bl, el) &&
-             pl_buf_read(p->vk->gpu, p->diag, 0, diag, 4 * words);
-        const int count = ok ? fel_certified_check(metadata, bl, el, p->diag_stride, diag, &ratio) : -1;
+        pl_gpu_finish(p->vk->gpu);
+        collect_timers(p);
+        const double before = p->gpu_ns[3];
+        ok = bl && el && (!fixed || fel_fixed_params(metadata, p->fixed_words, FEL_FIXED_WORDS)) &&
+             render_target(p, metadata, bl, el) && pl_buf_read(p->vk->gpu, p->diag, 0, diag, 4 * words);
+        pl_gpu_finish(p->vk->gpu);
+        collect_timers(p);
+        *ms += (p->gpu_ns[3] - before) / 1e6;
+        const int count = ok ? fel_certified_check(metadata, bl, el, p->diag_stride, fixed, diag, &ratio) : -1;
         ok = ok && count >= 0;
-        mismatches += count > 0 ? count : 0;
-        if (ratio > worst || ratio != ratio) worst = ratio;
+        *mismatches += count > 0 ? count : 0;
+        if (ratio > *worst || ratio != ratio) *worst = ratio;
         av_frame_free(&bl); av_frame_free(&el);
     }
-    ok = ok && mismatches == 0 && worst <= 0.5;
-    if (getenv("MVO_FEL_GPU_SELF_TEST"))
-        fprintf(stderr, "mvo-fel : auto-test exact %s (écart / borne %.4g, codes différents %d)\n",
-                ok ? "réussi" : "refusé", worst, mismatches);
     pl_buf_destroy(p->vk->gpu, &p->diag);
     p->diag_stride = 0;
-    p->rescued = rescued; p->undecided = undecided;
     free(diag);
+    return ok && *mismatches == 0 && *worst <= 0.5;
+}
+
+/* Auto-test du mode exact : variantes double et virgule fixe (lot A2'), la plus rapide des variantes
+ * valides est retenue (MVO_FEL_GPU_FIXED=0 ou 1 : variante imposée). Échec des deux : mode exact
+ * refusé (rendu CPU). Bilan sur stderr si MVO_FEL_GPU_SELF_TEST est défini. */
+static int fel_gpu_self_test(struct fel_gpu *p)
+{
+    size_t size = 0;
+    AVDOVIMetadata *metadata = av_dovi_metadata_alloc(&size);
+    if (!metadata) return 0;
+    const long long rescued = p->rescued, undecided = p->undecided;
+    double gpu_ns[5];
+    memcpy(gpu_ns, p->gpu_ns, sizeof(gpu_ns));
+    const char *forced = getenv("MVO_FEL_GPU_FIXED");
+    double worst[2] = {0, 0}, ms[2] = {0, 0};
+    int mismatches[2] = {0, 0}, ok[2] = {0, 0}, tested[2] = {0, 0};
+    if ((tested[0] = !forced || strcmp(forced, "1")))
+        ok[0] = self_test_variant(p, 0, metadata, &worst[0], &mismatches[0], &ms[0]);
+    if ((tested[1] = !forced || strcmp(forced, "0")))
+        ok[1] = self_test_variant(p, 1, metadata, &worst[1], &mismatches[1], &ms[1]);
+    p->fixed_mode = ok[1] && (!ok[0] || ms[1] < ms[0]) ? 1 : 0;
+    if (getenv("MVO_FEL_GPU_SELF_TEST"))
+        for (int v = 0; v < 2; ++v)
+            if (!tested[v]) fprintf(stderr, "mvo-fel : auto-test exact %s non testé (MVO_FEL_GPU_FIXED)\n", v ? "virgule fixe" : "double");
+            else fprintf(stderr, "mvo-fel : auto-test exact %s %s (écart / borne %.4g, codes différents %d, %.2f ms)%s\n",
+                         v ? "virgule fixe" : "double", ok[v] ? "réussi" : "refusé", worst[v], mismatches[v], ms[v],
+                         p->fixed_mode == v && ok[v] ? " : retenu" : "");
+    p->rescued = rescued; p->undecided = undecided;
+    memcpy(p->gpu_ns, gpu_ns, sizeof(gpu_ns));
     av_free(metadata);
-    return ok;
+    return ok[0] || ok[1];
 }
 
 int fel_gpu_set_precision(void *context, int precision)
@@ -1180,7 +1347,8 @@ int fel_gpu_float64(const void *context)
 static int render_fast(struct fel_gpu *p, const AVDOVIMetadata *metadata)
 {
     char header[FEL_HEADER_SIZE];
-    if (!upload_coefficients(p, metadata) || !precise_header(header, sizeof(header), metadata, 0)) return 0;
+    if (!upload_coefficients(p, metadata) ||
+        !precise_header(header, sizeof(header), metadata, "float fel_f(int i){return fel_cf[i>>2][i&3];}\n", "")) return 0;
     struct pl_shader_desc d[16];
     struct pl_buffer_var unused[2];
     precise_descriptors(p, d, unused, PL_DESC_ACCESS_READONLY);   /* sources et axes : 12 premiers */
@@ -1242,6 +1410,9 @@ static int render_target(struct fel_gpu *p, const AVDOVIMetadata *metadata,
     if (p->precision != FEL_PRECISION_FAST && !fused) return 0;
     if (fused ? !load_layer(p, bl, 0) || !load_layer(p, el, 1)
               : !scale_layer(p, bl, 0, metadata) || !scale_layer(p, el, 1, metadata)) return 0;
+    /* Exact : virgule fixe si choisie (auto-test) et si le RPU entre dans son cadre, sinon double. */
+    if (p->precision == FEL_PRECISION_EXACT && p->fixed_mode == 1 &&
+        fel_fixed_params(metadata, p->fixed_words, FEL_FIXED_WORDS)) return render_fixed(p, metadata);
     if (p->precision != FEL_PRECISION_FAST) return render_precise(p, metadata);
     /* Rapide : shader float32 Muxiveo si le RPU entre dans son cadre (10 bits, sans partition, NLQ
      * linéaire) ; sinon, ou avec MVO_FEL_GPU_LIBPLACEBO (comparaisons), décodage libplacebo. */

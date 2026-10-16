@@ -1,9 +1,13 @@
 // SPDX-License-Identifier: LGPL-2.1-or-later
 // Rendu certifié en virgule fixe multi-mots (voir fixed_point.hpp) : référence du shader GPU.
 #include "fixed_point.hpp"
+#include "fixed_abi.h"
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
+#include <cstdio>
+#include <cstring>
+#include <string>
 
 namespace muxiveo::fel::fixed {
 namespace {
@@ -173,9 +177,10 @@ bool prepare(const Mapping &mapping, const AVDOVIMetadata &metadata, Params &p) 
     return p.ok = true;
 }
 
-bool eotf(u128 x, int fraction, uint64_t &mant, int &n, double &dl) {
+bool eotf(u128 x, int fraction, uint64_t &mant, int &n, double &dl, double *kappa) {
     const Tables &t = tables();
     mant = 0; n = 0; dl = 0;
+    if (kappa) *kappa = 0;
     if (!x) return true;
     const int64_t dls = ln_fixed(x, fraction) - t.lnx0_s58;
     dl = std::ldexp((double)dls, -58);
@@ -207,6 +212,11 @@ bool eotf(u128 x, int fraction, uint64_t &mant, int &n, double &dl) {
     }
     res = ((i128)(u128)num << 61) - (i128)((u128)g*den);
     if (res < 0 || res >= (i128)den) return false;
+    // κ = p/(m1·m2)·(1/num + c3/den), p = c1 + num : sans annulation.
+    if (kappa) {
+        const double nf = std::ldexp((double)num, -64), df = std::ldexp((double)den, -62);
+        *kappa = (0.8359375 + nf)/(6585030.0/524288)*(1/nf + 18.6875/df);
+    }
     if (!g) return true;
     const int64_t lg = ln_fixed(g, 63);
     const int64_t y = (int64_t)(((i128)lg*(i128)t.c8192_1305_q61) >> 64);  // S8.55
@@ -273,11 +283,11 @@ unsigned pixel(const Params &p, const certified::ExactPixel &in, std::array<uint
             if (!(xv + ex <= certified::PQ_ZERO_LOW)) uncertain = 7;   // zéro de l'EOTF à cheval
             continue;
         }
-        if (!eotf((u128)x, fraction, mant[i], expo[i], dl)) { uncertain = 7; continue; }
+        double kappa = 0;
+        if (!eotf((u128)x, fraction, mant[i], expo[i], dl, &kappa)) { uncertain = 7; continue; }
         if (!mant[i]) { if (!(xv + ex <= certified::PQ_ZERO_LOW)) uncertain = 7; continue; }
         L[i] = std::ldexp((double)mant[i], expo[i] - 63);
-        // Conditionnement κ (valeurs approchées, marge 1,01) et erreur de l'EOTF en virgule fixe.
-        const double pp = std::pow(xv, 32.0/2523), kappa = pp/(6585030.0/524288)*(1/(pp - 0.8359375) + 18.6875/(18.8515625 - 18.6875*pp));
+        // Conditionnement κ (num et den exacts, marge 1,01) et erreur de l'EOTF en virgule fixe.
         if (!(xv - ex > certified::PQ_ZERO_HIGH && kappa*ex <= 1e-6*xv && ex <= 1e-6*xv && dl > 0)) { uncertain = 7; continue; }
         rel[i] = std::ldexp(1.0, -50)*(1 + 1/dl) + 1.01*kappa*ex/xv;
     }
@@ -314,4 +324,65 @@ unsigned pixel(const Params &p, const certified::ExactPixel &in, std::array<uint
     }
     return uncertain;
 }
+}
+
+// Interface C du backend GPU (voir fixed_abi.h).
+extern "C" int fel_fixed_tables(uint32_t *words, int capacity) {
+    using namespace muxiveo::fel::fixed;
+    if (capacity < FEL_FIXED_TABLE_WORDS) return 0;
+    const Tables &t = tables();
+    auto put = [&](int at, uint64_t v) { words[2*at] = (uint32_t)v; words[2*at + 1] = (uint32_t)(v >> 32); };
+    for (int j = 0; j < 64; ++j) {
+        put(FXT_LNC + j, (uint64_t)t.ln_c[j]); put(FXT_INVC + j, t.inv_c[j]); put(FXT_POW2 + j, t.pow2[j]);
+    }
+    for (int j = 0; j < 16; ++j) put(FXT_EXPM1 + j, t.expm1[j]);
+    for (int k = 0; k < 9; ++k) {
+        put(FXT_LNK + k, (uint64_t)t.ln_coef[k]); put(FXT_EXPK + k, (uint64_t)t.exp_coef[k]); put(FXT_EM1K + k, t.expm1_coef[k]);
+    }
+    const uint64_t scalars[7] = {t.ln2_q64, t.c32_2523_q64, t.c8192_1305_q61, t.c64_ln2_q56, (uint64_t)t.lnx0_s58,
+                                 t.ln2_64_q90[0], t.ln2_64_q90[1]};
+    for (int i = 0; i < 7; ++i) put(FXT_CONST + i, scalars[i]);
+    return FEL_FIXED_TABLE_WORDS;
+}
+
+extern "C" int fel_fixed_params(const AVDOVIMetadata *metadata, uint32_t *words, int capacity) {
+    using namespace muxiveo::fel::fixed;
+    if (capacity < FEL_FIXED_WORDS) return 0;
+    try {
+        const muxiveo::fel::Mapping mapping(*metadata);
+        Params p;
+        if (!prepare(mapping, *metadata, p)) return 0;
+        // Cadre du shader : |n| < 2^20 et d ≤ 28 (produits n·v sur 128 bits).
+        if (p.d > 28) return 0;
+        for (int i = 0; i < 9; ++i) if (std::abs(p.n[i]) >= (1 << 20)) return 0;
+        for (int c = 0; c < 3; ++c) if (p.slope[c] < 0 || p.slope[c] > 0xffffffffLL) return 0;   // pente sur 32 bits
+        std::memset(words, 0, sizeof(uint32_t)*FEL_FIXED_WORDS);
+        auto put64 = [&](int at, uint64_t v) { words[at] = (uint32_t)v; words[at + 1] = (uint32_t)(v >> 32); };
+        auto put128 = [&](int at, i128 v) { put64(at, (uint64_t)(u128)v); put64(at + 2, (uint64_t)((u128)v >> 64)); };
+        auto putf = [&](int at, double v) { const float f = (float)(v*(1 + 1e-6)); std::memcpy(&words[at], &f, 4); };
+        words[0] = (uint32_t)p.d; words[1] = (uint32_t)p.q; words[2] = p.residual;
+        for (int c = 0; c < 3; ++c) {
+            const auto &curve = p.curves[c];
+            const int b = FEL_FIXED_CURVE0 + c*FEL_FIXED_CURVE;
+            words[b] = curve.count;
+            for (int k = 0; k < 9; ++k) words[b + 1 + k] = (uint32_t)curve.codes[k];
+            for (int k = 0; k < 8; ++k) { words[b + 10 + k] = (uint32_t)curve.method[k]; words[b + 18 + k] = (uint32_t)curve.order[k]; }
+            for (int k = 0; k < 8; ++k) for (int i = 0; i < 24; ++i) words[b + 26 + 24*k + i] = (uint32_t)curve.coef[k][i];
+            put128(b + 218, curve.low); put128(b + 222, curve.high);
+            for (int k = 0; k < 8; ++k) putf(b + 226 + k, curve.error[k]);
+        }
+        const int g = FEL_FIXED_GLOBAL;
+        for (int c = 0; c < 3; ++c) {
+            put64(g + 2*c, (uint64_t)p.slope[c]); put64(g + 6 + 2*c, (uint64_t)p.threshold2[c]);
+            put128(g + 12 + 4*c, p.offset[c]);
+        }
+        for (int i = 0; i < 9; ++i) {
+            words[g + 24 + i] = (uint32_t)p.n[i];
+            put64(g + 33 + 2*i, (uint64_t)p.m[i]);
+            putf(g + 51 + i, p.m_error[i]);
+        }
+        return FEL_FIXED_WORDS;
+    } catch (const std::exception &) {
+        return 0;
+    }
 }

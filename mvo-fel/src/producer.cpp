@@ -57,6 +57,7 @@ int fel_gpu_render_yuv(void *, const AVDOVIMetadata *, const AVFrame *, const AV
 void fel_gpu_configure(void *, const fel_output *);
 void fel_gpu_timings(void *, double *);
 int fel_gpu_set_precision(void *, int);
+int fel_gpu_fixed_variant(const void *);
 void fel_gpu_certified(void *, long long *, long long *);
 #endif
 }
@@ -464,6 +465,9 @@ struct mvo_fel_context {
                 return;
             }
             backend = std::string("vulkan: ") + name + ", " + precision_label(precision);
+            // Mode exact : variante retenue par l'auto-test (lot A2').
+            if (precision == FEL_PRECISION_EXACT)
+                backend += fel_gpu_fixed_variant(gpu_prototype) ? ", virgule fixe" : ", double";
         }
     }
 #endif
@@ -629,7 +633,7 @@ struct mvo_fel_context {
     // Précision du rendu GPU (fel_precision) ; défaut rapide pour les appelants antérieurs.
     int precision = FEL_PRECISION_FAST;
     static const char *precision_label(int value) {
-        return value == FEL_PRECISION_EXACT ? "précision exacte (double)"
+        return value == FEL_PRECISION_EXACT ? "précision exacte (certifiée)"
              : value == FEL_PRECISION_STANDARD ? "précision standard (hybride borné)" : "précision rapide (float32)";
     }
     using Emit = std::function<bool(std::unique_ptr<Job>)>;
