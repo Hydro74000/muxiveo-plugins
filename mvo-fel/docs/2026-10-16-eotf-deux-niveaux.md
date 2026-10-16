@@ -1,4 +1,4 @@
-# EOTF à deux niveaux (lot L, premier levier)
+# EOTF à deux niveaux et sortie en entiers (lot L)
 
 16 octobre 2026. Lot L du [plan de précision certifiée](2026-10-16-plan-precision-certifiee.md), premier levier du [profil de la composition](2026-10-16-profil-lent.md).
 
@@ -75,4 +75,34 @@ FEL seul, sortie Y'CbCr 10 bits vers `/dev/null`, environ 480 images UHD, RTX 40
 
 **Raphael.** La virgule fixe y reste plus lente que le double (1,9 contre 2,3 i/s). L'auto-test garde donc le double.
 
-**Objectif de L.** Toy Story 5 dépasse les 116 i/s de NVEncC par défaut ; Ryan s'en approche. Le levier suivant est la sortie fusionnée (1,9 ms).
+## Sortie Y'CbCr exacte en entiers (second levier)
+
+Le profil attribuait 1,9 ms à la passe de sortie du mode exact, contre 0,2 ms pour le Standard et le Rapide. Elle calculait l'arithmétique entière exacte de `convert_rows` (CPU) en double, et le double est au 1/64 du débit sur GeForce.
+
+Elle calcule désormais en entiers 32 et 64 bits :
+
+- **Luma.** `S = 2627R + 6780G + 593B` (≤ 655 350 000) sur 32 bits, puis `A = 219·2^(d−8)·S` sur 64 bits.
+- **Chroma.** Les sommes pondérées, en 8es par axe (≤ 64·65 535), tiennent sur 32 bits ; `X` est signé sur 64 bits.
+- **Quantification.** `floor(A/D)` est estimé en flottant (écart ≤ 1), puis corrigé par le reste exact. Le tramage compare `r·8192` à `D·(8192 − t)` sur 64 bits.
+
+Les formules et les octets sont inchangés. Aucun changement de passe, d'ABI ou de format.
+
+| Contrôle | Résultat |
+|---|---|
+| GPU face au CPU, mode exact, avant et après le changement : 3 formats (8, 10, 16 bits) × 3 tramages × 6 positions chroma × 2 recadrages, images 0, 8 et 16 de Ryan | **108 configurations sur 108 identiques** au CPU, octet pour octet |
+| Tests natifs, dont `fel_gpu_precision_fixed` | réussis |
+
+Passe de sortie : 1,9 → 0,2 ms sur RTX (0,5 ms avec 2 images en vol), 34 → 8 ms sur Raphael.
+
+## Bilan du lot L
+
+FEL seul, sortie Y'CbCr 10 bits, environ 480 images UHD, 2 images en vol, RTX 4070 Ti SUPER :
+
+| Extrait | Avant L | EOTF à deux niveaux | + sortie en entiers |
+|---|---:|---:|---:|
+| Ryan (MMR) | 81 i/s | 106 i/s | **117 i/s** |
+| Toy Story 5 (polynômes) | 95 i/s | 127 i/s | **143 i/s** |
+
+**Objectif de L atteint.** Le Lent RTX dépasse les 116 i/s de NVEncC par défaut sur les deux contenus, soit +44 à +51 %. T (≤ 1,3 ms, MMR seulement) reste en réserve.
+
+Raphael passe de 2,3 à 2,5 i/s. Il garde la variante double, plus rapide qu'en virgule fixe sur ce GPU.

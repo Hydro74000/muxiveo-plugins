@@ -1596,12 +1596,25 @@ static int prepare_dither(struct fel_gpu *p, int mode)
     return 1;
 }
 
-/* floor(A/D + t/8192) en double, entiers exacts (|A|, D·8192 < 2^53) : quotient corrigé puis
- * comparaison du reste au seuil de tramage, sans int64 ni arrondi de division. */
+/* floor(A/D + t/8192) en entiers exacts (lot L) : A signé sur 64 bits (deux mots, complément à deux),
+ * 0 < D < 2^32, 0 ≤ t < 8192. Quotient estimé en flottant (écart ≤ 1), corrigé par le reste exact,
+ * puis reste comparé au seuil de tramage sur 64 bits. Mêmes valeurs que convert_rows (CPU), sans
+ * double : le double est au 1/64 du débit sur GeForce. */
 static const char fel_quantize_header[] =
-    "double fel_quant(double A,double D,double t){double q=floor(A/D),r=A-q*D;"
-    "for(int i=0;i<2;++i){if(r<0.0LF){q-=1.0LF;r+=D;}if(r>=D){q+=1.0LF;r-=D;}}"
-    "return q+(r*8192.0LF>=D*(8192.0LF-t)?1.0LF:0.0LF);}\n";
+    "uvec2 q64_add(uvec2 a,uvec2 b){uint c;uint l=uaddCarry(a.x,b.x,c);return uvec2(l,a.y+b.y+c);}"
+    "uvec2 q64_neg(uvec2 a){return q64_add(~a,uvec2(1u,0u));}"
+    "uvec2 q64_smul(int a,int b){int h,l;imulExtended(a,b,h,l);return uvec2(uint(l),uint(h));}"
+    "uvec2 q64_umul(uint a,uint b){uint h,l;umulExtended(a,b,h,l);return uvec2(l,h);}"
+    /* a signé (|a| < 2^40), k > 0 petit : a·k sans dépassement. */
+    "uvec2 q64_mulk(uvec2 a,uint k){bool n=int(a.y)<0;uvec2 m=n?q64_neg(a):a;uvec2 r=q64_umul(m.x,k);"
+    "r.y+=m.y*k;return n?q64_neg(r):r;}"
+    "bool q64_uge(uvec2 a,uvec2 b){return a.y>b.y||(a.y==b.y&&a.x>=b.x);}"
+    "int fel_quant(uvec2 A,uint D,uint t){"
+    "int q=int(floor((float(int(A.y))*4294967296.0+float(A.x))/float(D)));"
+    "uvec2 qd=q64_umul(uint(abs(q)),D);uvec2 r=q64_add(A,q<0?qd:q64_neg(qd));"
+    "for(int i=0;i<2;++i){if(int(r.y)<0){q-=1;r=q64_add(r,uvec2(D,0u));}"
+    "if(int(r.y)>=0&&(r.y!=0u||r.x>=D)){q+=1;r=q64_add(r,q64_neg(uvec2(D,0u)));}}"
+    "return q+(q64_uge(q64_umul(r.x,8192u),q64_umul(D,8192u-t))?1:0);}\n";
 
 static int dispatch(struct fel_gpu *p, pl_tex target, const char *header, const char *body, int w, int h)
 {
@@ -1648,16 +1661,17 @@ static int convert(struct fel_gpu *p, const struct fel_output *o, pl_tex y, pl_t
         "float k = clamp(floor((219.0*l + 16.0)*%d.0 + texelFetch(fel_threshold, xy & 63, 0).r), 0.0, %d.0);"
         "color = vec4(k*U + B, 0.0, 0.0, 1.0);",
         numerator, denominator, denominator, o->crop_x, o->crop_y, scale, maximum);
-    /* Mode exact : luma floor(219·S·2^(d-8)/(10000·65535) + t) + 16·2^(d-8), S = 2627R + 6780G + 593B. */
+    /* Mode exact : luma floor(219·S·2^(d-8)/(10000·65535) + t) + 16·2^(d-8), S = 2627R + 6780G + 593B
+     * (≤ 655 350 000, 32 bits) ; A = 219·2^(d-8)·S sur 64 bits. */
     const int exact = p->precision == FEL_PRECISION_EXACT;
     if (exact)
         snprintf(body, sizeof(body),
             "const float U = %d.0/%d.0, B = 0.25/%d.0;"
             "ivec2 xy=ivec2(gl_FragCoord.xy);"
-            "dvec3 c=dvec3(round(texelFetch(fel_rgb, xy + ivec2(%d, %d), 0).rgb*65535.0));"
-            "double A=219.0LF*(2627.0LF*c.r+6780.0LF*c.g+593.0LF*c.b)*%d.0LF;"
-            "double t=double(round(texelFetch(fel_threshold, xy & 63, 0).r*8192.0));"
-            "double k=min(16.0LF*%d.0LF+fel_quant(A,655350000.0LF,t),%d.0LF);"
+            "uvec3 c=uvec3(round(texelFetch(fel_rgb, xy + ivec2(%d, %d), 0).rgb*65535.0));"
+            "uvec2 A=q64_umul(219u*%du,2627u*c.r+6780u*c.g+593u*c.b);"
+            "uint t=uint(round(texelFetch(fel_threshold, xy & 63, 0).r*8192.0));"
+            "int k=min(16*%d+fel_quant(A,655350000u,t),%d);"
             "color = vec4(float(k)*U + B, 0.0, 0.0, 1.0);",
             numerator, denominator, denominator, o->crop_x, o->crop_y, scale, scale, maximum);
     if (!dispatch(p, y, exact ? fel_quantize_header : NULL, body, o->width, o->height)) return 0;
@@ -1681,25 +1695,25 @@ static int convert(struct fel_gpu *p, const struct fel_output *o, pl_tex y, pl_t
             numerator, denominator, denominator, wx[0], wx[1], wx[2], wx[3], wy[0], wy[1], wy[2], wy[3],
             o->crop_x, fx, o->crop_y, fy, p->width - 1, p->height - 1,
             scale, maximum, scale, maximum, store);
-        /* Chroma exacte : poids en 8es par axe (sommes sur 64), 224·cb = 7X/(4·k·65535),
-         * X = 9407B - 2627R - 6780G (k = 9407) ou 7373R - 6780G - 593B (k = 7373). */
+        /* Chroma exacte : poids en 8es par axe (sommes sur 64, ≤ 64·65535 : 32 bits), 224·cb = 7X/(4·k·65535),
+         * X = 9407B - 2627R - 6780G (k = 9407) ou 7373R - 6780G - 593B (k = 7373), X signé sur 64 bits. */
         if (exact)
             snprintf(body, sizeof(body),
                 "const float U = %d.0/%d.0, B = 0.25/%d.0;"
-                "const double WX[4] = double[4](%d.0LF, %d.0LF, %d.0LF, %d.0LF);"
-                "const double WY[4] = double[4](%d.0LF, %d.0LF, %d.0LF, %d.0LF);"
+                "const int WX[4] = int[4](%d, %d, %d, %d);"
+                "const int WY[4] = int[4](%d, %d, %d, %d);"
                 "ivec2 ij = ivec2(gl_FragCoord.xy);"
-                "dvec3 s = dvec3(0.0LF);"
+                "ivec3 s = ivec3(0);"
                 "for (int b = 0; b < 4; b++) for (int a = 0; a < 4; a++) {"
-                "  double w = WX[a]*WY[b]; if (w == 0.0LF) continue;"
+                "  int w = WX[a]*WY[b]; if (w == 0) continue;"
                 "  ivec2 q = clamp(ivec2(%d + 2*ij.x + %d + a, %d + 2*ij.y + %d + b), ivec2(0), ivec2(%d, %d));"
-                "  s += w*dvec3(round(texelFetch(fel_rgb, q, 0).rgb*65535.0)); }"
-                "double tb = double(round(texelFetch(fel_threshold, (ij + ivec2(21, 11)) & 63, 0).r*8192.0));"
-                "double tr = double(round(texelFetch(fel_threshold, (ij + ivec2(43, 37)) & 63, 0).r*8192.0));"
-                "float qb = float(min(128.0LF*%d.0LF + fel_quant(7.0LF*(9407.0LF*s.b-2627.0LF*s.r-6780.0LF*s.g)*%d.0LF,"
-                "  4.0LF*9407.0LF*65535.0LF, tb), %d.0LF));"
-                "float qr = float(min(128.0LF*%d.0LF + fel_quant(7.0LF*(7373.0LF*s.r-6780.0LF*s.g-593.0LF*s.b)*%d.0LF,"
-                "  4.0LF*7373.0LF*65535.0LF, tr), %d.0LF));"
+                "  s += w*ivec3(round(texelFetch(fel_rgb, q, 0).rgb*65535.0)); }"
+                "uint tb = uint(round(texelFetch(fel_threshold, (ij + ivec2(21, 11)) & 63, 0).r*8192.0));"
+                "uint tr = uint(round(texelFetch(fel_threshold, (ij + ivec2(43, 37)) & 63, 0).r*8192.0));"
+                "uvec2 xb = q64_add(q64_smul(9407, s.b), q64_neg(q64_add(q64_smul(2627, s.r), q64_smul(6780, s.g))));"
+                "uvec2 xr = q64_add(q64_smul(7373, s.r), q64_neg(q64_add(q64_smul(6780, s.g), q64_smul(593, s.b))));"
+                "float qb = float(min(128*%d + fel_quant(q64_mulk(xb, 7u*%du), 2465950980u, tb), %d));"
+                "float qr = float(min(128*%d + fel_quant(q64_mulk(xr, 7u*%du), 1932758220u, tr), %d));"
                 "%s",
                 numerator, denominator, denominator, wx[0]/2, wx[1]/2, wx[2]/2, wx[3]/2, wy[0]/2, wy[1]/2, wy[2]/2, wy[3]/2,
                 o->crop_x, fx, o->crop_y, fy, p->width - 1, p->height - 1,

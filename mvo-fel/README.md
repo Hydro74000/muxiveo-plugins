@@ -52,7 +52,7 @@ toujours la référence certifiée, quel que soit le mode.
 
 | Mode | Calcul GPU | Écart au CPU | RTX 4070 Ti SUPER | iGPU Raphael |
 |---|---|---|---:|---:|
-| `exact` (Lent, recommandé) | classement certifié entre seuils PQ, Y'CbCr en entiers exacts ; variante choisie par auto-test : virgule fixe ([A2'](docs/2026-10-16-a2-virgule-fixe.md) : EOTF rapide à borne démontrée, puis multi-mots pour les pixels indécis, puis CPU certifié) ou double ([A1](docs/2026-10-16-gpu-exact-certifie.md), reprises par le CPU certifié) | identique au bit près (référence certifiée) | 106–127 i/s (virgule fixe, [EOTF à deux niveaux](docs/2026-10-16-eotf-deux-niveaux.md)) | 2,3 i/s (double) |
+| `exact` (Lent, recommandé) | classement certifié entre seuils PQ, Y'CbCr en entiers exacts ; variante choisie par auto-test : virgule fixe ([A2'](docs/2026-10-16-a2-virgule-fixe.md) : EOTF rapide à borne démontrée, puis multi-mots pour les pixels indécis, puis CPU certifié) ou double ([A1](docs/2026-10-16-gpu-exact-certifie.md), reprises par le CPU certifié) | identique au bit près (référence certifiée) | 117–143 i/s (virgule fixe, [EOTF à deux niveaux](docs/2026-10-16-eotf-deux-niveaux.md)) | 2,5 i/s (double) |
 | `standard` | float32 reformulé, borne d'erreur par pixel, recalcul en double au-delà de 0,4 code | ≤ 1 code 16 bits | 171–207 i/s | 6,1 i/s |
 | `fast` (défaut de l'ABI) | shader float32 Muxiveo : sommes, segments et zéro NLQ exacts, EOTF et OETF sans annulation ([détails](docs/2026-10-16-rapide-ameliore.md)) | 1 code 16 bits sur scènes réelles ; jusqu'à 112 codes 16 bits sur le stress synthétique le plus défavorable | 270 i/s | 15 i/s |
 
