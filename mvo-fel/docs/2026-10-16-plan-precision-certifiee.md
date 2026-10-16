@@ -40,10 +40,10 @@ Conventions :
 | **M** | Mesures de bout en bout | Workflow Muxiveo complet (`benchmark_fel_workflow.py`), FEL Lent puis Standard : x265 (CPU), NVEncC HEVC 10 bits sur le même GPU (preset rapide et lent), hevc_nvenc en NUT et direct ; RTX et iGPU ; configurations P (1 ou 2 images en vol), puis T et P + T après T0 | Débit global et durée par encodeur ; P ne doit pas ralentir un encodeur GPU partagé (sinon une seule image en vol dans ce cas) |
 | **T0** | Banc Tensor Cores (RTX) | Mapping MMR et matrices en virgule fixe découpée en tranches INT8, produits partiels **exacts** accumulés en INT32 sur les unités matricielles (schéma d'Ozaki, `VK_KHR_cooperative_matrix`) ; pipeline de calcul hors libplacebo si l'extension GLSL ne peut pas y être activée ; référence à battre : la virgule fixe multi-mots d'A2' (mapping ≈ 2 ms sur 7,8 ms de composition UHD) | Gain sur la composition, puis débit global mesuré en M (T seul, P + T) ; T et P sont cumulables, pas exclusifs |
 | **T1** | Tensor Cores dans le rendu exact (si T0 go) | **Intégré à l'extension Tensor existante** (`mvo-rife-trt`, dépôt muxiveo-plugins), qui devient l'extension portant tous les sujets Tensor du projet Muxiveo : interface entre mvo-fel et l'extension (chargement dynamique facultatif), repli virgule fixe A2' sans l'extension ; mêmes classement, reprises et auto-test | 0 différence avec C1 ; débit face à A2' sur RTX et en M ; licence vérifiée (ci-dessous) |
-| **Q** | Politique adaptative | Nombre d'images en vol et emploi des Tensor Cores choisis par Muxiveo selon l'encodeur (CPU ou GPU partagé), le GPU (NVIDIA ou non) et les mesures de M : option d'ABI additive (au lieu de `MVO_FEL_GPU_WORKERS`) | Meilleure configuration mesurée pour chaque cas ; textes de Muxiveo |
+| **Q** | Réglage des images en vol | Option d'ABI additive `mvo_fel_set_render_workers` (1 à 4, 2 par défaut, capacité `render_workers`) ; Muxiveo passe à 1 avec l'interpolation RIFE sur le même GPU (lot V) | Sortie identique quel que soit le nombre (test de fumée) |
 | **V** | Validation et livraison | Attestation de schéma 5 (référence certifiée, compteurs de reprises) ; documentation ; textes de Muxiveo (débits et précisions) | Attestation réussie ; tests Muxiveo et natifs verts |
 
-Ordre d'exécution : C0 → C1 → A1 → B0 → R → A2' → B1 (arrêté) → P → M (P) → T0 → M (T, P + T) → T1 (si go) → Q → V. Chaque lot est commité séparément puis audité.
+Ordre d'exécution : C0 → C1 → A1 → B0 → R → A2' → B1 (arrêté) → P → M → Q → V. T0 et T1 sont classés au vu de M : gain maximal de 1,3 ms par image sur contenu MMR (14 % de la composition), moins de 1 % dans le pire workflow mesuré ; réouvrables si un workflow devient limité par le calcul FEL. Chaque lot est commité séparément puis audité.
 
 Décisions du 16/10 :
 
@@ -91,3 +91,5 @@ Ce que les Tensor Cores ne couvrent pas :
 | R | Fait : [Rapide amélioré](2026-10-16-rapide-ameliore.md) ; stress : 9 151 → 1 code 16 bits (matrices réelles), 1 026 → 112 (identité) ; réel : 1 code ; iGPU −12 % |
 | A2' | Fait : [Lent en virgule fixe](2026-10-16-a2-virgule-fixe.md) ; RTX : composition 18,7 → 7,8 ms, Lent 34,4 → 43,6–51,4 i/s, 0 reprise sur scènes réelles ; iGPU : double conservé (choix par auto-test) |
 | P | Fait (plugin seul) : [recouvrement](2026-10-16-recouvrement.md), 2 images en vol ; Lent RTX 50,5 → 57,3 i/s ; mesures de bout en bout (M) en cours |
+| M | Fait : [mesures de bout en bout](2026-10-16-mesures-bout-en-bout.md) ; P neutre avec x265, NVEncC (par défaut et HQ) et RIFE + NVEncC, marge en régime établi ; T classé |
+| Q | Fait : option d'ABI `mvo_fel_set_render_workers` (2 par défaut) |

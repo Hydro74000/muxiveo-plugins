@@ -60,6 +60,9 @@ MVO_FEL_EXPORT int mvo_fel_set_timestamps(mvo_fel_context *, const char *mode);
  * ou "exact" (double natif, classement certifié : identique au CPU). Les deux derniers exigent un GPU calculant en double
  * (devices : float64) ; sinon le rendu passe sur CPU (référence certifiée). */
 MVO_FEL_EXPORT int mvo_fel_set_precision(mvo_fel_context *, const char *mode);
+/* Extension additive ABI 1 (capacité render_workers : [min, max]) : images en vol du rendu GPU, une
+ * par fil et par contexte sur le même périphérique (2 par défaut). Avant run ; sans effet en CPU. */
+MVO_FEL_EXPORT int mvo_fel_set_render_workers(mvo_fel_context *, int count);
 MVO_FEL_EXPORT int mvo_fel_set_output(mvo_fel_context *, const char *pixel_format,
     const char *chroma_location, const char *dither);
 /* Mesures locales après run ; pipe_s est inclus dans nut_s. */

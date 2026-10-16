@@ -141,10 +141,29 @@ def precision_modes(lib, fixture: Path, device: str) -> None:
     exact, backend = render(device, "exact")
     standard, _ = render(device, "standard")
     fast, _ = render(device, None)
-    # CPU toujours en double ; GPU exact : double natif ou repli CPU s'il n'en dispose pas.
+    # CPU certifié ; GPU exact : identique (variante double ou virgule fixe) ou repli CPU.
     assert exact == cpu, backend
     assert len(standard) == len(fast) == len(cpu)
     assert backend.startswith("cpu") or "précision exacte" in backend, backend
+    # Images en vol (lot P) : valeurs refusées hors de [1, 4] ; sortie identique quel que soit le nombre.
+    if capabilities.get("render_workers"):
+        lib.mvo_fel_set_render_workers.argtypes = [c.c_void_p, c.c_int]
+        lib.mvo_fel_set_render_workers.restype = c.c_int
+        for workers in (1, 3):
+            handle = lib.mvo_fel_create(str(fixture.resolve()).encode(), 0, 2, 24000, 1001)
+            try:
+                assert lib.mvo_fel_set_render_workers(handle, 0) == -1
+                assert lib.mvo_fel_set_render_workers(handle, 5) == -1
+                assert lib.mvo_fel_set_render_workers(handle, workers) == 0
+                assert lib.mvo_fel_set_precision(handle, b"exact") == 0
+                assert lib.mvo_fel_set_device(handle, device.encode("ascii")) == 0
+                data = bytearray()
+                assert lib.mvo_fel_run(handle, WRITE(lambda _o, p, n: data.extend(c.string_at(p, n)) or 0),
+                                       PROGRESS(lambda *_: None), None) == 0
+                assert lib.mvo_fel_set_render_workers(handle, 2) == -1
+                assert bytes(data) == cpu, workers
+            finally:
+                lib.mvo_fel_destroy(handle)
 
 
 def yuv_output(lib, fixture: Path) -> None:

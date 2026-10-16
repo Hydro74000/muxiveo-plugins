@@ -290,6 +290,7 @@ struct mvo_fel_context {
     bool gpu_attempted = false;
     // Contextes de rendu supplémentaires (lot P) : plusieurs images en vol, une par fil de rendu.
     std::vector<void *> gpu_extra;
+    int render_workers = 2;      // images en vol (mvo_fel_set_render_workers, 1 à 4)
 #endif
     // Fil de rendu : contexte GPU (ou nul : CPU), cadre des plans du paquet, mesures propres.
     struct Worker {
@@ -479,11 +480,9 @@ struct mvo_fel_context {
             // Mode exact : variante retenue par l'auto-test (lot A2').
             if (precision == FEL_PRECISION_EXACT)
                 backend += fel_gpu_fixed_variant(gpu_prototype) ? ", virgule fixe" : ", double";
-            // Lot P : contextes supplémentaires sur le même périphérique (MVO_FEL_GPU_WORKERS, 2 par
-            // défaut), précision et auto-test hérités ; un échec réduit simplement le parallélisme.
-            const char *count = getenv("MVO_FEL_GPU_WORKERS");
-            const int workers = std::clamp(count ? std::atoi(count) : 2, 1, 4);
-            for (int i = 1; i < workers; ++i) {
+            // Lot P : contextes supplémentaires sur le même périphérique (render_workers, 2 par défaut),
+            // précision et auto-test hérités ; un échec réduit simplement le parallélisme.
+            for (int i = 1; i < render_workers; ++i) {
                 void *extra = hw_device ? fel_gpu_import(hw_device->data, w, h)
                                         : fel_gpu_create(w, h, uuid.size() == 32 ? uuid.c_str() : device.c_str());
                 if (!extra || !fel_gpu_inherit(extra, gpu_prototype)) { fel_gpu_destroy(extra); break; }
@@ -958,7 +957,7 @@ struct mvo_fel_context {
 uint32_t mvo_fel_abi_version() { return MVO_FEL_ABI; }
 const char *mvo_fel_capabilities() {
 #ifdef MVO_FEL_VULKAN_PROTOTYPE
-    return "{\"abi\":1,\"version\":\"" MVO_FEL_VERSION "\",\"transport\":\"nut\",\"pixel_format\":\"gbrp16le\",\"cpu\":true,\"backend\":\"vulkan-prototype\",\"statistics\":1,\"device_selection\":1,\"seek\":1,\"fd_output\":1,\"timestamps\":[\"source\",\"zero\"],\"crop\":1,\"output_formats\":[\"gbrp16le\",\"yuv420p16le\",\"yuv420p10le\",\"yuv420p\"],\"dithers\":[\"none\",\"ordered\",\"blue\"],\"direct_formats\":[\"p010\"],\"precision\":[\"exact\",\"standard\",\"fast\"],\"device_features\":[\"float64\"],\"experimental\":true}";
+    return "{\"abi\":1,\"version\":\"" MVO_FEL_VERSION "\",\"transport\":\"nut\",\"pixel_format\":\"gbrp16le\",\"cpu\":true,\"backend\":\"vulkan-prototype\",\"statistics\":1,\"device_selection\":1,\"seek\":1,\"fd_output\":1,\"timestamps\":[\"source\",\"zero\"],\"crop\":1,\"output_formats\":[\"gbrp16le\",\"yuv420p16le\",\"yuv420p10le\",\"yuv420p\"],\"dithers\":[\"none\",\"ordered\",\"blue\"],\"direct_formats\":[\"p010\"],\"precision\":[\"exact\",\"standard\",\"fast\"],\"device_features\":[\"float64\"],\"render_workers\":[1,4],\"experimental\":true}";
 #else
     return "{\"abi\":1,\"version\":\"" MVO_FEL_VERSION "\",\"transport\":\"nut\",\"pixel_format\":\"gbrp16le\",\"cpu\":true,\"statistics\":1,\"device_selection\":1,\"seek\":1,\"fd_output\":1,\"timestamps\":[\"source\",\"zero\"],\"crop\":1,\"output_formats\":[\"gbrp16le\",\"yuv420p16le\",\"yuv420p10le\",\"yuv420p\"],\"dithers\":[\"none\",\"ordered\",\"blue\"],\"precision\":[\"exact\",\"standard\",\"fast\"],\"device_features\":[\"float64\"]}";
 #endif
@@ -1055,6 +1054,13 @@ int mvo_fel_set_precision(mvo_fel_context *p, const char *mode) {
     if (value != "exact" && value != "standard" && value != "fast") return -1;
     p->precision = value == "exact" ? FEL_PRECISION_EXACT : value == "standard" ? FEL_PRECISION_STANDARD
                                                                                   : FEL_PRECISION_FAST;
+    return 0;
+}
+int mvo_fel_set_render_workers(mvo_fel_context *p, int count) {
+    if (!p || p->started || count < 1 || count > 4) return -1;
+#ifdef MVO_FEL_VULKAN_PROTOTYPE
+    p->render_workers = count;
+#endif
     return 0;
 }
 int mvo_fel_set_timestamps(mvo_fel_context *p, const char *mode) {

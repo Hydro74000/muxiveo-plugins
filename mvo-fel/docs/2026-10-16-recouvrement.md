@@ -16,7 +16,7 @@ Plusieurs fils de rendu tournent en parallèle, chacun avec son propre contexte 
 - **Ordre des images.** Chaque fil prend les jobs dans l'ordre, sous verrou, avec un ticket. Le résultat n'est écrit que lorsque son ticket est le suivant : l'ordre des images est conservé.
 - **Erreur et annulation.** Elles réveillent les fils en attente d'ordre.
 - **Rendu CPU.** Il reste sur un seul fil, ses lignes étant déjà parallèles.
-- **Réglage.** `MVO_FEL_GPU_WORKERS` fixe le nombre de fils, de 1 à 4 ; la valeur par défaut est 2. Le libellé du moteur indique « 2 images en vol ».
+- **Réglage.** L'option d'ABI `mvo_fel_set_render_workers` (capacité `render_workers`, lot Q) fixe le nombre d'images en vol, de 1 à 4 ; la valeur par défaut est 2. Le libellé du moteur indique « 2 images en vol ».
 - **Statistiques.** Les temps GPU et les compteurs de reprises sont additionnés sur tous les contextes.
 
 ## Mesures
@@ -39,4 +39,4 @@ Chaque contexte supplémentaire alloue ses propres textures (couches, cible RGBA
 
 Attestation de schéma 4 avec deux images en vol (3 scènes, RTX et Raphael, transport direct) : réussie. Les empreintes des images sont identiques, ce qui confirme l'ordre et les codes. Les écarts au CPU certifié sont inchangés : `exact` 0 code, `standard` et `fast` 1 code 16 bits.
 
-Ces mesures portent sur le plugin seul. Le lot M mesure le workflow complet, avec x265 et des encodeurs GPU qui partagent la carte, pour régler la politique adaptative (lot Q).
+Ces mesures portent sur le plugin seul. Le workflow complet est mesuré au [lot M](2026-10-16-mesures-bout-en-bout.md) : P est neutre face à x265, NVEncC et RIFE sur le même GPU, et donne de la marge en régime établi.
