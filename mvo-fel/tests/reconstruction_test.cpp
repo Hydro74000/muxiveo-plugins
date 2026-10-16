@@ -80,7 +80,22 @@ void fast_matches_reference(AVDOVIMetadata &metadata) {
     }
 }
 
+// Table des seuils PQ : strictement croissante dans ]0, 1[, cohérente avec pq_eotf et pq_oetf.
+void pq_thresholds_consistent() {
+    double previous = 0;
+    for (int k = 0; k < PQ_THRESHOLDS; ++k) {
+        const double threshold = pq_threshold(k), signal = (k + 0.5)/65535;
+        if (!(threshold > previous && threshold < 1)) {
+            std::cerr << "seuil PQ " << k << " hors ordre : " << threshold << '\n';
+            std::exit(1);
+        }
+        previous = threshold;
+        near(threshold/pq_eotf(signal), 1, 1e-11);
+        near(pq_oetf(threshold), signal, 1e-12);
+    }
+}
 int main() {
+    pq_thresholds_consistent();
     auto *metadata = av_dovi_metadata_alloc(nullptr);
     auto &header = *av_dovi_get_header(metadata);
     auto &mapping = *av_dovi_get_mapping(metadata);

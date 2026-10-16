@@ -11,10 +11,17 @@ option(MVO_FEL_MATH_ONLY "Construire seulement les tests mathématiques" OFF)
 option(MVO_FEL_VULKAN_PROTOTYPE "Prototype Vulkan, paquet Linux sous attestation numérique" OFF)
 set(MVO_FEL_DOVI_LIBRARY "" CACHE FILEPATH "Archive libdovi statique de la révision épinglée")
 
-add_library(fel_math STATIC src/reconstruction.cpp)
+# Seuils d'arrondi PQ (scripts/generate_pq_thresholds.py → data/pq_thresholds.bin) en tableau C.
+set(MVO_FEL_PQ_SOURCE ${CMAKE_CURRENT_BINARY_DIR}/pq_thresholds.c)
+add_custom_command(OUTPUT ${MVO_FEL_PQ_SOURCE}
+  COMMAND ${CMAKE_COMMAND} -DINPUT=${CMAKE_CURRENT_SOURCE_DIR}/data/pq_thresholds.bin
+          -DOUTPUT=${MVO_FEL_PQ_SOURCE} -DSYMBOL=fel_pq_threshold_bytes
+          -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_bytes.cmake
+  DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/data/pq_thresholds.bin ${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_bytes.cmake)
+add_library(fel_math STATIC src/reconstruction.cpp ${MVO_FEL_PQ_SOURCE})
 target_include_directories(fel_math PUBLIC include)
 target_link_libraries(fel_math PUBLIC PkgConfig::AV)
-set_target_properties(fel_math PROPERTIES CXX_VISIBILITY_PRESET hidden)
+set_target_properties(fel_math PROPERTIES CXX_VISIBILITY_PRESET hidden C_VISIBILITY_PRESET hidden)
 if(NOT MVO_FEL_MATH_ONLY)
   if(NOT EXISTS "${MVO_FEL_DOVI_LIBRARY}")
     message(FATAL_ERROR "Construire les dépendances avec scripts/build.py (libdovi absente)")
@@ -76,6 +83,8 @@ if(BUILD_TESTING)
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_package.py)
     add_test(NAME fel_layers COMMAND ${Python3_EXECUTABLE}
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/layers.py $<TARGET_FILE:mvo_fel>)
+    add_test(NAME fel_pq_thresholds COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/scripts/generate_pq_thresholds.py --check)
   endif()
   if(MVO_FEL_REFERENCE_TESTS)
     pkg_check_modules(PLACEBO REQUIRED IMPORTED_TARGET libplacebo>=7.374.0)

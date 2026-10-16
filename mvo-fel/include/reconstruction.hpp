@@ -35,6 +35,10 @@ struct Mapping {
 };
 
 double spline16(double x);
+// Seuil d'arrondi PQ k+½ (k = 0..65534) dans le domaine linéaire, arrondi vers le bas en double :
+// pq_threshold(k) ≤ EOTF((k+½)/65535) < suivant(pq_threshold(k)). Table data/pq_thresholds.bin.
+constexpr int PQ_THRESHOLDS = 65535;
+double pq_threshold(int k);
 double pq_eotf(double x);
 double pq_oetf(double x);
 Vec reshape(const Mapping &mapping, const Vec &bl);

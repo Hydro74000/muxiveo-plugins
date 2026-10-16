@@ -16,6 +16,7 @@ extern "C" {
 #include <libavutil/pixdesc.h>
 }
 
+extern "C" const unsigned char fel_pq_threshold_bytes[];
 namespace muxiveo::fel {
 namespace {
 constexpr double m1 = 2610.0 / 16384.0, m2 = 2523.0 / 32.0;
@@ -123,6 +124,11 @@ double pq_eotf(double x) {
 double pq_oetf(double x) {
     const double p = std::pow(std::max(x, 0.0), m1);
     return std::pow((c1+c2*p)/(1+c3*p), m2);
+}
+double pq_threshold(int k) {
+    double value;
+    std::memcpy(&value, fel_pq_threshold_bytes + 8*static_cast<size_t>(k), sizeof(value));  // petit-boutiste
+    return value;
 }
 Vec reshape(const Mapping &mapping, const Vec &bl, const std::array<unsigned, 3> &piece) {
     Vec sig{}, out{};
