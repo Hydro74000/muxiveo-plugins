@@ -22,3 +22,6 @@ _mvo_fel_vulkan_configure
 _mvo_fel_set_timestamps
 _mvo_fel_set_crop
 _mvo_fel_set_decoder_device
+_mvo_fel_set_precision
+_mvo_fel_vulkan_precision
+_mvo_fel_devices_features

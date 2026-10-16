@@ -32,6 +32,12 @@ def load(path: Path):
     lib.mvo_fel_set_timestamps.restype = c.c_int
     lib.mvo_fel_set_start.argtypes = [c.c_void_p, c.c_int64]
     lib.mvo_fel_set_start.restype = c.c_int
+    lib.mvo_fel_set_precision.argtypes = [c.c_void_p, c.c_char_p]
+    lib.mvo_fel_set_precision.restype = c.c_int
+    lib.mvo_fel_set_device.argtypes = [c.c_void_p, c.c_char_p]
+    lib.mvo_fel_set_device.restype = c.c_int
+    lib.mvo_fel_backend.argtypes = [c.c_void_p]
+    lib.mvo_fel_backend.restype = c.c_char_p
     for name in ("mvo_fel_cancel", "mvo_fel_destroy"):
         getattr(lib, name).argtypes = [c.c_void_p]
         getattr(lib, name).restype = None
@@ -52,8 +58,6 @@ def smoke(library: Path, fixture: Path, output: Path | None = None, device: str 
             assert lib.mvo_fel_set_start(handle, 5*1001*1000000//24000) == 0
             assert lib.mvo_fel_set_start(handle, -1) == -1
         if device != "auto":
-            lib.mvo_fel_set_device.argtypes = [c.c_void_p, c.c_char_p]
-            lib.mvo_fel_set_device.restype = c.c_int
             assert lib.mvo_fel_set_device(handle, device.encode("ascii")) == 0
         received, frames = 0, 0
         header = bytearray()
@@ -93,7 +97,54 @@ def smoke(library: Path, fixture: Path, output: Path | None = None, device: str 
                 sink.close()
     fd_output(lib, fixture)
     yuv_output(lib, fixture)
-    print("ABI, NUT, 12 images/B-frames, seek, descripteur, Y'CbCr, fermeture aval, annulation, piste invalide et erreur de lecture : OK")
+    precision_modes(lib, fixture, device)
+    print("ABI, NUT, 12 images/B-frames, seek, descripteur, Y'CbCr, précisions, fermeture aval, annulation, "
+          "piste invalide et erreur de lecture : OK")
+
+
+def precision_modes(lib, fixture: Path, device: str) -> None:
+    """Modes de précision : valeurs refusées ; exact identique au CPU octet pour octet."""
+    capabilities = json.loads(lib.mvo_fel_capabilities())
+    assert capabilities.get("precision") == ["exact", "standard", "fast"]
+    assert capabilities.get("device_features") == ["float64"]
+    # Liste historique sans clé nouvelle (versions publiées de Muxiveo) ; liste étendue avec float64.
+    for name, extended in (("mvo_fel_devices", False), ("mvo_fel_devices_features", True)):
+        function = getattr(lib, name)
+        function.argtypes = [c.c_void_p, c.c_size_t]
+        function.restype = c.c_size_t
+        size = function(None, 0)
+        buffer = c.create_string_buffer(size)
+        assert function(buffer, size) == size
+        assert all(("float64" in item) == extended for item in json.loads(buffer.value))
+
+    def render(engine: str, precision: str | None) -> tuple[bytes, str]:
+        handle = lib.mvo_fel_create(str(fixture.resolve()).encode(), 0, 2, 24000, 1001)
+        assert handle
+        data = bytearray()
+        try:
+            assert lib.mvo_fel_set_precision(handle, b"double") == -1
+            if precision:
+                assert lib.mvo_fel_set_precision(handle, precision.encode()) == 0
+            assert lib.mvo_fel_set_device(handle, engine.encode("ascii")) == 0
+
+            def write(_opaque, pointer, size):
+                data.extend(c.string_at(pointer, size))
+                return 0
+
+            assert lib.mvo_fel_run(handle, WRITE(write), PROGRESS(lambda *_: None), None) == 0
+            assert lib.mvo_fel_set_precision(handle, b"exact") == -1
+            return bytes(data), (lib.mvo_fel_backend(handle) or b"").decode("utf-8", "replace")
+        finally:
+            lib.mvo_fel_destroy(handle)
+
+    cpu, _ = render("cpu", "exact")
+    exact, backend = render(device, "exact")
+    standard, _ = render(device, "standard")
+    fast, _ = render(device, None)
+    # CPU toujours en double ; GPU exact : double natif ou repli CPU s'il n'en dispose pas.
+    assert exact == cpu, backend
+    assert len(standard) == len(fast) == len(cpu)
+    assert backend.startswith("cpu") or "précision exacte" in backend, backend
 
 
 def yuv_output(lib, fixture: Path) -> None:

@@ -70,7 +70,8 @@ void fast_matches_reference(AVDOVIMetadata &metadata) {
         curve.mmr_order[1] = 2; curve.mmr_constant[1] = 2000;
         for (int k = 0; k < 2; ++k) for (int j = 0; j < 7; ++j) curve.mmr_coef[1][k][j] = 3000*(j+1)*(k ? -1 : 1);
     }
-    for (unsigned seed = 1; seed <= 50; ++seed) {
+    // 200 graines : signaux exactement sur un pivot compris (segment choisi sur valeurs exactes).
+    for (unsigned seed = 1; seed <= 200; ++seed) {
         std::mt19937 random(seed);
         if (const int worst = fast_error(metadata, random, 0, 1023); worst > 2) {
             std::cerr << "chemin rapide MMR, graine " << seed << " : " << worst << " codes 16 bits\n";

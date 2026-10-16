@@ -47,7 +47,7 @@ void dovi_rpu_free(void *);
 #ifdef MVO_FEL_VULKAN_PROTOTYPE
 void *fel_gpu_create(int, int, const char *);
 void fel_gpu_destroy(void *);
-size_t fel_gpu_devices(char *, size_t);
+size_t fel_gpu_devices(char *, size_t, int);
 int fel_gpu_device_name(void *, char *, size_t);
 int fel_gpu_render(void *, const AVDOVIMetadata *, const AVFrame *, const AVFrame *, uint16_t *);
 int fel_gpu_render_planar(void *, const AVDOVIMetadata *, const AVFrame *, const AVFrame *, AVFrame *);
@@ -56,6 +56,7 @@ int fel_gpu_render_vulkan(void *, const AVDOVIMetadata *, const AVFrame *, const
 int fel_gpu_render_yuv(void *, const AVDOVIMetadata *, const AVFrame *, const AVFrame *, const fel_output *, AVFrame *);
 void fel_gpu_configure(void *, const fel_output *);
 void fel_gpu_timings(void *, double *);
+int fel_gpu_set_precision(void *, int);
 #endif
 }
 
@@ -409,19 +410,25 @@ struct mvo_fel_context {
         el.init(stream, "el", el_threads, hw_decode ? hw_device : nullptr);
     }
 #ifdef MVO_FEL_VULKAN_PROTOTYPE
-    // UUID du premier GPU dédié énuméré (sinon le premier) pour le choix automatique.
-    static std::string automatic_uuid() {
-        std::vector<char> json(mvo_fel_devices(nullptr, 0) + 1);
-        if (json.size() < 3 || !mvo_fel_devices(json.data(), json.size())) return "";
+    // Choix automatique selon la précision. Rapide : premier GPU dédié, sinon le premier.
+    // Standard : GPU dédié calculant en double, sinon intégré en double. Exact : GPU dédié
+    // en double uniquement (sur iGPU, le double natif partout est plus lent que le CPU).
+    // Chaîne vide : rendu CPU.
+    std::string automatic_uuid() const {
+        std::vector<char> json(mvo_fel_devices_features(nullptr, 0) + 1);
+        if (json.size() < 3 || !mvo_fel_devices_features(json.data(), json.size())) return "";
         const std::string text(json.data());
-        std::string first;
+        std::string candidates[2];   // dédié, intégré
         for (size_t at = text.find("{\"uuid\":\""); at != std::string::npos; at = text.find("{\"uuid\":\"", at + 1)) {
-            const std::string uuid = text.substr(at + 9, 32);
-            const size_t end = text.find('}', at);
-            if (first.empty()) first = uuid;
-            if (text.substr(at, end - at).find("\"kind\":\"discrete\"") != std::string::npos) return uuid;
+            const std::string uuid = text.substr(at + 9, 32), entry = text.substr(at, text.find('}', at) - at);
+            const bool discrete = entry.find("\"kind\":\"discrete\"") != std::string::npos;
+            const bool float64 = entry.find("\"float64\":true") != std::string::npos;
+            if (precision != FEL_PRECISION_FAST && !float64) continue;
+            std::string &slot = candidates[discrete ? 0 : 1];
+            if (slot.empty()) slot = uuid;
         }
-        return first;
+        if (!candidates[0].empty()) return candidates[0];
+        return precision == FEL_PRECISION_EXACT ? "" : candidates[1];
     }
     // Rendu sur le périphérique Vulkan de FFmpeg (décodage Vulkan Video possible) ;
     // à défaut, renderer libplacebo autonome et décodage CPU, comme en 0.1.0.
@@ -429,6 +436,8 @@ struct mvo_fel_context {
         gpu_attempted = true;
         const int w = stream->codecpar->width, h = stream->codecpar->height;
         const std::string uuid = device == "auto" ? automatic_uuid() : device;
+        // Aucun GPU éligible pour cette précision : rendu CPU (toujours en double).
+        if (device == "auto" && precision != FEL_PRECISION_FAST && uuid.empty()) return;
         if (uuid.size() == 32) {
             const std::string dashed = uuid.substr(0, 8) + "-" + uuid.substr(8, 4) + "-" + uuid.substr(12, 4) + "-" +
                                        uuid.substr(16, 4) + "-" + uuid.substr(20);
@@ -442,7 +451,15 @@ struct mvo_fel_context {
         if (gpu_prototype) {
             char name[256];
             fel_gpu_device_name(gpu_prototype, name, sizeof(name));
-            backend = std::string("vulkan: ") + name;
+            if (!fel_gpu_set_precision(gpu_prototype, precision)) {
+                // Précision demandée impossible sans double natif : rendu CPU, en double.
+                fel_gpu_destroy(gpu_prototype);
+                gpu_prototype = nullptr;
+                av_buffer_unref(&hw_device);
+                backend = std::string("cpu (") + name + " sans calcul double)";
+                return;
+            }
+            backend = std::string("vulkan: ") + name + ", " + precision_label(precision);
         }
     }
 #endif
@@ -605,6 +622,12 @@ struct mvo_fel_context {
         check(avformat_write_header(output, nullptr), "En-tête NUT");
     }
     std::string device = "auto", backend = "cpu";
+    // Précision du rendu GPU (fel_precision) ; défaut rapide pour les appelants antérieurs.
+    int precision = FEL_PRECISION_FAST;
+    static const char *precision_label(int value) {
+        return value == FEL_PRECISION_EXACT ? "précision exacte (double)"
+             : value == FEL_PRECISION_STANDARD ? "précision standard (hybride borné)" : "précision rapide (float32)";
+    }
     using Emit = std::function<bool(std::unique_ptr<Job>)>;
     // Apparie BL/EL/RPU dans l'ordre de présentation ; false si emit demande l'arrêt.
     bool pair(const Emit &emit) {
@@ -866,9 +889,9 @@ struct mvo_fel_context {
 uint32_t mvo_fel_abi_version() { return MVO_FEL_ABI; }
 const char *mvo_fel_capabilities() {
 #ifdef MVO_FEL_VULKAN_PROTOTYPE
-    return "{\"abi\":1,\"version\":\"" MVO_FEL_VERSION "\",\"transport\":\"nut\",\"pixel_format\":\"gbrp16le\",\"cpu\":true,\"backend\":\"vulkan-prototype\",\"statistics\":1,\"device_selection\":1,\"seek\":1,\"fd_output\":1,\"timestamps\":[\"source\",\"zero\"],\"crop\":1,\"output_formats\":[\"gbrp16le\",\"yuv420p16le\",\"yuv420p10le\",\"yuv420p\"],\"dithers\":[\"none\",\"ordered\",\"blue\"],\"direct_formats\":[\"p010\"],\"experimental\":true}";
+    return "{\"abi\":1,\"version\":\"" MVO_FEL_VERSION "\",\"transport\":\"nut\",\"pixel_format\":\"gbrp16le\",\"cpu\":true,\"backend\":\"vulkan-prototype\",\"statistics\":1,\"device_selection\":1,\"seek\":1,\"fd_output\":1,\"timestamps\":[\"source\",\"zero\"],\"crop\":1,\"output_formats\":[\"gbrp16le\",\"yuv420p16le\",\"yuv420p10le\",\"yuv420p\"],\"dithers\":[\"none\",\"ordered\",\"blue\"],\"direct_formats\":[\"p010\"],\"precision\":[\"exact\",\"standard\",\"fast\"],\"device_features\":[\"float64\"],\"experimental\":true}";
 #else
-    return "{\"abi\":1,\"version\":\"" MVO_FEL_VERSION "\",\"transport\":\"nut\",\"pixel_format\":\"gbrp16le\",\"cpu\":true,\"statistics\":1,\"device_selection\":1,\"seek\":1,\"fd_output\":1,\"timestamps\":[\"source\",\"zero\"],\"crop\":1,\"output_formats\":[\"gbrp16le\",\"yuv420p16le\",\"yuv420p10le\",\"yuv420p\"],\"dithers\":[\"none\",\"ordered\",\"blue\"]}";
+    return "{\"abi\":1,\"version\":\"" MVO_FEL_VERSION "\",\"transport\":\"nut\",\"pixel_format\":\"gbrp16le\",\"cpu\":true,\"statistics\":1,\"device_selection\":1,\"seek\":1,\"fd_output\":1,\"timestamps\":[\"source\",\"zero\"],\"crop\":1,\"output_formats\":[\"gbrp16le\",\"yuv420p16le\",\"yuv420p10le\",\"yuv420p\"],\"dithers\":[\"none\",\"ordered\",\"blue\"],\"precision\":[\"exact\",\"standard\",\"fast\"],\"device_features\":[\"float64\"]}";
 #endif
 }
 int mvo_fel_classify(const uint8_t *nal, size_t size) {
@@ -895,7 +918,15 @@ mvo_fel_context *mvo_fel_create(const char *source, int stream, int threads, int
 }
 size_t mvo_fel_devices(char *buffer, size_t capacity) {
 #ifdef MVO_FEL_VULKAN_PROTOTYPE
-    return fel_gpu_devices(buffer, capacity);
+    return fel_gpu_devices(buffer, capacity, 0);
+#else
+    if (buffer && capacity >= 3) std::memcpy(buffer, "[]", 3);
+    return 3;
+#endif
+}
+size_t mvo_fel_devices_features(char *buffer, size_t capacity) {
+#ifdef MVO_FEL_VULKAN_PROTOTYPE
+    return fel_gpu_devices(buffer, capacity, 1);
 #else
     if (buffer && capacity >= 3) std::memcpy(buffer, "[]", 3);
     return 3;
@@ -947,6 +978,14 @@ int mvo_fel_set_crop(mvo_fel_context *p, int left, int top, int right, int botto
     if (!p || p->started || left < 0 || top < 0 || right < 0 || bottom < 0 ||
         (left | top | right | bottom) & 1 || std::max({left, top, right, bottom}) > 8192) return -1;
     p->crop = {left, top, right, bottom};
+    return 0;
+}
+int mvo_fel_set_precision(mvo_fel_context *p, const char *mode) {
+    if (!p || p->started || !mode) return -1;
+    const std::string value(mode);
+    if (value != "exact" && value != "standard" && value != "fast") return -1;
+    p->precision = value == "exact" ? FEL_PRECISION_EXACT : value == "standard" ? FEL_PRECISION_STANDARD
+                                                                                  : FEL_PRECISION_FAST;
     return 0;
 }
 int mvo_fel_set_timestamps(mvo_fel_context *p, const char *mode) {
@@ -1061,6 +1100,17 @@ int mvo_fel_vulkan_render(void *gpu,const void *md,const void *bl,const void *el
     return fel_gpu_render_vulkan(gpu,static_cast<const AVDOVIMetadata*>(md),
         static_cast<const AVFrame*>(bl),static_cast<const AVFrame*>(el),static_cast<AVFrame*>(output)) ? 0 : -1;
 #else
+    return -1;
+#endif
+}
+int mvo_fel_vulkan_precision(void *gpu, const char *mode) {
+#ifdef MVO_FEL_VULKAN_PROTOTYPE
+    const std::string value(mode ? mode : "");
+    const int precision = value == "exact" ? FEL_PRECISION_EXACT : value == "standard" ? FEL_PRECISION_STANDARD
+                        : value == "fast" ? FEL_PRECISION_FAST : -1;
+    return gpu && precision >= 0 && fel_gpu_set_precision(gpu, precision) ? 0 : -1;
+#else
+    (void)gpu; (void)mode;
     return -1;
 #endif
 }

@@ -18,6 +18,7 @@ using Mat = std::array<Vec, 3>;
 struct Curve {
     unsigned count = 0;
     std::array<double, 9> pivots{};
+    std::array<int, 9> codes{};   // pivots en codes BL : choix de segment exact sur sommes entières
     std::array<int, 8> method{};
     std::array<unsigned, 8> order{};
     std::array<Vec, 8> poly{};
@@ -37,6 +38,8 @@ double spline16(double x);
 double pq_eotf(double x);
 double pq_oetf(double x);
 Vec reshape(const Mapping &mapping, const Vec &bl);
+// Segments déjà choisis (index de pivot par composante), sans comparaison flottante.
+Vec reshape(const Mapping &mapping, const Vec &bl, const std::array<unsigned, 3> &piece);
 Vec compose(const Mapping &mapping, const Vec &bl, const Vec &el);
 Vec to_rgb(const Mapping &mapping, const Vec &signal);
 

@@ -85,6 +85,7 @@ Mapping::Mapping(const AVDOVIMetadata &metadata) {
             throw std::runtime_error("Nombre de pivots RPU invalide");
         for (unsigned p = 0; p < dst.count; ++p) {
             dst.pivots[p] = src.pivots[p] / bl_max;
+            dst.codes[p] = src.pivots[p];
             if (p && dst.pivots[p] <= dst.pivots[p-1])
                 throw std::runtime_error("Pivots RPU non croissants");
         }
@@ -123,15 +124,14 @@ double pq_oetf(double x) {
     const double p = std::pow(std::max(x, 0.0), m1);
     return std::pow((c1+c2*p)/(1+c3*p), m2);
 }
-Vec reshape(const Mapping &mapping, const Vec &bl) {
+Vec reshape(const Mapping &mapping, const Vec &bl, const std::array<unsigned, 3> &piece) {
     Vec sig{}, out{};
     for (int c = 0; c < 3; ++c) sig[c] = std::clamp(bl[c], 0.0, 1.0);
     const std::array<double, 7> terms{sig[0], sig[1], sig[2], sig[0]*sig[1],
         sig[0]*sig[2], sig[1]*sig[2], sig[0]*sig[1]*sig[2]};
     for (int c = 0; c < 3; ++c) {
         const auto &curve = mapping.curves[c];
-        unsigned p = 0;
-        while (p+2 < curve.count && sig[c] >= curve.pivots[p+1]) ++p;
+        const unsigned p = piece[c];
         double s;
         if (curve.method[p] == AV_DOVI_MAPPING_POLYNOMIAL) {
             const auto &a = curve.poly[p];
@@ -149,6 +149,17 @@ Vec reshape(const Mapping &mapping, const Vec &bl) {
         out[c] = std::clamp(s, curve.pivots[0], curve.pivots[curve.count-1]);
     }
     return out;
+}
+Vec reshape(const Mapping &mapping, const Vec &bl) {
+    std::array<unsigned, 3> piece{};
+    for (int c = 0; c < 3; ++c) {
+        const auto &curve = mapping.curves[c];
+        const double sig = std::clamp(bl[c], 0.0, 1.0);
+        // Échantillons en double : un signal égal au pivot en valeur exacte en diffère d'environ
+        // 1e-15, deux valeurs exactes distinctes d'au moins 1/(1023·D) > 1e-10 (D ≤ 2560²).
+        while (piece[c]+2 < curve.count && sig >= curve.pivots[piece[c]+1] - 1e-12) ++piece[c];
+    }
+    return reshape(mapping, bl, piece);
 }
 Vec compose(const Mapping &mapping, const Vec &bl, const Vec &el) {
     Vec out = reshape(mapping, bl);
@@ -542,19 +553,31 @@ void FastReconstruction::rows(const Mapping &mapping, AVFrame &rgb, int first_ro
             scale[k] = 1.0/(double(p.vertical.denominator[y])*1023.0);
         }
         const auto *row = reinterpret_cast<const uint16_t *>(luma + y*luma_stride);
+        const int64_t vertical_den[2] = {base_chroma[0].vertical.denominator[y], base_chroma[1].vertical.denominator[y]};
         // Signal non linéaire (mapping, NLQ, matrice Y'CbCr→LMS') par pixel, puis PQ par
         // tableaux contigus : boucles sans branche vectorisées par le compilateur.
         for (int x = 0; x < width; ++x) {
             double value[5];
+            int32_t sums[5];
             for (int k = 0; k < 5; ++k) {
                 const Plane &p = *planes[k];
                 const auto &i = p.horizontal.index[x];
                 const auto &w = p.horizontal.weight[x];
                 const int32_t *v = vertical[k].data();
                 const int32_t sum = w[0]*v[i[0]] + w[1]*v[i[1]] + w[2]*v[i[2]] + w[3]*v[i[3]];
+                sums[k] = sum;
                 value[k] = sum ? sum*scale[k]/p.horizontal.denominator[x] : 0.0;
             }
-            Vec out = reshape(mapping, {row[x]/1023.0, value[0], value[1]});
+            // Segment de mapping choisi sur les valeurs exactes : code BL face au pivot, et
+            // somme chroma bornée à [0, 1023·D] face à pivot·D (D = dénominateurs entiers).
+            std::array<unsigned, 3> piece{};
+            for (int c = 0; c < 3; ++c) {
+                const auto &curve = mapping.curves[c];
+                const int64_t den = c ? vertical_den[c-1] * base_chroma[c-1].horizontal.denominator[x] : 1;
+                const int64_t numerator = std::clamp<int64_t>(c ? sums[c-1] : row[x], 0, 1023*den);
+                while (piece[c]+2 < curve.count && numerator >= int64_t(curve.codes[piece[c]+1]) * den) ++piece[c];
+            }
+            Vec out = reshape(mapping, {row[x]/1023.0, value[0], value[1]}, piece);
             // Résiduel EL exact : un zéro entier n'applique ni seuil ni pente NLQ.
             if (mapping.residual) for (int c = 0; c < 3; ++c) {
                 const double d = value[2+c];

@@ -24,6 +24,8 @@ MVO_FEL_EXPORT int mvo_fel_vulkan_render(void *, const void *metadata,
  * position chroma et tramage comme mvo_fel_set_output. Avant le premier rendu. */
 MVO_FEL_EXPORT int mvo_fel_vulkan_configure(void *, const char *chroma_location, const char *dither,
     int crop_x, int crop_y, int width, int height);
+/* Précision du rendu (mvo_fel_set_precision) ; -1 si le périphérique ne calcule pas en double. */
+MVO_FEL_EXPORT int mvo_fel_vulkan_precision(void *, const char *mode);
 MVO_FEL_EXPORT void mvo_fel_vulkan_destroy(void *);
 #ifdef __cplusplus
 }

@@ -45,6 +45,41 @@ Débit du plugin seul, 300 images UHD, sortie 10 bits finale (Ryzen 7800X3D) :
 Les durées de workflow complètes (x265, NVEncC, FFmpeg/NVENC NUT et direct) sont
 consignées avec le plan de continuation.
 
+## Précision du rendu GPU
+
+Muxiveo propose trois modes (`mvo_fel_set_precision`, capacité `precision`). Le CPU calcule
+toujours en double : il est exact quel que soit le mode.
+
+| Mode | Calcul GPU | Écart au CPU | RTX 4070 Ti SUPER | iGPU Raphael |
+|---|---|---|---:|---:|
+| `exact` (Lent, recommandé) | double natif partout, conversion Y'CbCr comprise | identique au bit près | 27,6 i/s | 2,1 i/s |
+| `standard` | float32 reformulé, borne d'erreur par pixel, recalcul en double au-delà de 0,4 code | ≤ 1 code 16 bits | 66,7 i/s | 8,1 i/s |
+| `fast` (défaut de l'ABI) | décodage Dolby Vision libplacebo en float32 | jusqu'à ~300 codes PQ12 aux couleurs extrêmes | 67 i/s | 20,8 i/s |
+
+Débit du plugin seul, 300 images UHD, sortie 10 bits finale ; CPU (7800X3D) : 8,1 i/s.
+
+Dans les modes `exact` et `standard` :
+
+- le segment de mapping (pivots) et le zéro du résiduel NLQ sont décidés sur les sommes
+  entières exactes ;
+- le mapping, la NLQ et la matrice Y'CbCr→LMS' sont calculés en double ;
+- un GPU calculant en double (`shaderFloat64`, clé `float64` de
+  `mvo_fel_devices_features`) est requis ; sinon le rendu passe sur le CPU.
+
+Le float-float (deux float32) a été écarté : ses termes correcteurs sont perdus selon
+l'optimiseur du pilote, ce qui a été mesuré sur NVIDIA et sur AMD
+([proposition](docs/2026-10-16-gpu-exact-proposition.md)).
+
+Choix automatique du GPU :
+
+| Mode | GPU retenu |
+|---|---|
+| `exact` | GPU dédié calculant en double (sur iGPU, plus lent que le CPU), sinon CPU |
+| `standard` | GPU dédié, puis intégré, calculant en double, sinon CPU |
+| `fast` | GPU dédié, sinon le premier GPU |
+
+`fel_gpu_precision_test` vérifie chaque mode sur trois stress de 200 graines face au CPU.
+
 ## Architecture
 
 - **Bibliothèque** `libmvo_fel.so`, `mvo_fel.dll` ou `libmvo_fel.dylib`. ABI C 1
@@ -66,8 +101,9 @@ consignées avec le plan de continuation.
   (aperçus) sans reconstruire ce qui précède.
 - **Rendu GPU** (Vulkan) : une seule passe de composition lit les plans BL/EL.
   Le rééchantillonnage Spline16 se fait en entiers exacts : chroma BL et trois
-  résiduels EL, avec zéro et signe du résiduel exacts. Viennent ensuite les
-  shaders libplacebo NLQ/mapping/couleurs, puis la conversion de sortie.
+  résiduels EL, avec zéro et signe du résiduel exacts. Viennent ensuite le shader
+  couleur Muxiveo (modes `exact`/`standard`) ou les shaders libplacebo (mode `fast`),
+  puis la conversion de sortie (en double en mode `exact`).
 - **Rendu CPU** : même arithmétique entière, passes séparables, PQ et matrice
   LMS→RGB en double vectorisées (AVX2+FMA choisi à l'exécution, NEON sur arm64) :
   identique à la référence en double sur les scènes réelles, ≤ 2 codes 16 bits sur

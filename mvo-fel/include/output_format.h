@@ -9,6 +9,8 @@ enum fel_output_format {
     FEL_OUT_GBRP16 = 0, FEL_OUT_YUV420P16, FEL_OUT_YUV420P10, FEL_OUT_YUV420P8, FEL_OUT_P010
 };
 enum fel_dither { FEL_DITHER_NONE = 0, FEL_DITHER_ORDERED, FEL_DITHER_BLUE };
+/* Précision du rendu couleur GPU (le CPU calcule toujours en double). */
+enum fel_precision { FEL_PRECISION_FAST = 0, FEL_PRECISION_STANDARD, FEL_PRECISION_EXACT };
 struct fel_output {
     int format, dither;
     int chroma;            /* AVChromaLocation */

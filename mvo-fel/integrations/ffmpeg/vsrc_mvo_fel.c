@@ -14,7 +14,7 @@
 
 typedef struct FelSource {
     const AVClass *class;
-    char *source, *library, *format, *chroma, *dither;
+    char *source, *library, *format, *chroma, *dither, *precision;
     int stream, threads, width, height, callback_error;
     int crop_left, crop_top, crop_right, crop_bottom, crop_w, crop_h, p010;
     AVRational time_base, frame_rate, sar;
@@ -31,6 +31,7 @@ typedef struct FelSource {
     int (*render)(void *,const void *,const void *,const void *,void *);
     void (*gpu_destroy)(void *);
     int (*configure)(void *,const char *,const char *,int,int,int,int);
+    int (*set_precision)(void *,const char *);
     int (*decoder_device)(mvo_fel_context *,const void *);
 } FelSource;
 
@@ -44,6 +45,7 @@ static const AVOption mvo_fel_options[]={
     {"format","Sortie : gbrp16 (RGB PQ) ou p010 (finale tramée)",OFFSET(format),AV_OPT_TYPE_STRING,{.str="gbrp16"},0,0,FLAGS},
     {"chroma","Position chroma de la sortie p010",OFFSET(chroma),AV_OPT_TYPE_STRING,{.str="left"},0,0,FLAGS},
     {"dither","Tramage de la sortie p010",OFFSET(dither),AV_OPT_TYPE_STRING,{.str="blue"},0,0,FLAGS},
+    {"precision","Précision du rendu : fast, standard ou exact (double natif requis)",OFFSET(precision),AV_OPT_TYPE_STRING,{.str="fast"},0,0,FLAGS},
     {"crop_left","Recadrage p010 : marge gauche (paire)",OFFSET(crop_left),AV_OPT_TYPE_INT,{.i64=0},0,8192,FLAGS},
     {"crop_top","Recadrage p010 : marge haute (paire)",OFFSET(crop_top),AV_OPT_TYPE_INT,{.i64=0},0,8192,FLAGS},
     {"crop_right","Recadrage p010 : marge droite (paire)",OFFSET(crop_right),AV_OPT_TYPE_INT,{.i64=0},0,8192,FLAGS},
@@ -81,6 +83,7 @@ static av_cold int init(AVFilterContext *ctx)
     if(s->format && !s->p010 && strcmp(s->format,"gbrp16"))return AVERROR(EINVAL);
     *(void **)(&s->configure)=dlsym(s->module,"mvo_fel_vulkan_configure");
     *(void **)(&s->decoder_device)=dlsym(s->module,"mvo_fel_set_decoder_device");
+    *(void **)(&s->set_precision)=dlsym(s->module,"mvo_fel_vulkan_precision");
     if(s->p010 && !s->configure) {
         av_log(ctx,AV_LOG_ERROR,"MVO_FEL_RECOVERABLE : sortie p010 absente de cette bibliothèque FEL.\n");
         return AVERROR_EXTERNAL;
@@ -150,6 +153,12 @@ static int config_output(AVFilterLink *link)
     s->renderer=s->gpu_create(ctx->hw_device_ctx->data,s->width,s->height);
     if(!s->renderer) {
         av_log(ctx,AV_LOG_ERROR,"MVO_FEL_RECOVERABLE : initialisation du renderer FEL impossible.\n");
+        return AVERROR_EXTERNAL;
+    }
+    /* Précision exacte ou standard : GPU calculant en double indispensable, sinon repli du transport. */
+    if(s->precision && strcmp(s->precision,"fast") &&
+       (!s->set_precision || s->set_precision(s->renderer,s->precision))) {
+        av_log(ctx,AV_LOG_ERROR,"MVO_FEL_RECOVERABLE : précision %s indisponible sur ce GPU.\n",s->precision);
         return AVERROR_EXTERNAL;
     }
     if(s->p010 && s->configure(s->renderer,s->chroma,s->dither,s->crop_left,s->crop_top,s->crop_w,s->crop_h)) {
