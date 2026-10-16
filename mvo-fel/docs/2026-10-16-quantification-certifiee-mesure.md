@@ -37,6 +37,19 @@ Le corpus compte six scènes FEL réelles : Il faut sauver le soldat Ryan ×2, T
 
 La part ambiguë est proportionnelle à ε : environ 4·10⁴ · ε des composantes.
 
+Une relecture (16/10) a corrigé deux biais de l'outil :
+
+- la distance aux seuils était calculée avec max(R, 0), ce qui rendait ambiguës des composantes négatives certaines ;
+- l'entrée de l'EOTF était bornée à 1.
+
+Une fois corrigés, l'effet est négligeable : 14,18 → 14,02 % des pixels sur Toy Story à ε = 10⁻⁶, chiffres inchangés ailleurs. Les composantes négatives atteignent pourtant 8,4 % sur Moana, mais dans des zones presque noires. Aucun signal LMS' ne dépasse 1.
+
+**Limites du modèle :**
+
+- Il centre l'intervalle sur la valeur de référence. Un shader le centrera sur une approximation distante d'au plus δ : le taux réel se situe donc entre les lignes ε et 2ε, soit au plus le double.
+- ε ≈ 10⁻⁶ pour un certificat float32 reste une hypothèse, tant que l'analyse des opérations ne l'a pas établie.
+- Le coût de A n'est qu'un ordre de grandeur : il manque le certificat, l'accès aux seuils, la compaction et la correction dispersée.
+
 ## Conséquences
 
 1. **Un certificat float32 ne suffit pas seul.** Une borne float32 rigoureuse vaut environ ε ≈ 10⁻⁶ : elle laisse 5 à 14 % des pixels à recalculer.
