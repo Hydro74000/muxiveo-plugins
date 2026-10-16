@@ -190,6 +190,111 @@ uvec2 fx_eotf(uvec4 x, int fraction, out int n, out float dl, out float kappa, i
     return fx_exp(y, n);
 }
 
+// --- Premier niveau (lot L) : produits 32 × 32 bits, additions sur 64 bits (fixed_point.cpp, eotf_fast). ---
+uint mulhi32(uint a, uint b) { uint h, l; umulExtended(a, b, h, l); return h; }
+int imul_sar38(int a, int b) { int h, l; imulExtended(a, b, h, l); return h >> 6; }          // plancher(a·b / 2^38)
+uint umul_shr38(uint a, uint b) { uint h, l; umulExtended(a, b, h, l); return h >> 6; }
+// 64 bits ≪ k (0 ≤ k < 32) d'un mot de 32 bits.
+uvec2 x2shl32(uint v, int k) { return k == 0 ? uvec2(v, 0u) : uvec2(v << k, v >> (32 - k)); }
+
+// ln(v), v > 0 à l'échelle 2^-fraction, en S5.58 ; série de degré 4 en S1.30.
+uvec2 fx_ln_fast(uvec4 v, int fraction) {
+    int top = x4msb(v), e = top - fraction;
+    uvec2 m = (top >= 63 ? x4shr(v, top - 63) : x4shl(v, 63 - top)).xy;          // Q1.63
+    int j = int((m.y >> 25) & 63u);
+    uvec2 d = x2sub(m, uvec2(0u, (uint(64 + j) << 25) | (1u << 24)));            // |d| ≤ 2^56
+    int d32 = int((d.x >> 25) | (d.y << 7));                                      // plancher(d / 2^25)
+    uint rm = mulhi32(d32 < 0 ? uint(-d32) : uint(d32), fxt(FXT_INVC + j).y);
+    int r = d32 < 0 ? -int(rm) : int(rm);                                         // r·2^38
+    int a = -(1 << 28);
+    a = 357913941 + imul_sar38(a, r);
+    a = -(1 << 29) + imul_sar38(a, r);
+    a = (1 << 30) + imul_sar38(a, r);
+    int h, l;
+    imulExtended(a, r, h, l);
+    uvec2 series = uvec2((uint(l) >> 10) | (uint(h) << 22), uint(h >> 10));       // S5.58
+    uvec4 p = x2mul(fxt(FXT_CONST), uvec2(uint(abs(e)), 0u));
+    uvec2 eln2 = x4sar(e < 0 ? x4neg(p) : p, 6).xy;
+    return x2add(x2add(eln2, x2sar(fxt(FXT_LNC + j), 5)), series);
+}
+
+// e^y, y en S8.55 : mantisse Q1.63, valeur = mant·2^(n-63) ; série de degré 4 en Q1.31.
+uvec2 fx_exp_fast(uvec2 y, out int n) {
+    float yf = (x2sign(y) ? -x2float(x2neg(y)) : x2float(y))*2.7755576e-17;     // 2^-55
+    int K = int(floor(yf*92.332482616893657));
+    uvec4 ln2 = uvec4(fxt(FXT_CONST + 5), fxt(FXT_CONST + 6));                    // ln2/64 en Q0.90
+    uvec4 r90 = x4sub(x4shl(x4ext(y), 35), x4muls(ln2, K));
+    if (x4sign(r90)) { K -= 1; r90 = x4add(r90, ln2); }
+    else if (!x4lt(r90, ln2)) { K += 1; r90 = x4sub(r90, ln2); }
+    uint r38 = x4shr(r90, 52).x;                                                  // r·2^38
+    uint a = 89478485u;
+    a = 357913941u + umul_shr38(a, r38);
+    a = 1073741824u + umul_shr38(a, r38);
+    a = 2147483648u + umul_shr38(a, r38);
+    uint h, l;
+    umulExtended(a, r38, h, l);
+    uint em = (h << 1) | (l >> 31);                                               // (e^r − 1)·2^38
+    int q = K >= 0 ? K/64 : -((-K + 63)/64);
+    uvec2 p2 = fxt(FXT_POW2 + (K - 64*q));
+    uint h0, l0, h1, l1, c, c2, c3;
+    umulExtended(p2.x, em, h0, l0);
+    umulExtended(p2.y, em, h1, l1);
+    uint mid = uaddCarry(h0, l1, c);
+    uint top = h1 + c;                                                            // pow2·em = l0 + mid·2^32 + top·2^64
+    uint lo = uaddCarry(p2.x, (mid >> 6) | (top << 26), c);
+    uint hi = uaddCarry(p2.y, top >> 6, c2);
+    hi = uaddCarry(hi, c, c3);
+    n = q;
+    if ((c2 | c3) != 0u) { n += 1; return uvec2((lo >> 1) | (hi << 31), (hi >> 1) | 0x80000000u); }
+    return uvec2(lo, hi);
+}
+
+// EOTF rapide : comme fx_eotf, ln g = ln num − ln den ; err majore l'erreur relative de L.
+// ok faux : hors cadre, ou voisinage du zéro de l'EOTF (le second niveau décide).
+uvec2 fx_eotf_fast(uvec4 x, int fraction, out int n, out float dl, out float kappa, out float err, inout bool ok) {
+    n = 0; dl = 0.0; kappa = 0.0; err = 0.0;
+    uvec2 dls = x2sub(fx_ln_fast(x, fraction), fxt(FXT_CONST + 4));
+    bool neg = x2sign(dls);
+    dl = (neg ? -x2float(x2neg(dls)) : x2float(dls))*3.4694470e-18;              // 2^-58
+    if (neg || (dls.x | dls.y) == 0u) return uvec2(0u);
+    uvec2 delta = x4shr(x2mul(dls, fxt(FXT_CONST + 1)), 59).xy;                          // S63
+    int j = int(delta.y >> 25);
+    if (j > 15) { ok = false; return uvec2(0u); }
+    uvec2 r0 = x2sub(delta, uvec2(0u, uint(j) << 25));
+    uvec2 r = uvec2(r0.x << 1, (r0.y << 1) | (r0.x >> 31));                       // Q0.64, r < 1/64
+    uvec2 em = uvec2(0u);
+    if ((r.x | r.y) != 0u) {
+        uint r38 = (r.x >> 26) | (r.y << 6);
+        uint b = 35791394u;
+        b = 178956971u + (mulhi32(b, r38) >> 6);
+        b = 715827883u + (mulhi32(b, r38) >> 6);
+        b = 2147483648u + (mulhi32(b, r38) >> 6);
+        int sh = r.y != 0u ? 31 - findMSB(r.y) : 63 - findMSB(r.x);              // ≥ 6
+        uint rn = sh < 32 ? (r.y << sh) | (r.x >> (32 - sh)) : r.x << (sh - 32);
+        uint qv = mulhi32(mulhi32(rn, rn), b);                                    // r²·b = qv·2^-(32+2sh)
+        int k = 32 - 2*sh;
+        em = x2add(r, k >= 0 ? x2shl32(qv, k) : (-k < 32 ? uvec2(qv >> -k, 0u) : uvec2(0u)));
+    }
+    uvec2 ex = x2add(x2add(em, x2hi(fxt(FXT_EXPM1 + j), em)), fxt(FXT_EXPM1 + j));
+    uvec2 num = x4shr(x2mul(ex, uvec2(107u, 0u)), 7).xy;                          // c1·expm1, Q0.64
+    if (!x2lt(num, uvec2(0u, 43u << 24))) { ok = false; return uvec2(0u); }
+    if ((num.x | num.y) == 0u) return uvec2(0u);
+    uvec2 den = x2sub(uvec2(0u, 6615u << 19), x4shr(x2mul(num, uvec2(299u, 0u)), 6).xy);   // Q2.62
+    float nf = x2float(num)*5.4210109e-20, df = x2float(den)*2.1684043e-19;
+    kappa = (0.8359375 + nf)/12.56011962890625*(1.0/nf + 18.6875/df);
+    uvec2 lg = x2sub(fx_ln_fast(uvec4(num, 0u, 0u), 64), fx_ln_fast(uvec4(den, 0u, 0u), 62));
+    uvec4 py = x2mul(x2abs(lg), fxt(FXT_CONST + 2));
+    uvec2 y = py.zw;
+    if (x2sign(lg)) { if ((py.x | py.y) != 0u) y = x2add(y, uvec2(1u, 0u)); y = x2neg(y); }   // plancher
+    // Borne (fixed_point.cpp) : ln 2^-35, expm1 2^-34, exp 2^-35 ; marge 1,25.
+    float f = 1.0 + 18.6875*nf/df;
+    float rnum = 2.9103830e-11*(1.0/dl + 0.01) + 5.8207661e-11 + 2.7755576e-17/dl + 8.6736174e-19;
+    if (!(rnum <= 2.4414062e-4)) { ok = false; return uvec2(0u); }
+    float B = 6.2774*(1.01*f*rnum + 5.8207661e-11) + 8.8817842e-16;
+    err = 1.25*(B*(1.0 + B) + 1.01*2.9103830e-11);
+    return fx_exp_fast(y, n);
+}
+
 uint fp(int i) { return fel_fp[i >> 2][i & 3]; }
 uvec2 fp2(int i) { return uvec2(fp(i), fp(i + 1)); }
 uvec4 fp4(int i) { return uvec4(fp(i), fp(i + 1), fp(i + 2), fp(i + 3)); }

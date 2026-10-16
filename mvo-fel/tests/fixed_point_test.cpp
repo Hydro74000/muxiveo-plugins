@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: LGPL-2.1-or-later
 // Virgule fixe multi-mots (lot A2') : EOTF face au double-double (erreur ≤ moitié de la borne
-// 2^-50·(1 + 1/ln(x/x0))), puis pipeline complet face au CPU certifié sur couches aléatoires :
-// codes certains identiques, |R - R exact| ≤ moitié de la borne, part de composantes indécises.
+// 2^-50·(1 + 1/ln(x/x0))), EOTF rapide du premier niveau (lot L, erreur ≤ moitié de sa borne), puis
+// pipeline complet à deux niveaux face au CPU certifié sur couches aléatoires : codes certains
+// identiques, |R - R exact| ≤ moitié de la borne, part de composantes indécises et de second niveau.
 #include "fixed_point.hpp"
 #include <cmath>
 #include <cstdio>
@@ -76,9 +77,36 @@ int main() {
     }
     std::printf("EOTF virgule fixe : erreur / borne ≤ %.4f\n", worst);
     if (!(worst <= 0.5)) return 1;
+    // EOTF rapide : échelles d'entrée variées (2^-64 à 2^-112), voisinage du zéro x0 (dl petit), pôle.
+    double worst_fast = 0, largest = 0;
+    long long checked = 0;
+    for (int s = 0; s < 1200000; ++s) {
+        const int kind = s % 4;
+        const double x = kind == 0 ? std::exp(std::log(7.31e-7)*unit(random))
+                       : kind == 1 ? unit(random)
+                       : kind == 2 ? 7.3095590257840e-7*(1 + std::ldexp(1.0, -(int)(40*unit(random))))
+                       : 1 + 0.33*unit(random);
+        const int fraction = 64 + (int)(48*unit(random));
+        const u128 xs = (u128)std::ldexp((long double)x, fraction);
+        uint64_t mant; int n; double dl, kappa, bound;
+        if (!fixed::eotf_fast(xs, fraction, mant, n, dl, kappa, bound) || !mant) continue;
+        double k2;
+        const auto ref = certified::eotf({(double)std::ldexp((long double)xs, -fraction),
+                                          (double)(std::ldexp((long double)xs, -fraction) - (long double)(double)std::ldexp((long double)xs, -fraction))}, k2);
+        const long double L = std::ldexp((long double)mant, n - 63);
+        const double rel = std::abs((double)((L - (long double)ref.hi - ref.lo)/(long double)ref.hi));
+        if (rel/bound > worst_fast && std::getenv("FEL_DEBUG_FAST"))
+            std::printf("  pire : genre %d, x %.17g, fraction %d, dl %.6g, kappa %.4g, borne %.4g, erreur %.4g\n",
+                        kind, x, fraction, dl, kappa, bound, rel);
+        worst_fast = std::max(worst_fast, rel/bound);
+        if (dl > 0.01) largest = std::max(largest, bound);
+        ++checked;
+    }
+    std::printf("EOTF rapide : %lld points, erreur / borne ≤ %.4f, borne ≤ %.3g (dl > 0,01)\n", checked, worst_fast, largest);
+    if (!(worst_fast <= 0.5)) return 1;
     // Pipeline complet.
     auto *metadata = av_dovi_metadata_alloc(nullptr);
-    long long components = 0, uncertain = 0, mismatches = 0;
+    long long components = 0, uncertain = 0, mismatches = 0, second = 0, pixels = 0;
     double ratio = 0;
     long long per_mode[3][2] = {};
     for (int mode = 0; mode < 3; ++mode) {
@@ -102,7 +130,9 @@ int main() {
                     std::array<uint16_t, 3> codes{}, exact{};
                     fixed::i128 linear[3];
                     double bound[3];
-                    const unsigned mask = fixed::pixel(params, px, codes, linear, bound);
+                    int tier = 0;
+                    const unsigned mask = fixed::pixel(params, px, codes, linear, bound, &tier);
+                    ++pixels; second += tier;
                     std::array<certified::DD, 3> value{};
                     certified::classify(m, px, 7, exact, &value);
                     for (int c = 0; c < 3; ++c) {
@@ -120,8 +150,8 @@ int main() {
     for (int mode = 0; mode < 3; ++mode)
         std::printf("  %s : %lld indécises sur %lld\n", mode == 0 ? "identité" : mode == 1 ? "matrices réelles" : "MMR",
                     per_mode[mode][1], per_mode[mode][0]);
-    std::printf("pipeline virgule fixe : %lld composantes, %lld indécises, %lld codes différents, écart / borne ≤ %.4f\n",
-                components, uncertain, mismatches, ratio);
+    std::printf("pipeline virgule fixe : %lld composantes, %lld indécises, %lld codes différents, écart / borne ≤ %.4f ; "
+                "second niveau : %lld pixels sur %lld\n", components, uncertain, mismatches, ratio, second, pixels);
     // Indécises : signaux LMS' au-delà de 1,33 (hors cadre, vers le pôle), propres au stress
     // synthétique ; le contenu réel reste sous 1.
     return mismatches == 0 && ratio <= 0.5 && uncertain*100 < components ? 0 : 1;

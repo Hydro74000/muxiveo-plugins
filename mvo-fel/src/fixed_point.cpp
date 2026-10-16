@@ -71,6 +71,55 @@ uint64_t exp_fixed(int64_t y, int &n) {
     n = (int)q + (shift - 62);
     return (uint64_t)(product >> shift);
 }
+
+// --- Premier niveau (lot L) : produits 32 × 32 bits, additions sur 64 bits. ---
+uint32_t mulhi32(uint32_t a, uint32_t b) { return (uint32_t)(((uint64_t)a*b) >> 32); }
+// ln(1+r) = r·(1 + r·(−1/2 + r·(1/3 − r/4))) en S1.30.
+constexpr int32_t LNF[4] = {1 << 30, -(1 << 29), 357913941, -(1 << 28)};
+// expm1(r) = r + r²·b, b = 1/2 + r·(1/6 + r·(1/24 + r/120)) en Q0.32.
+constexpr uint32_t EMF[4] = {2147483648u, 715827883u, 178956971u, 35791394u};
+// e^r − 1 = r·a, a = 1 + r·(1/2 + r·(1/6 + r/24)) en Q1.31.
+constexpr uint32_t EXF[4] = {2147483648u, 1073741824u, 357913941u, 89478485u};
+
+// ln(v), v > 0 à l'échelle 2^-fraction, en S5.58 ; erreur absolue < 6,2·2^-38 (docs/2026-10-16-eotf-deux-niveaux.md).
+int64_t ln_fast(u128 v, int fraction) {
+    const Tables &t = tables();
+    const int top = msb(v), e = top - fraction;
+    const uint64_t m = top >= 63 ? (uint64_t)(v >> (top - 63)) : (uint64_t)(v << (63 - top));   // Q1.63
+    const int j = (int)((m >> 57) & 63);
+    const uint64_t c = ((uint64_t)(64 + j) << 57) | ((uint64_t)1 << 56);
+    const int64_t d = (int64_t)(m - c);                                    // |d| ≤ 2^56
+    const int32_t d32 = (int32_t)(d >> 25);                                // plancher, unité 2^-38
+    const uint32_t ad = d32 < 0 ? (uint32_t)(-(int64_t)d32) : (uint32_t)d32;
+    const uint32_t rm = mulhi32(ad, (uint32_t)(t.inv_c[j] >> 32));
+    const int32_t r = d32 < 0 ? -(int32_t)rm : (int32_t)rm;                // r·2^38, |r| < 2^-7
+    int32_t a = LNF[3];
+    for (int k = 2; k >= 0; --k) a = LNF[k] + (int32_t)(((int64_t)a*r) >> 38);
+    const int64_t series = ((int64_t)a*r) >> 10;                           // S5.58
+    const int64_t eln2 = (int64_t)(((i128)e*(i128)t.ln2_q64) >> 6);
+    return eln2 + (t.ln_c[j] >> 5) + series;
+}
+
+// e^y, y en S8.55 : mantisse Q1.63 et exposant ; erreur relative < 2^-36.
+uint64_t exp_fast(int64_t y, int &n) {
+    const Tables &t = tables();
+    const u128 ln2_64 = (u128)t.ln2_64_q90[1] << 64 | t.ln2_64_q90[0];
+    // K = floor(y·64/ln2) : estimation flottante (écart ≤ 1), puis correction exacte, 0 ≤ r < ln2/64.
+    int64_t K = (int64_t)std::floor((double)(float)((float)std::ldexp((double)y, -55)*92.332482616893657f));
+    i128 r90 = ((i128)y << 35) - (i128)K*(i128)ln2_64;
+    if (r90 < 0) { --K; r90 += (i128)ln2_64; }
+    else if (r90 >= (i128)ln2_64) { ++K; r90 -= (i128)ln2_64; }
+    const uint32_t r38 = (uint32_t)(r90 >> 52);                            // r·2^38 < 2^32
+    uint32_t a = EXF[3];
+    for (int k = 2; k >= 0; --k) a = EXF[k] + (uint32_t)(((uint64_t)a*r38) >> 38);
+    const uint32_t em = (uint32_t)(((uint64_t)a*r38) >> 31);               // (e^r − 1)·2^38
+    const int64_t q = K >= 0 ? K/64 : -((-K + 63)/64);
+    const int j = (int)(K - 64*q);
+    const u128 sum = (u128)t.pow2[j] + (((u128)t.pow2[j]*em) >> 38);       // Q1.63, < 2^65
+    n = (int)q;
+    if (sum >> 64) { ++n; return (uint64_t)(sum >> 1); }
+    return (uint64_t)sum;
+}
 }
 
 const Tables &tables() {
@@ -224,8 +273,54 @@ bool eotf(u128 x, int fraction, uint64_t &mant, int &n, double &dl, double *kapp
     return true;
 }
 
+bool eotf_fast(u128 x, int fraction, uint64_t &mant, int &n, double &dl, double &kappa, double &bound) {
+    const Tables &t = tables();
+    mant = 0; n = 0; dl = 0; kappa = 0; bound = 0;
+    if (!x) return true;
+    const int64_t dls = ln_fast(x, fraction) - t.lnx0_s58;
+    dl = std::ldexp((double)dls, -58);
+    if (dls <= 0) return true;
+    const uint64_t delta = (uint64_t)(((u128)(uint64_t)dls*t.c32_2523_q64) >> 59);   // S63
+    const int j = (int)(delta >> 57);
+    if (j > 15) return false;
+    // expm1(r) = r + r²·b : r² et r²·b sur mantisses normalisées (précision relative même si r est petit).
+    const uint64_t r = (delta - ((uint64_t)j << 57)) << 1;                // Q0.64, r < 1/64
+    uint64_t em = 0;
+    if (r) {
+        const uint32_t r38 = (uint32_t)(r >> 26);
+        uint32_t b = EMF[3];
+        for (int k = 2; k >= 0; --k) b = EMF[k] + (mulhi32(b, r38) >> 6);
+        const int sh = __builtin_clzll(r);                                 // ≥ 6
+        const uint32_t rn = (uint32_t)((r << sh) >> 32);
+        const uint32_t q = mulhi32(mulhi32(rn, rn), b);                    // r²·b = q·2^-(32+2sh)
+        em = r + (2*sh <= 32 ? (uint64_t)q << (32 - 2*sh) : 2*sh - 32 < 64 ? (uint64_t)q >> (2*sh - 32) : 0);
+    }
+    const uint64_t expm1 = em + mulhi(t.expm1[j], em) + t.expm1[j];
+    const uint64_t num = (uint64_t)(((u128)expm1*107) >> 7);               // c1·expm1, Q0.64
+    if (num >= ((uint64_t)43 << 56)) return false;
+    if (!num) return true;
+    const uint64_t den = ((uint64_t)6615 << 51) - (uint64_t)(((u128)num*299) >> 6);   // Q2.62
+    const double nf = std::ldexp((double)num, -64), df = std::ldexp((double)den, -62);
+    kappa = (0.8359375 + nf)/(6585030.0/524288)*(1/nf + 18.6875/df);
+    // ln g = ln num − ln den, puis L = exp(ln g/m1).
+    const int64_t lg = ln_fast(num, 64) - ln_fast(den, 62);
+    const int64_t y = (int64_t)(((i128)lg*(i128)t.c8192_1305_q61) >> 64);  // S8.55
+    mant = exp_fast(y, n);
+    // Borne : ln rapide (absolue) 2^-35, expm1 (relative) 2^-34, exponentielle (relative) 2^-35 ;
+    // f = 1 + c3·num/den propage l'erreur de num au dénominateur. Linéarisation valable tant que
+    // l'erreur relative de num reste petite (≤ 2^-12, soit dl ≳ 10^-7) ; au-delà (voisinage du zéro
+    // de l'EOTF), le second niveau décide. B majore l'erreur absolue de y = ln L ; e^B - 1 ≤ B·(1 + B).
+    const double E_LN = 0x1p-35, E_EM = 0x1p-34, E_EXP = 0x1p-35;
+    const double f = 1 + 18.6875*nf/df;
+    const double rnum = E_LN*(1/dl + 0.01) + E_EM + 0x1p-55/dl + 0x1p-60;
+    if (!(rnum <= 0x1p-12)) return false;
+    const double B = 6.2774*(1.01*f*rnum + 2*E_LN) + 0x1p-50;
+    bound = 1.25*(B*(1 + B) + 1.01*E_EXP);
+    return true;
+}
+
 unsigned pixel(const Params &p, const certified::ExactPixel &in, std::array<uint16_t, 3> &codes,
-               i128 (&linear)[3], double (&bound)[3]) {
+               i128 (&linear)[3], double (&bound)[3], int *tier) {
     // Signaux BL en Q0.64 (arrondis vers le bas ; 1 → 2^64 - 1).
     uint64_t sig[3];
     sig[0] = ratio64((uint64_t)std::clamp(in.luma, 0, 1023), 1023);
@@ -265,65 +360,79 @@ unsigned pixel(const Params &p, const certified::ExactPixel &in, std::array<uint
         }
         v[c] = s - p.offset[c];
     }
-    // Signaux LMS' à l'échelle 2^-(64+d+q), EOTF, encadrement.
+    // Signaux LMS' à l'échelle 2^-(64+d+q) et leur erreur d'entrée.
     const int fraction = scale + p.q;
-    uint64_t mant[3];
-    int expo[3];
-    double L[3], rel[3];
-    unsigned uncertain = 0;
+    i128 x[3];
+    double ex[3], xv[3];
     for (int i = 0; i < 3; ++i) {
-        const i128 x = (i128)p.n[3*i]*v[0] + (i128)p.n[3*i+1]*v[1] + (i128)p.n[3*i+2]*v[2];
-        double ex = std::ldexp(1.0, -fraction);
-        for (int j = 0; j < 3; ++j) ex += std::ldexp(std::abs((double)p.n[3*i+j]), -p.q)*ev[j];
-        ex *= 1.01;
-        const double xv = std::ldexp((double)x, -fraction);
-        double dl = 0;
-        mant[i] = 0; expo[i] = 0; L[i] = 0; rel[i] = 0;
-        if (x <= 0 || xv + ex <= certified::PQ_ZERO_LOW) {
-            if (!(xv + ex <= certified::PQ_ZERO_LOW)) uncertain = 7;   // zéro de l'EOTF à cheval
-            continue;
+        x[i] = (i128)p.n[3*i]*v[0] + (i128)p.n[3*i+1]*v[1] + (i128)p.n[3*i+2]*v[2];
+        ex[i] = std::ldexp(1.0, -fraction);
+        for (int j = 0; j < 3; ++j) ex[i] += std::ldexp(std::abs((double)p.n[3*i+j]), -p.q)*ev[j];
+        ex[i] *= 1.01;
+        xv[i] = std::ldexp((double)x[i], -fraction);
+    }
+    // Niveau 0 : EOTF rapide ; niveau 1 (si une composante reste indécise) : EOTF multi-mots.
+    unsigned uncertain = 0;
+    for (int level = 0; level < 2; ++level) {
+        if (tier) *tier = level;
+        uint64_t mant[3];
+        int expo[3];
+        double L[3], rel[3];
+        uncertain = 0;
+        for (int i = 0; i < 3; ++i) {
+            double dl = 0;
+            mant[i] = 0; expo[i] = 0; L[i] = 0; rel[i] = 0;
+            if (x[i] <= 0 || xv[i] + ex[i] <= certified::PQ_ZERO_LOW) {
+                if (!(xv[i] + ex[i] <= certified::PQ_ZERO_LOW)) uncertain = 7;   // zéro de l'EOTF à cheval
+                continue;
+            }
+            double kappa = 0, err = 0;
+            const bool ok = level == 0 ? eotf_fast((u128)x[i], fraction, mant[i], expo[i], dl, kappa, err)
+                                       : eotf((u128)x[i], fraction, mant[i], expo[i], dl, &kappa);
+            if (!ok) { uncertain = 7; continue; }
+            if (!mant[i]) { if (!(xv[i] + ex[i] <= certified::PQ_ZERO_LOW)) uncertain = 7; continue; }
+            L[i] = std::ldexp((double)mant[i], expo[i] - 63);
+            // Conditionnement κ (num et den exacts, marge 1,01) et erreur de l'EOTF en virgule fixe.
+            if (!(xv[i] - ex[i] > certified::PQ_ZERO_HIGH && kappa*ex[i] <= 1e-6*xv[i] && ex[i] <= 1e-6*xv[i] && dl > 0)) {
+                uncertain = 7; continue;
+            }
+            rel[i] = (level == 0 ? err : std::ldexp(1.0, -50)*(1 + 1/dl)) + 1.01*kappa*ex[i]/xv[i];
         }
-        double kappa = 0;
-        if (!eotf((u128)x, fraction, mant[i], expo[i], dl, &kappa)) { uncertain = 7; continue; }
-        if (!mant[i]) { if (!(xv + ex <= certified::PQ_ZERO_LOW)) uncertain = 7; continue; }
-        L[i] = std::ldexp((double)mant[i], expo[i] - 63);
-        // Conditionnement κ (num et den exacts, marge 1,01) et erreur de l'EOTF en virgule fixe.
-        if (!(xv - ex > certified::PQ_ZERO_HIGH && kappa*ex <= 1e-6*xv && ex <= 1e-6*xv && dl > 0)) { uncertain = 7; continue; }
-        rel[i] = std::ldexp(1.0, -50)*(1 + 1/dl) + 1.01*kappa*ex/xv;
-    }
-    // Matrice LMS→RGB en Q0.96 : L·2^96 = mant·2^(n+33).
-    u128 Lq[3];
-    for (int k = 0; k < 3; ++k) {
-        const int sh = expo[k] + 33;
-        Lq[k] = !mant[k] ? 0 : sh >= 0 ? (u128)mant[k] << sh : sh > -64 ? (u128)(mant[k] >> -sh) : 0;
-    }
-    for (int c = 0; c < 3; ++c) {
-        i128 R = 0;
-        double e = 3*std::ldexp(1.0, -96);
+        // Matrice LMS→RGB en Q0.96 : L·2^96 = mant·2^(n+33).
+        u128 Lq[3];
         for (int k = 0; k < 3; ++k) {
-            const int64_t mk = p.m[3*c + k];
-            const u128 am = (u128)(uint64_t)(mk < 0 ? -mk : mk);
-            const u128 lo = (uint64_t)Lq[k], hi = (uint64_t)(Lq[k] >> 64);
-            const i128 prod = (i128)((am*hi) << 3) + (i128)((am*lo) >> 61);   // |M|·L / 2^61, Q0.96
-            R += mk < 0 ? -prod : prod;
-            const double am_v = std::ldexp((double)am, -61);
-            e += ((am_v + p.m_error[3*c + k])*rel[k] + p.m_error[3*c + k])*L[k]*(1 + 1e-12) + std::ldexp(2.0, -96);
+            const int sh = expo[k] + 33;
+            Lq[k] = !mant[k] ? 0 : sh >= 0 ? (u128)mant[k] << sh : sh > -64 ? (u128)(mant[k] >> -sh) : 0;
         }
-        linear[c] = R;
-        bound[c] = e*(1 + 1e-9);
-        // Classement : code candidat par les seuils doubles, puis comparaisons exactes en Q0.96.
-        const double Rd = std::ldexp((double)R, -96);
-        int lo = 0, hi = PQ_THRESHOLDS;
-        while (lo < hi) { const int mid = (lo + hi)/2; if (pq_threshold(mid) < Rd) lo = mid + 1; else hi = mid; }
-        const int k = lo;
-        // Seuil exact T dans ]T_bas, suivant(T_bas)[ : borne basse comparée à suivant(T_bas) (R n'est pas
-        // un double), borne haute à T_bas.
-        auto T = [](int i) { return (i128)(u128)std::ldexp(pq_threshold(i), 96); };
-        auto T_up = [](int i) { return (i128)(u128)std::ldexp(std::nextafter(pq_threshold(i), 2.0), 96); };
-        const i128 eq = (i128)(u128)std::ceil(std::ldexp(bound[c], 96)) + 1;
-        const bool certain = (k == 0 || R - eq >= T_up(k - 1)) && (k == PQ_THRESHOLDS || R + eq <= T(k));
-        codes[c] = (uint16_t)k;
-        if (!certain || (uncertain & 7) == 7) uncertain |= 1u << c;
+        for (int c = 0; c < 3; ++c) {
+            i128 R = 0;
+            double e = 3*std::ldexp(1.0, -96);
+            for (int k = 0; k < 3; ++k) {
+                const int64_t mk = p.m[3*c + k];
+                const u128 am = (u128)(uint64_t)(mk < 0 ? -mk : mk);
+                const u128 lo = (uint64_t)Lq[k], hi = (uint64_t)(Lq[k] >> 64);
+                const i128 prod = (i128)((am*hi) << 3) + (i128)((am*lo) >> 61);   // |M|·L / 2^61, Q0.96
+                R += mk < 0 ? -prod : prod;
+                const double am_v = std::ldexp((double)am, -61);
+                e += ((am_v + p.m_error[3*c + k])*rel[k] + p.m_error[3*c + k])*L[k]*(1 + 1e-12) + std::ldexp(2.0, -96);
+            }
+            linear[c] = R;
+            bound[c] = e*(1 + 1e-9);
+            // Classement : code candidat par les seuils doubles, puis comparaisons exactes en Q0.96.
+            const double Rd = std::ldexp((double)R, -96);
+            int lo = 0, hi = PQ_THRESHOLDS;
+            while (lo < hi) { const int mid = (lo + hi)/2; if (pq_threshold(mid) < Rd) lo = mid + 1; else hi = mid; }
+            const int k = lo;
+            // Seuil exact T dans ]T_bas, suivant(T_bas)[ : borne basse comparée à suivant(T_bas) (R n'est pas
+            // un double), borne haute à T_bas.
+            auto T = [](int i) { return (i128)(u128)std::ldexp(pq_threshold(i), 96); };
+            auto T_up = [](int i) { return (i128)(u128)std::ldexp(std::nextafter(pq_threshold(i), 2.0), 96); };
+            const i128 eq = (i128)(u128)std::ceil(std::ldexp(bound[c], 96)) + 1;
+            const bool certain = (k == 0 || R - eq >= T_up(k - 1)) && (k == PQ_THRESHOLDS || R + eq <= T(k));
+            codes[c] = (uint16_t)k;
+            if (!certain || (uncertain & 7) == 7) uncertain |= 1u << c;
+        }
+        if (!uncertain) break;
     }
     return uncertain;
 }

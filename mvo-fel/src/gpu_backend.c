@@ -52,9 +52,9 @@ struct fel_gpu {
      * composantes indécises, correctifs du CPU certifié, diagnostic (lignes y % diag_stride). */
     int storable;
     pl_tex thresholds;
-    pl_buf rescue, patch, diag;
+    pl_buf rescue, patch, diag, left;
     int diag_stride, self_test;
-    int force_rescue;           /* tests : toutes les composantes reprises par le CPU certifié */
+    int force_rescue;           /* tests : toutes les composantes listées ; 1 CPU certifié, 2 second niveau GPU (virgule fixe) */
     /* Variante du mode exact (lot A2') : 0 double, 1 virgule fixe multi-mots ; tables GLSL, seuils
      * en Q0.96, paramètres de l'image (fixed_abi.h). */
     int fixed_mode, fixed_ready;
@@ -98,7 +98,7 @@ int fel_gpu_debug_fixed(void *context, const AVDOVIMetadata *metadata, const AVF
 /* Tests : toutes les composantes du mode exact reprises par le CPU certifié (chaîne de reprise). */
 void fel_gpu_force_rescue(void *context, int enabled)
 {
-    ((struct fel_gpu *)context)->force_rescue = enabled != 0;
+    ((struct fel_gpu *)context)->force_rescue = enabled == 2 ? 2 : enabled != 0;
 }
 
 /* Contexte de rendu supplémentaire (lot P) : reprend la précision, la variante et le résultat de
@@ -165,6 +165,7 @@ void fel_gpu_destroy(void *context)
         pl_tex_destroy(p->vk->gpu, &p->thr96);
         pl_buf_destroy(p->vk->gpu, &p->rescue);
         pl_buf_destroy(p->vk->gpu, &p->patch);
+        pl_buf_destroy(p->vk->gpu, &p->left);
         pl_buf_destroy(p->vk->gpu, &p->diag);
         for (int k = 0; k < 5; ++k) pl_timer_destroy(p->vk->gpu, &p->timers[k]);
     }
@@ -822,7 +823,7 @@ static const char fel_common_header[] =
 /* Seuils PQ en texture RG32UI 256 × 256 (dernier texel : +inf), liste de reprises et correctifs. */
 static int prepare_exact(struct fel_gpu *p)
 {
-    if (p->thresholds && p->rescue && p->patch) return 1;
+    if (p->thresholds && p->rescue && p->patch && p->left) return 1;
     pl_fmt fmt = pl_find_fmt(p->vk->gpu, PL_FMT_UINT, 2, 32, 32, PL_FMT_CAP_SAMPLEABLE);
     uint32_t *data = malloc(65536 * 2 * sizeof(uint32_t));
     if (!fmt || !data) { free(data); return 0; }
@@ -836,8 +837,10 @@ static int prepare_exact(struct fel_gpu *p)
     p->rescue = pl_buf_create(p->vk->gpu, pl_buf_params(.size = 4 + 4 * FEL_RESCUE_WORDS * (size_t)FEL_RESCUE_CAPACITY,
                                                         .storable = true, .host_readable = true, .host_writable = true));
     p->patch = pl_buf_create(p->vk->gpu, pl_buf_params(.size = 12 * (size_t)FEL_RESCUE_CAPACITY,
-                                                       .storable = true, .host_writable = true));
-    return p->rescue && p->patch;
+                                                       .storable = true, .host_readable = true, .host_writable = true));
+    p->left = pl_buf_create(p->vk->gpu, pl_buf_params(.size = 4, .storable = true, .host_readable = true,
+                                                      .host_writable = true));
+    return p->rescue && p->patch && p->left;
 }
 
 static struct pl_buffer_var uint_array(const char *name, int count, size_t offset)
@@ -855,7 +858,7 @@ static int precise_descriptors(struct fel_gpu *p, struct pl_shader_desc *d, stru
  * avec le dernier trouvé ne dépasse pas 4 (règle de liste du rendu exact). */
 static int apply_patch(struct fel_gpu *p, const char *header, const uint32_t *patch, uint32_t count)
 {
-    pl_buf_write(p->vk->gpu, p->patch, 0, patch, 12 * (size_t)count);
+    if (patch) pl_buf_write(p->vk->gpu, p->patch, 0, patch, 12 * (size_t)count);   /* sinon : déjà sur le GPU */
     struct pl_buffer_var rescue_vars[2], var = uint_array("fel_patch", 3 * FEL_RESCUE_CAPACITY, 0);
     struct pl_shader_desc desc[17];
     precise_descriptors(p, desc, rescue_vars, PL_DESC_ACCESS_READONLY);
@@ -1149,6 +1152,78 @@ static int prepare_fixed(struct fel_gpu *p)
 
 /* Mode exact en virgule fixe multi-mots (src/shaders/fixed_*.glsl, modèle src/fixed_point.cpp) ; mêmes
  * liste de reprises, correctifs et diagnostic (format virgule fixe) que le mode exact en double. */
+/* Second niveau du mode exact en virgule fixe (lot L) : les entrées de la liste des indécises sont
+ * reprises sur le GPU par l'EOTF multi-mots (une invocation par entrée, shader à part : la composition
+ * ne paie pas ses registres), puis par le CPU certifié si elles restent indécises. Correctifs appliqués
+ * par la passe commune ; sans reprise CPU, ils restent sur le GPU. d : descripteurs de la composition. */
+static int resolve_fixed(struct fel_gpu *p, const AVDOVIMetadata *metadata, const char *header,
+                         const struct pl_shader_desc *d, const struct pl_shader_var *parameters, const char *patch_header)
+{
+    uint32_t count = 0, left = 0;
+    if (!pl_buf_read(p->vk->gpu, p->rescue, 0, &count, sizeof(count))) return 0;
+    if (count > FEL_RESCUE_CAPACITY) {
+        fprintf(stderr, "mvo-fel : %u composantes à reprendre, capacité %d dépassée\n", count, FEL_RESCUE_CAPACITY);
+        return 0;
+    }
+    if (!count) return 1;
+    pl_buf_write(p->vk->gpu, p->left, 0, &left, sizeof(left));
+    struct pl_buffer_var patch_var = uint_array("fel_patch", 3 * FEL_RESCUE_CAPACITY, 0), left_var = uint_array("fel_left", 1, 0);
+    struct pl_shader_desc desc[16];
+    memcpy(desc, d, 14 * sizeof(*desc));                                       /* sources, seuils Q0.96, liste */
+    desc[14] = (struct pl_shader_desc){.desc = {.name = "fel_patch_buf", .type = PL_DESC_BUF_STORAGE,
+        .access = PL_DESC_ACCESS_WRITEONLY}, .binding = {.object = p->patch}, .buffer_vars = &patch_var, .num_buffer_vars = 1};
+    desc[15] = (struct pl_shader_desc){.desc = {.name = "fel_left_buf", .type = PL_DESC_BUF_STORAGE,
+        .access = PL_DESC_ACCESS_READWRITE}, .binding = {.object = p->left}, .buffer_vars = &left_var, .num_buffer_vars = 1};
+    const struct pl_shader_var variables[3] = {parameters[0], parameters[1],
+        {.var = {.name = "fel_level_n", .type = PL_VAR_UINT, .dim_v = 1, .dim_m = 1, .dim_a = 1}, .data = &count, .dynamic = true}};
+    char body[2048];
+    snprintf(body, sizeof(body),
+        "uint i=gl_GlobalInvocationID.x;if(i<fel_level_n){uint b=%du*i,w1=fel_rescue[b+1u];"
+        "int seg[3];vec3 out3;uvec4 Rd[3];float Ed[3];uint qd[3];"
+        "uint mask=fx_render(int(w1&0xffffu),int(fel_rescue[b+2u]),int(fel_rescue[b+3u]),int(fel_rescue[b+4u]),"
+        "int(fel_rescue[b+5u]),int(fel_rescue[b+6u]),int(fel_rescue[b+7u]),int(fel_rescue[b+8u]),int(fel_rescue[b+9u]),"
+        "true,seg,out3,Rd,Ed,qd);if(%d==1)mask=7u;"
+        "fel_patch[3u*i]=fel_rescue[b];fel_patch[3u*i+1u]=(qd[0]&0xffffu)|((qd[1]&0xffffu)<<16);"
+        "fel_patch[3u*i+2u]=qd[2]&0xffffu;fel_rescue[b+1u]=(w1&0x0fffffffu)|(mask<<28);"
+        "if(mask!=0u)atomicAdd(fel_left,1u);}",
+        FEL_RESCUE_WORDS, p->force_rescue);
+    pl_shader sh = pl_dispatch_begin(p->dispatch);
+    int ok = pl_shader_custom(sh, &(struct pl_custom_shader){.header = header, .body = body,
+        .input = PL_SHADER_SIG_NONE, .output = PL_SHADER_SIG_NONE, .descriptors = desc, .num_descriptors = 16,
+        .variables = variables, .num_variables = 3, .compute = true, .compute_group_size = {64, 1}});
+    ok = ok && pl_dispatch_compute(p->dispatch, pl_dispatch_compute_params(.shader = &sh,
+                                   .dispatch_size = {(int)((count + 63) / 64), 1, 1}));
+    pl_dispatch_abort(p->dispatch, &sh);
+    ok = ok && pl_buf_read(p->vk->gpu, p->left, 0, &left, sizeof(left));
+    if (!ok) return 0;
+    if (!left) return apply_patch(p, patch_header, NULL, count);
+    /* Indécises restantes : CPU certifié sur ces seules entrées, correctifs complétés sur l'hôte. */
+    uint32_t *entries = malloc(4 * FEL_RESCUE_WORDS * (size_t)count), *patch = malloc(12 * (size_t)count),
+             *subset = malloc(4 * FEL_RESCUE_WORDS * (size_t)left), *index = malloc(4 * (size_t)left);
+    uint16_t *codes = malloc(6 * (size_t)left);
+    ok = entries && patch && subset && index && codes &&
+         pl_buf_read(p->vk->gpu, p->rescue, 4, entries, 4 * FEL_RESCUE_WORDS * (size_t)count) &&
+         pl_buf_read(p->vk->gpu, p->patch, 0, patch, 12 * (size_t)count);
+    uint32_t n = 0;
+    for (uint32_t i = 0; ok && i < count; ++i)
+        if (entries[FEL_RESCUE_WORDS * i + 1] >> 28 && n < left) {
+            memcpy(subset + FEL_RESCUE_WORDS * n, entries + FEL_RESCUE_WORDS * i, 4 * FEL_RESCUE_WORDS);
+            index[n++] = i;
+        }
+    const int undecided = ok && n ? fel_certified_codes(metadata, subset, (int)n, codes) : 0;
+    ok = ok && undecided >= 0;
+    for (uint32_t k = 0; ok && k < n; ++k) {
+        patch[3*index[k] + 1] = codes[3*k] | (uint32_t)codes[3*k + 1] << 16;
+        patch[3*index[k] + 2] = codes[3*k + 2];
+        const uint32_t mask = subset[FEL_RESCUE_WORDS * k + 1] >> 28;
+        p->rescued += (mask & 1) + (mask >> 1 & 1) + (mask >> 2 & 1);
+    }
+    if (ok) p->undecided += undecided;
+    ok = ok && apply_patch(p, patch_header, patch, count);
+    free(entries); free(patch); free(subset); free(index); free(codes);
+    return ok;
+}
+
 static int render_fixed(struct fel_gpu *p, const AVDOVIMetadata *metadata)
 {
     if (!upload_coefficients(p, metadata) || !prepare_exact(p) || !prepare_fixed(p)) return 0;
@@ -1186,7 +1261,7 @@ static int render_fixed(struct fel_gpu *p, const AVDOVIMetadata *metadata)
         "ivec2 xy0=ivec2(gl_FragCoord.xy);bool inside=xy0.x<%d&&xy0.y<%d;ivec2 xy=min(xy0,ivec2(%d,%d));"
         "int code,tb,tr,Db,te0,te1,te2,Dl,Dc;fel_inputs(xy,code,tb,tr,Db,te0,te1,te2,Dl,Dc);"
         "int seg[3];vec3 out3;uvec4 Rd[3];float Ed[3];uint qd[3];"
-        "uint mask=fx_render(code,tb,tr,Db,te0,te1,te2,Dl,Dc,seg,out3,Rd,Ed,qd);",
+        "uint mask=fx_render(code,tb,tr,Db,te0,te1,te2,Dl,Dc,false,seg,out3,Rd,Ed,qd);",
         p->width, p->height, p->width - 1, p->height - 1);
     if (diag_rows && used > 0 && used < (int)sizeof(body))
         used += snprintf(body + used, sizeof(body) - used,
@@ -1204,7 +1279,7 @@ static int render_fixed(struct fel_gpu *p, const AVDOVIMetadata *metadata)
             .output_w = p->width, .output_h = p->height, .compute = true, .compute_group_size = {16, 16}});
         ok = ok && pl_dispatch_finish(p->dispatch, pl_dispatch_params(.timer = p->timers[3], .shader = &sh, .target = p->target));
         pl_dispatch_abort(p->dispatch, &sh);
-        ok = ok && resolve_rescues(p, metadata, patch_header);
+        ok = ok && resolve_fixed(p, metadata, header, d, parameters, patch_header);
     }
     free(prefix); free(header); free(patch_header);
     return ok;

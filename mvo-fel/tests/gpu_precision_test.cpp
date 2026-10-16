@@ -16,6 +16,7 @@ void fel_gpu_destroy(void *);
 int fel_gpu_render(void *, const AVDOVIMetadata *, const AVFrame *, const AVFrame *, uint16_t *);
 int fel_gpu_set_precision(void *, int);
 void fel_gpu_force_rescue(void *, int);
+int fel_gpu_fixed_variant(const void *);
 void fel_gpu_certified(void *, long long *, long long *);
 }
 using namespace muxiveo::fel;
@@ -70,22 +71,30 @@ int main() {
     const char *device = std::getenv("MVO_FEL_TEST_DEVICE");
     void *gpu = fel_gpu_create(64, 32, device);
     if (!gpu) return 77;
+    // Variante imposée (MVO_FEL_GPU_FIXED) : un refus de l'auto-test est un échec, jamais un repli silencieux.
+    const char *forced_variant = std::getenv("MVO_FEL_GPU_FIXED");
     if (!fel_gpu_set_precision(gpu, FEL_PRECISION_EXACT)) {
-        std::cout << "GPU sans calcul double : modes exact et standard non testés\n";
+        std::cout << (forced_variant ? "variante imposée refusée par l'auto-test (ou GPU sans calcul double)\n"
+                                     : "GPU sans calcul double : modes exact et standard non testés\n");
         fel_gpu_destroy(gpu);
-        return 77;
+        return forced_variant ? 1 : 77;
+    }
+    if (forced_variant && fel_gpu_fixed_variant(gpu) != (std::string(forced_variant) == "1")) {
+        std::cout << "variante imposée non retenue\n";
+        return 1;
     }
     bool ok = true;
     auto *metadata = av_dovi_metadata_alloc(nullptr);
     std::vector<uint16_t> rgba(64*32*4);
     // forced / flat : mode exact, toutes les composantes reprises par le CPU certifié, sur couches
     // aléatoires puis uniformes (plages d'entrées identiques propagées par la passe de correctifs).
-    for (const std::string mode : {"identity", "real", "mmr", "forced", "flat"}) {
-        const bool forced = mode == "forced" || mode == "flat";
+    // level1 : toutes listées puis reprises par le second niveau GPU (virgule fixe, lot L).
+    for (const std::string mode : {"identity", "real", "mmr", "forced", "flat", "level1"}) {
+        const bool forced = mode == "forced" || mode == "flat" || mode == "level1";
         metadata_for(*metadata, forced ? "real" : mode);
         const Mapping m(*metadata);
         const int low = mode == "mmr" ? 0 : forced || mode == "real" ? 200 : 64, high = mode == "mmr" ? 1023 : forced || mode == "real" ? 760 : 940;
-        fel_gpu_force_rescue(gpu, forced);
+        fel_gpu_force_rescue(gpu, mode == "level1" ? 2 : forced);
         for (const int precision : {FEL_PRECISION_EXACT, FEL_PRECISION_STANDARD, FEL_PRECISION_FAST}) {
             if (forced && precision != FEL_PRECISION_EXACT) continue;
             if (!fel_gpu_set_precision(gpu, precision)) return 1;
@@ -127,6 +136,8 @@ int main() {
             // aléatoire : tous les pixels.
             if ((mode == "flat" && rescued - rescued_before > 200*4*32*3) ||
                 (mode == "forced" && rescued - rescued_before < 200*64*32*3*9/10) || undecided != undecided_before) ok = false;
+            // Second niveau GPU (virgule fixe) : le CPU ne reprend presque rien.
+            if (mode == "level1" && fel_gpu_fixed_variant(gpu) && rescued - rescued_before > 200*64*32*3/100) ok = false;
             if (worst > (precision == FEL_PRECISION_EXACT ? 0 : precision == FEL_PRECISION_STANDARD ? 1 : 65535)) ok = false;
         }
     }

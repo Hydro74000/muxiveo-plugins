@@ -11,6 +11,8 @@
 //   2^(j/64) et Taylor ; erreur relative ≤ 2^-50·(1 + 1/ln(x/x0)) (docs/2026-10-16-a2-virgule-fixe.md).
 // - Matrice LMS→RGB en S2.61, valeurs linéaires et seuils PQ en Q0.96 ; classement comme le CPU
 //   certifié, composantes indécises reprises par certified::classify.
+// - Deux niveaux (lot L) : EOTF rapide (produits 32 × 32 bits, borne démontrée), puis EOTF multi-mots
+//   pour les seuls pixels indécis (docs/2026-10-16-eotf-deux-niveaux.md).
 #pragma once
 
 #include "certified.hpp"
@@ -57,8 +59,15 @@ bool prepare(const Mapping &mapping, const AVDOVIMetadata &metadata, Params &par
 // kappa (facultatif) : conditionnement relatif, calculé sur num et den exacts.
 bool eotf(u128 x, int fraction, uint64_t &mant, int &n, double &dl, double *kappa = nullptr);
 
+// EOTF rapide, premier niveau du rendu (lot L) : même découpage que eotf, produits 32 × 32 bits
+// (additions sur 64 bits), séries courtes, ln g = ln num − ln den (sans division). L = mant·2^(n-63) ;
+// bound majore l'erreur relative de L (hors erreur d'entrée), kappa comme eotf. false : hors cadre
+// (le second niveau, eotf, décide). Modèle exact du shader (fx_eotf_fast).
+bool eotf_fast(u128 x, int fraction, uint64_t &mant, int &n, double &dl, double &kappa, double &bound);
+
 // Valeurs linéaires R, G, B en Q0.96 (signées) et bornes d'erreur (valeur) d'un pixel ; masque
 // des composantes non certaines (domaine ou borne). Codes candidats classés sur la table Q0.96.
+// Deux niveaux : EOTF rapide, puis EOTF multi-mots si une composante reste indécise.
 unsigned pixel(const Params &params, const certified::ExactPixel &input, std::array<uint16_t, 3> &codes,
-               i128 (&linear)[3], double (&bound)[3]);
+               i128 (&linear)[3], double (&bound)[3], int *tier = nullptr);
 }

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: LGPL-2.1-or-later
-// Rendu exact d'un pixel en virgule fixe (lot A2') : traduction de fixed::pixel (src/fixed_point.cpp)
-// à partir des entrées entières exactes (fel_inputs). Codes candidats dans out3, masque des
-// composantes non certaines en retour ; R (Q0.96), bornes et codes pour le diagnostic.
+// Rendu exact d'un pixel en virgule fixe (lots A2' et L) : traduction de fixed::pixel (src/fixed_point.cpp)
+// à partir des entrées entières exactes (fel_inputs), EOTF à deux niveaux. Codes candidats dans out3,
+// masque des composantes non certaines en retour ; R (Q0.96), bornes et codes pour le diagnostic.
 // Décalages des paramètres : fixed_abi.h (FX_CURVE0, FX_CURVE, FX_GLOBAL définis avant ce fichier).
 
 // Seuil T_bas·2^96 (trois mots) ; fx_threshold_up : suivant(T_bas), au-dessus du seuil exact (le
@@ -13,9 +13,63 @@ uvec4 fx_threshold_up(int k) {
     return x4add(uvec4(t.xyz, 0u), x4shl(uvec4(1u, 0u, 0u, 0u), int(t.w)));
 }
 
-uint fx_render(int code, int tb, int tr, int Db, int te0, int te1, int te2, int Dl, int Dc,
-               out int seg[3], out vec3 out3, out uvec4 Rd[3], out float Ed[3], out uint qd[3]) {
+// EOTF (rapide ou multi-mots), encadrement relatif, matrice LMS→RGB (S2.61) en Q0.96, bornes et
+// classement exact sur les seuils Q0.96. Masque des composantes non certaines (fixed::pixel, un niveau).
+uint fx_finish(uvec4 xs[3], float exs[3], float xvs[3], int fraction, bool multiword, bool unc,
+               out vec3 out3, out uvec4 Rd[3], out float Ed[3], out uint qd[3]) {
     const float U96 = 1.2621774e-29;                                              // 2^-96
+    uvec4 Lq[3];
+    float Lf[3], rel[3];
+    for (int i = 0; i < 3; ++i) {
+        uvec4 x = xs[i];
+        float ex = exs[i], xv = xvs[i];
+        Lq[i] = uvec4(0u); Lf[i] = 0.0; rel[i] = 0.0;
+        bool zero = xv*(1.0 + 1e-5) + ex <= 7.30955e-7;
+        if (x4sign(x) || x4zero(x) || zero) { if (!zero) unc = true; continue; }
+        int n; float dl, kappa, err = 0.0; bool okx = true;
+        uvec2 mant = multiword ? fx_eotf(x, fraction, n, dl, kappa, okx) : fx_eotf_fast(x, fraction, n, dl, kappa, err, okx);
+        if (!okx) { unc = true; continue; }
+        if ((mant.x | mant.y) == 0u) { if (!zero) unc = true; continue; }
+        if (!(xv*(1.0 - 1e-5) - ex > 7.30957e-7 && kappa*ex <= 1e-6*xv && ex <= 1e-6*xv && dl > 0.0)) { unc = true; continue; }
+        rel[i] = (multiword ? 8.8817842e-16*(1.0 + 1.0/dl) : err) + 1.01*kappa*ex/xv;   // 2^-50
+        Lf[i] = x2float(mant)*exp2(float(n - 63));
+        int sh = n + 33;
+        Lq[i] = sh >= 0 ? x4shl(uvec4(mant, 0u, 0u), sh) : (sh > -64 ? x4shr(uvec4(mant, 0u, 0u), -sh) : uvec4(0u));
+    }
+    uint mask = unc ? 7u : 0u;
+    for (int c = 0; c < 3; ++c) {
+        uvec4 R = uvec4(0u);
+        float e = 5.0*U96;
+        for (int k = 0; k < 3; ++k) {
+            uvec2 m = fp2(FX_GLOBAL + 33 + 2*(3*c + k)), am = x2abs(m);
+            uvec4 prod = x4add(x4shl(x2mul(am, Lq[k].zw), 3), x4shr(x2mul(am, Lq[k].xy), 61));
+            R = x2sign(m) ? x4sub(R, prod) : x4add(R, prod);
+            float merr = fpf(FX_GLOBAL + 51 + 3*c + k);
+            e += ((x2float(am)*4.3368087e-19 + merr)*rel[k] + merr)*Lf[k]*1.000001 + 2.0*U96;
+        }
+        e *= 1.001;
+        float Rf = x4float(R)*U96;
+        int qc = Rf <= 0.0 ? 0 : Rf >= 1.0 ? 65535 : clamp(int(floor(g_oetf(Rf)*65535.0 + 0.5)), 0, 65535);
+        for (int i = 0; i < 8 && qc < 65535 && x4lt(fx_threshold(qc), R); ++i) ++qc;
+        for (int i = 0; i < 8 && qc > 0 && !x4lt(fx_threshold(qc - 1), R); ++i) --qc;
+        // Encadrement en Q0.96 : unités 2^-96 tant qu'il tient sur 64 bits, sinon 2^-64 (borne du
+        // premier niveau, jusqu'à ≈ 10^-8) ; arrondi vers le haut d'une unité.
+        float e96 = e*7.9228163e28;
+        uvec4 eq = e96 < 1.8e19 ? uvec4(x2add(x2from(e96), uvec2(1u, 0u)), 0u, 0u)
+                                : uvec4(0u, x2add(x2from(e*1.8446744e19), uvec2(1u, 0u)), 0u);
+        bool certain = !unc && e < 0.5 && (qc == 0 || !x4lt(x4sub(R, eq), fx_threshold_up(qc - 1))) &&
+                       (qc == 65535 || !x4lt(fx_threshold(qc), x4add(R, eq)));
+        if (!certain) mask |= 1u << c;
+        out3[c] = (float(qc) + 0.25)/65535.0;
+        Rd[c] = R; Ed[c] = e; qd[c] = uint(qc) | (certain ? 65536u : 0u);
+    }
+    return mask;
+}
+
+// multiword : EOTF du second niveau (passe sur la liste des indécises), sinon EOTF rapide (composition).
+// Constante à chaque appel : un shader ne contient qu'une EOTF, et n'en paie que les registres.
+uint fx_render(int code, int tb, int tr, int Db, int te0, int te1, int te2, int Dl, int Dc, bool multiword,
+               out int seg[3], out vec3 out3, out uvec4 Rd[3], out float Ed[3], out uint qd[3]) {
     int d = int(fp(0)), q = int(fp(1));
     bool residual = fp(2) != 0u;
     int scale = 64 + d, fraction = scale + q;
@@ -91,55 +145,17 @@ uint fx_render(int code, int tb, int tr, int Db, int te0, int te1, int te2, int 
         }
         v[c] = x4sub(s, fp4(FX_GLOBAL + 12 + 4*c));
     }
-    // Signaux LMS' (échelle 2^-fraction), EOTF et encadrement relatif.
-    bool unc = !ok;
-    uvec4 Lq[3];
-    float Lf[3], rel[3];
+    // Signaux LMS' (échelle 2^-fraction) et leur erreur d'entrée.
     float sq = exp2(-float(q)), sf = exp2(-float(fraction));
+    uvec4 xs[3];
+    float exs[3], xvs[3];
     for (int i = 0; i < 3; ++i) {
-        uvec4 x = x4add(x4add(x4muls(v[0], int(fp(FX_GLOBAL + 24 + 3*i))), x4muls(v[1], int(fp(FX_GLOBAL + 25 + 3*i)))),
-                        x4muls(v[2], int(fp(FX_GLOBAL + 26 + 3*i))));
+        xs[i] = x4add(x4add(x4muls(v[0], int(fp(FX_GLOBAL + 24 + 3*i))), x4muls(v[1], int(fp(FX_GLOBAL + 25 + 3*i)))),
+                      x4muls(v[2], int(fp(FX_GLOBAL + 26 + 3*i))));
         float ex = sf;
         for (int j = 0; j < 3; ++j) ex += abs(float(int(fp(FX_GLOBAL + 24 + 3*i + j))))*sq*ev[j];
-        ex *= 1.01;
-        float xv = x4float(x)*sf;
-        Lq[i] = uvec4(0u); Lf[i] = 0.0; rel[i] = 0.0;
-        bool zero = xv*(1.0 + 1e-5) + ex <= 7.30955e-7;
-        if (x4sign(x) || x4zero(x) || zero) { if (!zero) unc = true; continue; }
-        int n; float dl, kappa; bool okx = true;
-        uvec2 mant = fx_eotf(x, fraction, n, dl, kappa, okx);
-        if (!okx) { unc = true; continue; }
-        if ((mant.x | mant.y) == 0u) { if (!zero) unc = true; continue; }
-        if (!(xv*(1.0 - 1e-5) - ex > 7.30957e-7 && kappa*ex <= 1e-6*xv && ex <= 1e-6*xv && dl > 0.0)) { unc = true; continue; }
-        rel[i] = 8.8817842e-16*(1.0 + 1.0/dl) + 1.01*kappa*ex/xv;                // 2^-50
-        Lf[i] = x2float(mant)*exp2(float(n - 63));
-        int sh = n + 33;
-        Lq[i] = sh >= 0 ? x4shl(uvec4(mant, 0u, 0u), sh) : (sh > -64 ? x4shr(uvec4(mant, 0u, 0u), -sh) : uvec4(0u));
+        exs[i] = ex*1.01;
+        xvs[i] = x4float(xs[i])*sf;
     }
-    // Matrice LMS→RGB (S2.61) en Q0.96, bornes, classement exact sur les seuils Q0.96.
-    uint mask = unc ? 7u : 0u;
-    for (int c = 0; c < 3; ++c) {
-        uvec4 R = uvec4(0u);
-        float e = 5.0*U96;
-        for (int k = 0; k < 3; ++k) {
-            uvec2 m = fp2(FX_GLOBAL + 33 + 2*(3*c + k)), am = x2abs(m);
-            uvec4 prod = x4add(x4shl(x2mul(am, Lq[k].zw), 3), x4shr(x2mul(am, Lq[k].xy), 61));
-            R = x2sign(m) ? x4sub(R, prod) : x4add(R, prod);
-            float merr = fpf(FX_GLOBAL + 51 + 3*c + k);
-            e += ((x2float(am)*4.3368087e-19 + merr)*rel[k] + merr)*Lf[k]*1.000001 + 2.0*U96;
-        }
-        e *= 1.001;
-        float Rf = x4float(R)*U96;
-        int qc = Rf <= 0.0 ? 0 : Rf >= 1.0 ? 65535 : clamp(int(floor(g_oetf(Rf)*65535.0 + 0.5)), 0, 65535);
-        for (int i = 0; i < 8 && qc < 65535 && x4lt(fx_threshold(qc), R); ++i) ++qc;
-        for (int i = 0; i < 8 && qc > 0 && !x4lt(fx_threshold(qc - 1), R); ++i) --qc;
-        float e96 = e*7.9228163e28;
-        uvec4 eq = uvec4(x2add(x2from(e96), uvec2(1u, 0u)), 0u, 0u);
-        bool certain = !unc && e96 < 1.8e19 && (qc == 0 || !x4lt(x4sub(R, eq), fx_threshold_up(qc - 1))) &&
-                       (qc == 65535 || !x4lt(fx_threshold(qc), x4add(R, eq)));
-        if (!certain) mask |= 1u << c;
-        out3[c] = (float(qc) + 0.25)/65535.0;
-        Rd[c] = R; Ed[c] = e; qd[c] = uint(qc) | (certain ? 65536u : 0u);
-    }
-    return mask;
+    return fx_finish(xs, exs, xvs, fraction, multiword, !ok, out3, Rd, Ed, qd);
 }
