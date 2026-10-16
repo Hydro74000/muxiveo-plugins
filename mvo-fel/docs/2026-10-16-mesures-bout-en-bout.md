@@ -1,38 +1,75 @@
 # Mesures de bout en bout (lot M)
 
-16 octobre 2026. Lot M du [plan de précision certifiée](2026-10-16-plan-precision-certifiee.md). Il s'agit de savoir si le recouvrement ([P](2026-10-16-recouvrement.md)) ou les Tensor Cores (T) servent dans un vrai workflow, sur un GPU partagé avec l'encodeur.
+16 octobre 2026. Lot M du [plan de précision certifiée](2026-10-16-plan-precision-certifiee.md).
+
+La question posée : le FEL ralentit-il un encodage réel, et qu'est-ce qui limite le débit ? Selon la réponse, on sait si le recouvrement ([P](2026-10-16-recouvrement.md)) ou les Tensor Cores (T) servent.
+
+Cette note remplace une première version. Celle-ci tirait ses conclusions de la seule durée totale des workflows, sur des extraits de 10 s. Elle ne distinguait ni le calcul FEL, ni le transport, ni l'encodeur, ni les coûts fixes.
 
 ## Protocole
 
-- **Workflow.** Muxiveo complet (`scripts/benchmark_fel_workflow.py`), extrait de 10 s de Toy Story 5 (P7 FEL, 241 images UHD), FEL en mode Lent sur la RTX 4070 Ti SUPER, décodage Vulkan Video.
-- **Mesures.** Deux passages par cas, médianes. La référence BL est le même workflow sans reconstruction FEL.
-- **Images en vol.** 1 ou 2 (P).
+- **Workflow.** Muxiveo complet (`scripts/benchmark_fel_workflow.py`), FEL en mode Lent sur la RTX 4070 Ti SUPER, décodage Vulkan Video.
+- **Extraits.** 20 s (environ 480 images UHD) de Saving Private Ryan (contenu MMR) et de Toy Story 5 (polynômes), en P7 FEL.
+- **Encodeurs.** NVEncC HEVC 10 bits sur le même GPU :
+  - preset par défaut, qui encode à environ 116 i/s ;
+  - réglage « standard HQ » de l'utilisateur, à environ 50 i/s : VBR 34 Mbit/s, 2 passes au quart, UHQ, lookahead 24, AQ temporelle.
+- **Mesures isolées (`--isolate`).** Elles reprennent les réglages exacts que le workflow transmet au producteur, ainsi que la commande exacte de l'encodeur :
+  - **A** : FEL seul, écrit par le plugin sur `/dev/null` ;
+  - **B** : encodeur seul, nourri par le même NUT via un pipe ;
+  - **C** : workflow complet.
+- **Chronologie.** Le banc horodate chaque étape et chaque ligne d'outil.
 
-## Résultats
+Les mesures « plugin seul » antérieures passaient par un lecteur Python, qui plafonnait vers 1,9 Go/s, soit environ 78 i/s en Y'CbCr 10 bits UHD. Le Standard et le Rapide y paraissaient limités vers 78 i/s ; c'était le lecteur, pas le plugin.
 
-| Encodeur (même GPU que le FEL pour NVEncC) | BL | FEL, 1 image en vol | FEL, 2 images en vol | Goulot (mesures internes du plugin) |
-|---|---:|---:|---:|---|
-| NVEncC HEVC 10 bits, preset par défaut | 16,0–16,2 s | 21,55 s (+33 %) | 21,45 s (+34 %) | lecture du pipe NUT par NVEncC (≈ 65 i/s) |
-| NVEncC « standard HQ » (VBR 34 Mbit/s, 2 passes au quart, UHQ, lookahead 24, AQ temporelle) | 19,0 s | 24,81 s (+30 %) | 24,59 s (+29 %) | lecture du pipe par NVEncC |
-| x265 medium (CPU) | 34,5–34,7 s | 34,47 s (+0 %) | 34,81 s (+0 %) | x265 (≈ 7 i/s) |
-| RIFE 24 → 59,94 i/s (Équilibré, Vulkan) + NVEncC HQ, 603 images en sortie | 54,3–54,8 s | 58,79 s (+8 %) | 59,25 s (+8 %) | RIFE (le plugin attend 31 à 37 s sur 37) |
+## Cause principale du ralentissement : l'analyse d'entrée de NVEncC
 
-**Composition FEL.** Elle reste à 7,8–8 ms par image avec NVEncC, même en UHQ : aucune concurrence mesurable. Avec RIFE sur le même GPU, elle passe à 15 ms sans devenir le goulot.
+Les mesures horodatées montrent que NVEncC, nourri par un NUT d'images brutes, met 8 à 10 s avant sa première image encodée. Ensuite, il encode à environ 126 i/s.
 
-**Surcoût du FEL.** Sur ces extraits de 10 s, il tient surtout à des coûts fixes par job : ouverture de 1,1 à 2,2 s (vérification Vulkan Video sur 96 images, auto-test, compilation des shaders), plus la préparation FEL. Sur un film entier, ils deviennent négligeables.
+Son analyse d'entrée par défaut porte sur 5 s. Elle accumule une centaine d'images de 25 Mo à environ 13 i/s, avec le FEL comme avec le même NUT servi depuis le cache. Pendant ce temps, le FEL reste bloqué sur le pipe. Une analyse jusqu'à 1 s évite ce comportement, alors qu'avec 2 s il réapparaît.
 
-**Régime établi.** Le FEL produit 61 à 65 i/s avec 1 image en vol, autant que ce que NVEncC HQ absorbe. Avec 2 images en vol, il monte vers 78 i/s et ne peut plus freiner l'encodeur.
+| Analyse d'entrée (`--input-analyze`) | Première image encodée | Total, 483 images |
+|---|---:|---:|
+| défaut | 8,4 s | 11,9 s |
+| 0,05 à 1 s | 1,6 s | 6,2 à 7,3 s |
+| 2 s | 10,3 s | 13,8 s |
 
-## Gain maximal des Tensor Cores (T)
+**Correctif dans Muxiveo** (`2674d87`) :
+- `--input-analyze 0.2` sur l'entrée NUT, car le NUT décrit déjà son flux ;
+- `--fps` égal à la cadence de la source. Le NUT ne porte aucune cadence, et NVEncC la devinait : 24/1 ou 25/1 pour du 23,976. Les horodatages restent ceux du producteur (`--avsync vfr`), vérifié en cadence fixe et en cadence variable.
 
-Les Tensor Cores ne pourraient reprendre que l'accumulation des coefficients du MMR. Les monômes, l'EOTF, les divisions et le classement restent scalaires.
+## Durées des workflows
 
-Pour mesurer cette accumulation, elle est calculée une seconde fois, multipliée par un zéro que le compilateur ne peut pas deviner. Les codes restent identiques et aucune reprise n'apparaît. Résultat sur Ryan (contenu MMR) : composition 9,07 → 10,35–10,41 ms, soit **1,3 ms par image (14 %)**. Le gain est nul sur le contenu à polynômes (Toy Story 5, Moana).
+Extraits de 20 s, médianes de 2 passages.
 
-Dans le pire cas mesuré (RIFE et NVEncC sur le même GPU), ce gain vaudrait au plus 241 × 1,3 ms ≈ 0,3 s sur 54 s, soit moins de 1 %.
+| Cas | BL | FEL avant correctif | FEL après correctif |
+|---|---:|---:|---:|
+| Ryan, NVEncC par défaut | 22,7 s | 34,9 s (+56 %) | 27,5 s (+21 %) |
+| Ryan, NVEncC HQ | 28,5 s | 38,5 s (+37 %) | 30,8 s (+8 %) |
+| Toy Story 5, NVEncC par défaut | 18,7 s | 28,0 s (+49 %) | 23,8 s (+27 %) |
+| Toy Story 5, NVEncC HQ | 24,7 s | 36,1 s (+46 %) | 26,7 s (+8 %) |
 
-## Décisions
+**Ce qui reste :**
 
-- **T est classé.** Il est réouvrable si un workflow devient limité par le calcul FEL.
-- **P est conservé, 2 images en vol par défaut.** Il donne une marge en régime établi face à NVEncC et accélère le mode Rapide sur iGPU.
-- **Option d'ABI `mvo_fel_set_render_workers` (Q).** Muxiveo pourra passer à 1 image en vol quand l'interpolation RIFE tourne sur le même GPU : aucun gain dans ce cas, et environ 150 Mo de VRAM économisés.
+- **Coûts fixes (≈ 1,5 à 2 s par job).** Ouverture du plugin (1,1 à 1,4 s : vérification Vulkan Video, auto-test, compilation), puis démarrage de NVEncC.
+- **NVEncC HQ (≈ 50 i/s).** L'encodeur limite le débit, avec ou sans FEL : sur un film entier, le surcoût du FEL est négligeable.
+- **NVEncC par défaut (≈ 116 i/s).** Le FEL en Lent devient la limite, à 75–81 i/s dans le workflow. Sur un film entier, l'encodage dure environ 50 % de plus qu'en BL.
+
+L'étape 3 de Muxiveo (détection DoVi/HDR10+ sur 240 images) coûtait 15 s par job, avec ou sans FEL, parce que ffprobe décode sur un seul fil. Avec `-threads 0` (`31b1ac4`), elle prend 2 s.
+
+## Débit du FEL seul
+
+Sortie Y'CbCr 4:2:0 10 bits finale vers `/dev/null`, environ 480 images UHD, décodage Vulkan Video. Débits en i/s, avec 1 puis 2 images en vol.
+
+| GPU, contenu | Lent | Standard | Rapide |
+|---|---:|---:|---:|
+| RTX, Ryan (MMR) | 73,3 / 81,3 | 141,8 / 171,3 | 259,8 / 269,8 |
+| RTX, Toy Story 5 (polynômes) | 82,4 / 94,9 | 170,3 / 207,1 | 262,9 / 269,7 |
+| Raphael, Ryan | 2,3 / 2,3 | 6,1 / 6,1 | 14,6 / 15,1 |
+
+Le Lent est limité par sa composition : 9,3 ms par image en virgule fixe sur Ryan avec une image en vol, 12,1 ms quand deux images se partagent le GPU. Il faut y ajouter 1,9 ms de sortie (Y'CbCr en entiers exacts). Le Standard et le Rapide dépassent largement tout encodeur NVENC.
+
+## Conséquences
+
+- **P (2 images en vol) reste par défaut** : +11 à +15 % sur le Lent RTX, sans effet sur Raphael.
+- **T est rouvert.** Avec un encodeur rapide, le Lent RTX limite le débit. Mais les Tensor Cores ne reprendraient au plus que 1,3 ms par image sur Ryan, et rien sur un contenu à polynômes ; le Lent resterait sous les 116 i/s de NVEncC. Le lot L du plan profile donc d'abord la composition section par section, puis choisit ses leviers, T compris.
+- **Avec RIFE** (24 → 59,94 i/s sur le même GPU), RIFE limite le débit, avec ou sans FEL. Muxiveo y garde une seule image en vol (`mvo_fel_set_render_workers`). Ce cas, marginal car très lourd, n'oriente pas les choix ci-dessus.

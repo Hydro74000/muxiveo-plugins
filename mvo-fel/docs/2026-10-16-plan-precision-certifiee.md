@@ -38,12 +38,19 @@ Conventions :
 | **A2'** | Lent en virgule fixe multi-mots | Mapping (B0) **et EOTF** en entiers 64 bits : logarithme et exponentielle par table de 64 entrées et polynôme court, num = c₁·expm1(ln(x/x₀)/m2) sans annulation, inverse par Newton ; matrice LMS→RGB et seuils PQ en virgule fixe 96 bits ; erreurs de méthode bornées analytiquement, erreurs d'arrondi démontrées (Gappa, installé) ; même classement, mêmes reprises CPU et même auto-test qu'A1 ; variante choisie au démarrage là où elle bat le double (NVIDIA) | 0 différence avec C1 (stress, réel, attestation) ; débit Lent RTX ≈ 2× A1 |
 | **P** | Recouvrement du pipeline de rendu GPU | Plusieurs images en vol : téléversement, calcul, rapatriement des reprises et téléchargement d'images successives se chevauchent (un contexte de rendu par fil, précision et auto-test hérités, ordre rétabli par tickets). Conservé dans tous les cas : levier principal pour les GPU non NVIDIA et utile partout où le GPU a des temps morts | Codes inchangés (attestation) ; débit et mémoire GPU mesurés |
 | **M** | Mesures de bout en bout | Workflow Muxiveo complet (`benchmark_fel_workflow.py`), FEL Lent puis Standard : x265 (CPU), NVEncC HEVC 10 bits sur le même GPU (preset rapide et lent), hevc_nvenc en NUT et direct ; RTX et iGPU ; configurations P (1 ou 2 images en vol), puis T et P + T après T0 | Débit global et durée par encodeur ; P ne doit pas ralentir un encodeur GPU partagé (sinon une seule image en vol dans ce cas) |
-| **T0** | Banc Tensor Cores (RTX) | Mapping MMR et matrices en virgule fixe découpée en tranches INT8, produits partiels **exacts** accumulés en INT32 sur les unités matricielles (schéma d'Ozaki, `VK_KHR_cooperative_matrix`) ; pipeline de calcul hors libplacebo si l'extension GLSL ne peut pas y être activée ; référence à battre : la virgule fixe multi-mots d'A2' (mapping ≈ 2 ms sur 7,8 ms de composition UHD) | Gain sur la composition, puis débit global mesuré en M (T seul, P + T) ; T et P sont cumulables, pas exclusifs |
+| **T0** | Banc Tensor Cores (RTX), levier de L | Mapping MMR et matrices en virgule fixe découpée en tranches INT8, produits partiels **exacts** accumulés en INT32 sur les unités matricielles (schéma d'Ozaki, `VK_KHR_cooperative_matrix`) ; pipeline de calcul hors libplacebo si l'extension GLSL ne peut pas y être activée ; référence à battre : la virgule fixe multi-mots d'A2' (mapping ≈ 2 ms sur 7,8 ms de composition UHD) | Gain sur la composition, puis débit global mesuré en M (T seul, P + T) ; T et P sont cumulables, pas exclusifs |
 | **T1** | Tensor Cores dans le rendu exact (si T0 go) | **Intégré à l'extension Tensor existante** (`mvo-rife-trt`, dépôt muxiveo-plugins), qui devient l'extension portant tous les sujets Tensor du projet Muxiveo : interface entre mvo-fel et l'extension (chargement dynamique facultatif), repli virgule fixe A2' sans l'extension ; mêmes classement, reprises et auto-test | 0 différence avec C1 ; débit face à A2' sur RTX et en M ; licence vérifiée (ci-dessous) |
 | **Q** | Réglage des images en vol | Option d'ABI additive `mvo_fel_set_render_workers` (1 à 4, 2 par défaut, capacité `render_workers`) ; Muxiveo passe à 1 avec l'interpolation RIFE sur le même GPU (lot V) | Sortie identique quel que soit le nombre (test de fumée) |
 | **V** | Validation et livraison | Attestation de schéma 5 (référence certifiée, compteurs de reprises) ; documentation ; textes de Muxiveo (débits et précisions) | Attestation réussie ; tests Muxiveo et natifs verts |
+| **L** | Lent plus rapide sur RTX (rouvert le 16/10 après M) | Profil de la composition en virgule fixe, section par section (calcul dupliqué multiplié par un zéro uniforme : mapping, EOTF, division, matrice LMS→RGB, classement, sortie Y'CbCr exacte) ; leviers choisis selon le profil, dont T0/T1 | Lent RTX ≥ 116 i/s sur Ryan et Toy Story 5 (NVEncC par défaut n'attend plus le FEL) ; 0 différence avec C1 |
 
-Ordre d'exécution : C0 → C1 → A1 → B0 → R → A2' → B1 (arrêté) → P → M → Q → V. T0 et T1 sont classés au vu de M : gain maximal de 1,3 ms par image sur contenu MMR (14 % de la composition), moins de 1 % dans le pire workflow mesuré ; réouvrables si un workflow devient limité par le calcul FEL. Chaque lot est commité séparément puis audité.
+Ordre d'exécution : C0 → C1 → A1 → B0 → R → A2' → B1 (arrêté) → P → M → Q → V → L (profil, puis leviers, dont T0 → T1). Chaque lot est commité séparément puis audité.
+
+T avait été classé sur une première version de M : durées totales sur 10 s, et un cas RIFE pris comme pire cas. M corrigé ([mesures](2026-10-16-mesures-bout-en-bout.md)) montre deux choses :
+- **Le Lent limite le débit avec un encodeur rapide** : 81 à 95 i/s, contre 116 i/s pour NVEncC par défaut.
+- **T n'y suffit pas seul** : au plus 1,3 ms par image sur Ryan (MMR), rien sur un contenu à polynômes.
+
+D'où le lot L, qui profile la composition avant de choisir ses leviers.
 
 Décisions du 16/10 :
 
@@ -66,7 +73,7 @@ Ce que les Tensor Cores ne couvrent pas :
 
 - **Après A2' (décidé le 16/10) :** les trois modes sont conservés. Lent : exact certifié (43–51 i/s sur RTX). Standard : ≤ 1 code 16 bits, plus rapide (67 i/s). Rapide : float32 sur tous GPU.
 - **Après B0 :** go ou arrêt de B1, selon le critère du double débit.
-- **Après T0 :** go ou arrêt de T1, selon le critère du double débit sur RTX. T0 se mesure sur la seule RTX : la GTX 1070 et les UHD 630 et 730 n'ont pas d'unités matricielles, et aucun Arc n'est disponible.
+- **Après T0 :** go ou arrêt de T1, selon le gain sur le débit du Lent RTX, qui vise l'objectif de L. T0 se mesure sur la seule RTX : la GTX 1070 et les UHD 630 et 730 n'ont pas d'unités matricielles, et aucun Arc n'est disponible.
 - **A2 :** l'installation de Gappa dans le distrobox de développement sera demandée avant ce lot.
 
 ## Risques
@@ -90,7 +97,8 @@ Ce que les Tensor Cores ne couvrent pas :
 | B0 | Fait : [banc](2026-10-16-b0-entiers-multimots.md) ; Raphael 0,54× (critère 2× non atteint) : **B1 arrêté**. RTX : 2,64× plus rapide que le double, candidat pour le mapping d'A2 et référence de T0 |
 | R | Fait : [Rapide amélioré](2026-10-16-rapide-ameliore.md) ; stress : 9 151 → 1 code 16 bits (matrices réelles), 1 026 → 112 (identité) ; réel : 1 code ; iGPU −12 % |
 | A2' | Fait : [Lent en virgule fixe](2026-10-16-a2-virgule-fixe.md) ; RTX : composition 18,7 → 7,8 ms, Lent 34,4 → 43,6–51,4 i/s, 0 reprise sur scènes réelles ; iGPU : double conservé (choix par auto-test) |
-| P | Fait (plugin seul) : [recouvrement](2026-10-16-recouvrement.md), 2 images en vol ; Lent RTX 50,5 → 57,3 i/s ; mesures de bout en bout (M) en cours |
-| M | Fait : [mesures de bout en bout](2026-10-16-mesures-bout-en-bout.md) ; P neutre avec x265, NVEncC (par défaut et HQ) et RIFE + NVEncC, marge en régime établi ; T classé |
+| P | Fait : [recouvrement](2026-10-16-recouvrement.md), 2 images en vol ; Lent RTX 73 → 81 i/s (Ryan), 82 → 95 i/s (Toy Story 5) |
+| M | Fait (corrigé) : [mesures de bout en bout](2026-10-16-mesures-bout-en-bout.md), avec FEL seul, encodeur seul et workflow. Analyse d'entrée de NVEncC corrigée dans Muxiveo (surcoût FEL : +37–56 % → +8 % en HQ, +21–27 % avec le preset par défaut) ; cadence déclarée à NVEncC ; sonde de l'étape 3 15 → 2 s. Lent RTX limitant face à NVEncC par défaut : T rouvert dans L |
 | Q | Fait : option d'ABI `mvo_fel_set_render_workers` (2 par défaut) |
 | V | Attestation de schéma 5 réussie (3 scènes, RTX et Raphael, transport direct), acceptée par `package.py` : `exact` identique au CPU certifié, **0 indécise** sur le CPU de référence (35 à 218 reprises par scène) et sur le GPU (RTX en virgule fixe : 0 reprise ; Raphael en double : 65 à 501), mêmes pixels avec 1 et 2 images en vol ; `standard` et `fast` 1 code 16 bits. Muxiveo : images en vol transmises (1 avec RIFE), infobulles Lent et Rapide revues. Restent la version 0.2.0, l'attestation Windows et la publication |
+| L | Rouvert : profil de la composition à faire, puis choix des leviers (T0 compris) |

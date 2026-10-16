@@ -64,7 +64,7 @@ Débit du plugin, 300 images UHD, sortie 10 bits, sur la RTX :
 | A1 (double) | 34,4 i/s |
 | **A2'** (virgule fixe) | **43,6 i/s** |
 
-Sur l'extrait de référence, avec le décodage Vulkan Video, le débit atteint 51,4 i/s. Le libellé du moteur indique la variante retenue (« précision exacte (certifiée), virgule fixe »).
+Sur l'extrait de référence, avec le décodage Vulkan Video, le débit atteint 51,4 i/s. Ces débits passaient par un lecteur Python, qui plafonnait vers 78 i/s ; ils se comparent entre eux. Débits sans lecteur : [mesures de bout en bout](2026-10-16-mesures-bout-en-bout.md). Le libellé du moteur indique la variante retenue (« précision exacte (certifiée), virgule fixe »).
 
 Le débit n'est plus limité par la composition. L'étage de rendu enchaîne en série téléversement, composition, rapatriement de la liste et téléchargement.
 

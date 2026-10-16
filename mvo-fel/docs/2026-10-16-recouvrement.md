@@ -31,7 +31,7 @@ Débit du plugin seul, 300 images UHD, sortie 10 bits, décodage Vulkan Video.
 | iGPU Raphael | Rapide | 17,8 i/s | 20,2 i/s | |
 | iGPU Raphael | Standard | 7,4 i/s | 7,4 i/s | |
 
-Standard et Rapide plafonnent vers 78 i/s, la limite du reste de la chaîne (décodage et sortie NUT). Le Lent reste limité par le rendu. Un troisième fil n'apporte rien : les contextes se partagent le même GPU.
+Ces débits passent par un lecteur Python, qui plafonnait vers 1,9 Go/s : le plafond de 78 i/s du Standard et du Rapide était celui du lecteur. Écrit par le plugin sur `/dev/null`, le Standard monte à 171–207 i/s et le Rapide à 270 i/s ([mesures de bout en bout](2026-10-16-mesures-bout-en-bout.md)). Le Lent reste limité par le rendu. Un troisième fil n'apporte rien : les contextes se partagent le même GPU.
 
 Chaque contexte supplémentaire alloue ses propres textures (couches, cible RGBA16, sorties, tampons de reprises), soit de l'ordre de 150 Mo en UHD.
 
@@ -39,4 +39,4 @@ Chaque contexte supplémentaire alloue ses propres textures (couches, cible RGBA
 
 Attestation de schéma 4 avec deux images en vol (3 scènes, RTX et Raphael, transport direct) : réussie. Les empreintes des images sont identiques, ce qui confirme l'ordre et les codes. Les écarts au CPU certifié sont inchangés : `exact` 0 code, `standard` et `fast` 1 code 16 bits.
 
-Ces mesures portent sur le plugin seul. Le workflow complet est mesuré au [lot M](2026-10-16-mesures-bout-en-bout.md) : P est neutre face à x265, NVEncC et RIFE sur le même GPU, et donne de la marge en régime établi.
+Ces mesures portent sur le plugin seul. Le workflow complet est mesuré au [lot M](2026-10-16-mesures-bout-en-bout.md). Avec un encodeur rapide (NVEncC par défaut), le Lent limite le débit, et P y apporte 11 à 15 %. Avec un encodeur lent (NVEncC HQ, x265) ou avec RIFE, P est neutre.
