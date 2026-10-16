@@ -18,7 +18,7 @@ add_custom_command(OUTPUT ${MVO_FEL_PQ_SOURCE}
           -DOUTPUT=${MVO_FEL_PQ_SOURCE} -DSYMBOL=fel_pq_threshold_bytes
           -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_bytes.cmake
   DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/data/pq_thresholds.bin ${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_bytes.cmake)
-add_library(fel_math STATIC src/reconstruction.cpp src/certified.cpp ${MVO_FEL_PQ_SOURCE})
+add_library(fel_math STATIC src/reconstruction.cpp src/certified.cpp src/fixed_point.cpp ${MVO_FEL_PQ_SOURCE})
 target_include_directories(fel_math PUBLIC include)
 target_link_libraries(fel_math PUBLIC PkgConfig::AV)
 set_target_properties(fel_math PROPERTIES CXX_VISIBILITY_PRESET hidden C_VISIBILITY_PRESET hidden)
@@ -77,6 +77,9 @@ if(BUILD_TESTING)
   add_executable(fel_math_test tests/reconstruction_test.cpp)
   target_link_libraries(fel_math_test PRIVATE fel_math)
   add_test(NAME fel_math COMMAND fel_math_test)
+  add_executable(fel_fixed_test tests/fixed_point_test.cpp)
+  target_link_libraries(fel_fixed_test PRIVATE fel_math)
+  add_test(NAME fel_fixed COMMAND fel_fixed_test)
   if(NOT MVO_FEL_MATH_ONLY)
     find_package(Python3 REQUIRED COMPONENTS Interpreter)
     add_test(NAME fel_producer COMMAND ${Python3_EXECUTABLE}
