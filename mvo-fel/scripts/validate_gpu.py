@@ -11,7 +11,8 @@ import subprocess
 from functools import partial
 from pathlib import Path
 
-from validate_producer import producer_frames, validate_producer
+from package import engine_sources
+from validate_producer import certified_counters, producer_frames, validate_producer
 from validate_direct import validate_direct
 from validate_yuv import direct_options, p010_to_planar, validate_yuv
 
@@ -74,14 +75,16 @@ def main() -> None:
     if not devices:
         raise RuntimeError("Aucun GPU à valider")
     args.report.parent.mkdir(parents=True, exist_ok=True)
-    report = {"schema": 4, "library_sha256": digest(args.library), "oracle_sha256": digest(args.oracle),
-              "backend_source_sha256": digest(ROOT / "src/gpu_backend.c"),
+    report = {"schema": 5, "library_sha256": digest(args.library), "oracle_sha256": digest(args.oracle),
+              "engine_sources": engine_sources(),
               "dependencies": json.loads((ROOT / "dependencies.json").read_text(encoding="utf-8")),
               "tolerance_pq12": 2, "tolerance_codes16": {"standard": 1, "exact": 0}, "samples": [], "passed": False}
     if args.direct_ffmpeg:
         report["direct"] = {"binary_sha256": digest(args.direct_ffmpeg),
                             "filter_sources": {p.name: digest(p) for p in sorted((ROOT/'integrations/ffmpeg').glob('*.c'))}}
-    cpu_frames: dict[Path, tuple[list[bytes], list[dict]]] = {}
+    lib.mvo_fel_capabilities.restype = ctypes.c_char_p
+    workers = json.loads(lib.mvo_fel_capabilities()).get("render_workers")
+    cpu_frames: dict[Path, tuple[list[bytes], list[dict], dict]] = {}
     for device in devices:
         for index, clip in enumerate(args.clips):
             sample = {"device": device, "clip_sha256": digest(clip), "frames": 3, "modes": {}}
@@ -93,15 +96,32 @@ def main() -> None:
                 # Sorties finales Y'CbCr : conversion de référence en double à partir du RGB attesté.
                 result["yuv"] = validate_yuv(lib, clip, device["uuid"], rgb, mode)
                 if mode == "exact":
-                    # Identique au CPU (double) octet pour octet, RGB et Y'CbCr.
+                    # Identique au CPU certifié octet pour octet, RGB et Y'CbCr ; aucune composante
+                    # indécise, ni sur le CPU de référence ni sur le GPU (reprises comprises).
                     if clip not in cpu_frames:
-                        cpu_rgb = producer_frames(lib, clip, "cpu", int(pixels[0][0]), "gbrp16le")[1]
-                        cpu_frames[clip] = (cpu_rgb, validate_yuv(lib, clip, "cpu", cpu_rgb, mode))
-                    cpu_rgb, cpu_yuv = cpu_frames[clip]
+                        statistics: dict = {}
+                        cpu_rgb = producer_frames(lib, clip, "cpu", int(pixels[0][0]), "gbrp16le",
+                                                  statistics=statistics)[1]
+                        cpu_frames[clip] = (cpu_rgb, validate_yuv(lib, clip, "cpu", cpu_rgb, mode),
+                                            certified_counters(statistics))
+                    cpu_rgb, cpu_yuv, reference = cpu_frames[clip]
                     if (rgb != cpu_rgb or [case["frame_sha256"] for case in result["yuv"]]
                             != [case["frame_sha256"] for case in cpu_yuv]):
                         raise RuntimeError(f"Précision exacte différente du CPU : {device['name']}, scène {index+1}")
+                    if reference["certified_undecided"] or result["producer"]["certified_undecided"]:
+                        raise RuntimeError(f"Composantes indécises : {device['name']}, scène {index+1}")
                     result["cpu_identical"] = True
+                    result["cpu_reference"] = reference
+                    backend = result["producer"]["backend"]
+                    result["variant"] = ("fixed" if "virgule fixe" in backend
+                                         else "double" if ", double" in backend else None)
+                    if result["variant"] is None:
+                        raise RuntimeError(f"Variante du mode exact absente du moteur : {backend!r}")
+                    # Une seule image en vol (lot Q) : mêmes pixels que le rendu par défaut.
+                    if not workers:
+                        raise RuntimeError("Capacité render_workers absente")
+                    single, _ = validate_producer(lib, clip, device["uuid"], int(pixels[0][0]), hashes, mode, 1)
+                    result["single_worker"] = {"backend": single["backend"], "identical": True}
                 if args.direct_ffmpeg:
                     option = f":precision={mode}"
                     direct = validate_direct(args.direct_ffmpeg, args.library, clip, device["uuid"], int(pixels[0][0]),
@@ -116,7 +136,7 @@ def main() -> None:
             report["samples"].append(sample)
             args.report.write_text(json.dumps(report, ensure_ascii=False, indent=2)+"\n", encoding="utf-8")
     if (digest(args.library) != report["library_sha256"] or digest(args.oracle) != report["oracle_sha256"]
-            or digest(ROOT / "src/gpu_backend.c") != report["backend_source_sha256"]
+            or engine_sources() != report["engine_sources"]
             or json.loads((ROOT / "dependencies.json").read_text(encoding="utf-8")) != report["dependencies"]):
         raise RuntimeError("Le moteur ou ses sources ont changé pendant la validation")
     if args.direct_ffmpeg and (digest(args.direct_ffmpeg) != report["direct"]["binary_sha256"]

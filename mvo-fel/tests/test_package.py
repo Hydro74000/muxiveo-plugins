@@ -1,4 +1,5 @@
 """Gardes du paquet GPU : refuser les attestations antérieures ou incomplètes."""
+import copy
 import importlib.util
 import json
 import tempfile
@@ -30,16 +31,21 @@ class PackageValidationTests(unittest.TestCase):
                                "frame_sha256": ["e"*64]*3}]}
             if name == "exact":
                 result["cpu_identical"] = True
+                result["producer"].update(certified_rescued=12, certified_undecided=0)
+                result["cpu_reference"] = {"certified_rescued": 30, "certified_undecided": 0}
+                result["variant"] = "fixed"
+                result["single_worker"] = {"backend": "vulkan: test", "identical": True}
             return result
         self.report = {
-            "schema": 4, "passed": True, "tolerance_pq12": 2, "tolerance_codes16": {"standard": 1, "exact": 0},
+            "schema": 5, "passed": True, "tolerance_pq12": 2, "tolerance_codes16": {"standard": 1, "exact": 0},
             "library_sha256": package.digest(self.library),
-            "backend_source_sha256": package.digest(package.ROOT / "src/gpu_backend.c"),
+            "engine_sources": package.engine_sources(),
             "dependencies": json.loads((package.ROOT / "dependencies.json").read_text()),
             "samples": [{"device": {"uuid": "a"*32, "float64": True}, "clip_sha256": str(index)*64, "frames": 3,
                          "modes": {name: mode(name) for name in ("fast", "standard", "exact")}}
                         for index in range(3)],
         }
+        self.original = copy.deepcopy(self.report)
         lib = Mock()
         lib.mvo_fel_abi_version.return_value = 1
         lib.mvo_fel_capabilities.return_value = b'{"experimental":true}'
@@ -55,9 +61,30 @@ class PackageValidationTests(unittest.TestCase):
         self.assertTrue(self.load()["experimental"])
 
     def test_old_attestation_is_rejected(self):
-        self.report["schema"] = 3
+        self.report["schema"] = 4
         with self.assertRaisesRegex(RuntimeError, "incompatible"):
             self.load()
+
+    def test_changed_engine_sources_are_rejected(self):
+        self.report["engine_sources"]["src/shaders/fixed_render.glsl"] = "0"*64
+        with self.assertRaisesRegex(RuntimeError, "incompatible"):
+            self.load()
+
+    def test_undecided_components_are_rejected(self):
+        for key in ("producer", "cpu_reference"):
+            with self.subTest(key=key):
+                self.report = copy.deepcopy(self.original)
+                self.report["samples"][1]["modes"]["exact"][key]["certified_undecided"] = 1
+                with self.assertRaisesRegex(RuntimeError, "certifié"):
+                    self.load()
+
+    def test_exact_variant_and_single_worker_are_required(self):
+        for key in ("variant", "single_worker", "cpu_reference"):
+            with self.subTest(key=key):
+                self.report = copy.deepcopy(self.original)
+                del self.report["samples"][2]["modes"]["exact"][key]
+                with self.assertRaisesRegex(RuntimeError, "certifié"):
+                    self.load()
 
     def test_different_library_is_rejected(self):
         self.library.write_bytes(b"autre bibliotheque")

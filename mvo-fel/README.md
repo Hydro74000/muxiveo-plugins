@@ -229,7 +229,9 @@ Critères par précision :
 
 - `fast` : ≤ 2 codes PQ12 face au CPU et à `kernel64` ;
 - `standard` : en plus, ≤ 1 code 16 bits face au chemin CPU rapide (sommes entières exactes) ;
-- `exact` : 0 code ; images RGB et Y'CbCr du producteur identiques octet pour octet à celles du CPU.
+- `exact` : 0 code ; images RGB et Y'CbCr du producteur identiques octet pour octet à celles du CPU
+  certifié ; aucune composante indécise, ni sur le CPU de référence ni sur le GPU ; variante retenue
+  (virgule fixe ou double) consignée ; mêmes pixels avec une seule image en vol.
 
 Les sorties finales Y'CbCr 4:2:0 10 bits du même NUT sont ensuite comparées à une
 conversion de référence en double (numpy), recalculée depuis ce RGB attesté :
@@ -237,9 +239,11 @@ conversion de référence en double (numpy), recalculée depuis ce RGB attesté 
 - position chroma `topleft` recadrée sans tramage : arrondi exact, ≤ 0,5 code ;
 - position `left` avec le tramage livré : < 1 code.
 
-L'attestation de schéma 4 contient, par précision, ces empreintes et ces écarts,
-ainsi que les SHA-256 du moteur, des sources et des dépendances. Les schémas 1 à 3
-ne sont plus acceptés.
+L'attestation de schéma 5 contient, par précision, ces empreintes et ces écarts ; en mode
+`exact`, les compteurs de reprises et d'indécises du CPU et du GPU. Elle contient aussi les
+SHA-256 du moteur, des dépendances et des sources du rendu GPU et de la référence certifiée
+(`gpu_backend.c`, `certified.cpp`, `fixed_point.cpp`, `reconstruction.cpp`, shaders, table des
+seuils PQ). Les schémas 1 à 4 ne sont plus acceptés.
 Le packaging refuse un paquet GPU sans attestation valide. Il est autorisé sur
 Linux et Windows ; macOS reste CPU, faute de contenu réel en CI. Le paquet est
 autonome hors pilote graphique : `package.py` vérifie les dépendances ELF, ou les

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import ctypes
 import hashlib
+import json
 import subprocess
 import tempfile
 import threading
@@ -10,33 +11,51 @@ from collections.abc import Callable
 from pathlib import Path
 
 
-def validate_producer(lib: ctypes.CDLL, clip: Path, uuid: str, frame_bytes: int,
-                      expected: list[str], precision: str = "fast") -> tuple[dict, list[bytes]]:
-    """Aucun intermédiaire vidéo ; FFmpeg sélectionne les images 0, 8 et 16 (rendues aussi brutes)."""
+def validate_producer(lib: ctypes.CDLL, clip: Path, uuid: str, frame_bytes: int, expected: list[str],
+                      precision: str = "fast", workers: int | None = None) -> tuple[dict, list[bytes]]:
+    """Aucun intermédiaire vidéo ; FFmpeg sélectionne les images 0, 8 et 16 (rendues aussi brutes).
+    Le résultat porte aussi les compteurs du rendu certifié (reprises, indécises)."""
     if not 0 < frame_bytes <= 8192*8192*6 or len(expected) != 3:
         raise ValueError("Dimensions ou nombre d'images de validation invalides")
-    backend, frames = producer_frames(lib, clip, uuid, frame_bytes, "gbrp16le", precision_setter(lib, precision))
+    statistics: dict = {}
+    backend, frames = producer_frames(lib, clip, uuid, frame_bytes, "gbrp16le",
+                                      precision_setter(lib, precision, workers), statistics)
     hashes = [hashlib.sha256(frame).hexdigest() for frame in frames]
     if hashes != expected:
         raise RuntimeError(f"Pixels de la bibliothèque différents de la référence : moteur={backend!r}, "
                            f"empreintes={[h[:16] for h in hashes]}")
-    return {"backend": backend, "frame_sha256": hashes}, frames
+    return {"backend": backend, "frame_sha256": hashes, **certified_counters(statistics)}, frames
 
 
-def precision_setter(lib: ctypes.CDLL, precision: str) -> Callable[[int], None]:
-    """Réglage de précision appliqué au contexte du producteur avant le rendu."""
+def certified_counters(statistics: dict) -> dict:
+    """Composantes reprises et indécises du rendu certifié, lues dans les statistiques du producteur."""
+    counters = {key: statistics.get(f"certified_{key}") for key in ("rescued", "undecided")}
+    if not all(isinstance(value, int) and value >= 0 for value in counters.values()):
+        raise RuntimeError(f"Compteurs du rendu certifié absents : {statistics}")
+    return {f"certified_{key}": value for key, value in counters.items()}
+
+
+def precision_setter(lib: ctypes.CDLL, precision: str, workers: int | None = None) -> Callable[[int], None]:
+    """Réglage de précision (et du nombre d'images en vol) appliqué au contexte avant le rendu."""
     lib.mvo_fel_set_precision.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
     lib.mvo_fel_set_precision.restype = ctypes.c_int
+    if workers is not None:
+        lib.mvo_fel_set_render_workers.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        lib.mvo_fel_set_render_workers.restype = ctypes.c_int
 
     def configure(context: int) -> None:
         if lib.mvo_fel_set_precision(context, precision.encode("ascii")):
             raise RuntimeError(f"Précision refusée : {precision}")
+        if workers is not None and lib.mvo_fel_set_render_workers(context, workers):
+            raise RuntimeError(f"Nombre d'images en vol refusé : {workers}")
     return configure
 
 
 def producer_frames(lib: ctypes.CDLL, clip: Path, uuid: str, frame_bytes: int, pixel_format: str,
-                    configure: Callable[[int], None] | None = None) -> tuple[str, list[bytes]]:
-    """Images 0, 8 et 16 du NUT livré, brutes ; ``configure`` règle le contexte avant le rendu."""
+                    configure: Callable[[int], None] | None = None,
+                    statistics: dict | None = None) -> tuple[str, list[bytes]]:
+    """Images 0, 8 et 16 du NUT livré, brutes ; ``configure`` règle le contexte avant le rendu,
+    ``statistics`` reçoit les statistiques du producteur après le rendu."""
     if not 0 < frame_bytes <= 8192*8192*6:
         raise ValueError("Dimensions de validation invalides")
     write_type = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t)
@@ -113,6 +132,10 @@ def producer_frames(lib: ctypes.CDLL, clip: Path, uuid: str, frame_bytes: int, p
                 code = process.wait(timeout=15)
                 reader.join(timeout=15)
                 backend = (lib.mvo_fel_backend(context) or b"").decode("utf-8", errors="replace")
+                if statistics is not None:
+                    lib.mvo_fel_statistics.argtypes = [ctypes.c_void_p]
+                    lib.mvo_fel_statistics.restype = ctypes.c_char_p
+                    statistics.update(json.loads(lib.mvo_fel_statistics(context) or b"{}"))
             finally:
                 timer.cancel()
                 timer.join()

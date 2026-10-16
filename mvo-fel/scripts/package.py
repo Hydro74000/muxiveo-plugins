@@ -25,6 +25,17 @@ def digest(path: Path) -> str:
     return h.hexdigest()
 
 
+# Sources du rendu GPU et de la référence certifiée liées à l'attestation (schéma 5).
+ENGINE_SOURCES = ("src/gpu_backend.c", "src/certified.cpp", "src/fixed_point.cpp", "src/reconstruction.cpp",
+                  "src/shaders/*.glsl", "data/pq_thresholds.bin")
+
+
+def engine_sources() -> dict[str, str]:
+    """Empreintes des sources du moteur, par chemin relatif."""
+    return {path.relative_to(ROOT).as_posix(): digest(path)
+            for pattern in ENGINE_SOURCES for path in sorted(ROOT.glob(pattern))}
+
+
 def check_mode(result: dict, mode: str) -> None:
     """Une précision attestée : écarts, pixels du producteur, sorties Y'CbCr."""
     for metric in ("max_cpu_pq12", "max_reference_pq12"):
@@ -35,6 +46,17 @@ def check_mode(result: dict, mode: str) -> None:
     if (not isinstance(codes, int) or codes < 0 or mode == "standard" and codes > 1
             or mode == "exact" and (codes or result.get("cpu_identical") is not True)):
         raise RuntimeError(f"Précision {mode} hors tolérance dans l'attestation")
+    if mode == "exact":
+        # Référence CPU et rendu GPU certifiés (aucune composante indécise), variante retenue,
+        # mêmes pixels avec une seule image en vol.
+        reference = result.get("cpu_reference") or {}
+        counters = (result.get("producer", {}).get("certified_rescued"),
+                    result.get("producer", {}).get("certified_undecided"),
+                    reference.get("certified_rescued"), reference.get("certified_undecided"))
+        if (not all(isinstance(value, int) and value >= 0 for value in counters) or counters[1] or counters[3]
+                or result.get("variant") not in {"fixed", "double"}
+                or (result.get("single_worker") or {}).get("identical") is not True):
+            raise RuntimeError("Rendu exact non certifié dans l'attestation")
     producer = result.get("producer", {})
     hashes = producer.get("frame_sha256", [])
     if (len(hashes) != 3 or not all(re.fullmatch(r"[0-9a-f]{64}", h) for h in hashes)
@@ -64,10 +86,10 @@ def load_capabilities(library: Path, validation: Path | None = None) -> dict:
         if validation is None:
             raise RuntimeError("Le prototype Vulkan exige une attestation numérique de cette bibliothèque")
         report = json.loads(validation.read_text(encoding="utf-8"))
-        if (report.get("schema") != 4 or report.get("passed") is not True or report.get("tolerance_pq12") != 2
+        if (report.get("schema") != 5 or report.get("passed") is not True or report.get("tolerance_pq12") != 2
                 or report.get("tolerance_codes16") != {"standard": 1, "exact": 0}
                 or report.get("library_sha256") != digest(library)
-                or report.get("backend_source_sha256") != digest(ROOT / "src/gpu_backend.c")
+                or report.get("engine_sources") != engine_sources()
                 or report.get("dependencies") != json.loads((ROOT / "dependencies.json").read_text(encoding="utf-8"))):
             raise RuntimeError("Attestation GPU incompatible avec cette bibliothèque")
         scenes: dict[str, set[str]] = {}

@@ -93,3 +93,4 @@ Ce que les Tensor Cores ne couvrent pas :
 | P | Fait (plugin seul) : [recouvrement](2026-10-16-recouvrement.md), 2 images en vol ; Lent RTX 50,5 → 57,3 i/s ; mesures de bout en bout (M) en cours |
 | M | Fait : [mesures de bout en bout](2026-10-16-mesures-bout-en-bout.md) ; P neutre avec x265, NVEncC (par défaut et HQ) et RIFE + NVEncC, marge en régime établi ; T classé |
 | Q | Fait : option d'ABI `mvo_fel_set_render_workers` (2 par défaut) |
+| V | Attestation de schéma 5 réussie (3 scènes, RTX et Raphael, transport direct), acceptée par `package.py` : `exact` identique au CPU certifié, **0 indécise** sur le CPU de référence (35 à 218 reprises par scène) et sur le GPU (RTX en virgule fixe : 0 reprise ; Raphael en double : 65 à 501), mêmes pixels avec 1 et 2 images en vol ; `standard` et `fast` 1 code 16 bits. Muxiveo : images en vol transmises (1 avec RIFE), infobulles Lent et Rapide revues. Restent la version 0.2.0, l'attestation Windows et la publication |
