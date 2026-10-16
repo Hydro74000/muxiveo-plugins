@@ -101,6 +101,21 @@ void fel_gpu_force_rescue(void *context, int enabled)
     ((struct fel_gpu *)context)->force_rescue = enabled != 0;
 }
 
+/* Contexte de rendu supplémentaire (lot P) : reprend la précision, la variante et le résultat de
+ * l'auto-test d'un contexte du même périphérique, sans relancer l'auto-test. 0 si incompatible. */
+int fel_gpu_inherit(void *context, const void *source)
+{
+    struct fel_gpu *p = context;
+    const struct fel_gpu *s = source;
+    if (!p || !s || (s->precision != FEL_PRECISION_FAST && !p->float64) ||
+        (s->precision == FEL_PRECISION_EXACT && !p->storable)) return 0;
+    p->precision = s->precision;
+    p->self_test = s->self_test;
+    p->fixed_mode = s->fixed_mode;
+    p->force_rescue = s->force_rescue;
+    return 1;
+}
+
 /* Variante du mode exact retenue par l'auto-test : 1 virgule fixe, 0 double. */
 int fel_gpu_fixed_variant(const void *context)
 {

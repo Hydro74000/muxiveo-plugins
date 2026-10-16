@@ -58,6 +58,7 @@ void fel_gpu_configure(void *, const fel_output *);
 void fel_gpu_timings(void *, double *);
 int fel_gpu_set_precision(void *, int);
 int fel_gpu_fixed_variant(const void *);
+int fel_gpu_inherit(void *, const void *);
 void fel_gpu_certified(void *, long long *, long long *);
 #endif
 }
@@ -274,7 +275,7 @@ struct mvo_fel_context {
     AVIOContext *io = nullptr;
     AVStream *stream = nullptr, *out_stream = nullptr;
     Layer bl, el;
-    Frame rgb, scratch;
+    Frame scratch;   // RGB intermédiaire du rendu CPU (un seul fil de rendu)
     AVBufferPool *pool = nullptr;
     // Format produit : RGB PQ 16 bits par défaut, Y'CbCr 4:2:0 final ou 16 bits sur demande.
     fel_output output_format{FEL_OUT_GBRP16, FEL_DITHER_BLUE, AVCHROMA_LOC_LEFT, 0, 0, 0, 0};
@@ -287,7 +288,16 @@ struct mvo_fel_context {
 #ifdef MVO_FEL_VULKAN_PROTOTYPE
     void *gpu_prototype = nullptr;
     bool gpu_attempted = false;
+    // Contextes de rendu supplémentaires (lot P) : plusieurs images en vol, une par fil de rendu.
+    std::vector<void *> gpu_extra;
 #endif
+    // Fil de rendu : contexte GPU (ou nul : CPU), cadre des plans du paquet, mesures propres.
+    struct Worker {
+        void *gpu = nullptr;
+        Frame frame;
+        double pixels = 0, starved = 0, blocked = 0;
+    };
+    std::mutex render_mutex;
     // Périphérique Vulkan FFmpeg partagé par les décodeurs et le rendu (Vulkan Video).
     AVBufferRef *hw_device = nullptr;
     bool hw_decode = false;
@@ -321,6 +331,7 @@ struct mvo_fel_context {
         stop_prefetch();
         rows.reset();
 #ifdef MVO_FEL_VULKAN_PROTOTYPE
+        for (void *gpu : gpu_extra) fel_gpu_destroy(gpu);
         fel_gpu_destroy(gpu_prototype);
 #endif
         bl.reset(); el.reset();
@@ -468,6 +479,17 @@ struct mvo_fel_context {
             // Mode exact : variante retenue par l'auto-test (lot A2').
             if (precision == FEL_PRECISION_EXACT)
                 backend += fel_gpu_fixed_variant(gpu_prototype) ? ", virgule fixe" : ", double";
+            // Lot P : contextes supplémentaires sur le même périphérique (MVO_FEL_GPU_WORKERS, 2 par
+            // défaut), précision et auto-test hérités ; un échec réduit simplement le parallélisme.
+            const char *count = getenv("MVO_FEL_GPU_WORKERS");
+            const int workers = std::clamp(count ? std::atoi(count) : 2, 1, 4);
+            for (int i = 1; i < workers; ++i) {
+                void *extra = hw_device ? fel_gpu_import(hw_device->data, w, h)
+                                        : fel_gpu_create(w, h, uuid.size() == 32 ? uuid.c_str() : device.c_str());
+                if (!extra || !fel_gpu_inherit(extra, gpu_prototype)) { fel_gpu_destroy(extra); break; }
+                gpu_extra.push_back(extra);
+            }
+            if (!gpu_extra.empty()) backend += ", " + std::to_string(gpu_extra.size() + 1) + " images en vol";
         }
     }
 #endif
@@ -706,11 +728,13 @@ struct mvo_fel_context {
         if (!bl.ready.empty() || !el.ready.empty()) throw Failure("Fin de flux BL/EL désalignée");
     }
     // Reconstruction d'une image dans un paquet du pool (thread de rendu uniquement).
-    std::unique_ptr<Rendered> render(Job &job) {
+    // Plusieurs fils de rendu en mode GPU (lot P) : initialisation sous verrou, cadre et contexte par fil.
+    std::unique_ptr<Rendered> render(Job &job, Worker &w) {
         check_cancelled();
         const AVFrame &base = *job.base;
         const bool yuv = output_format.format != FEL_OUT_GBRP16;
         if (!yuv && (crop[0] | crop[1] | crop[2] | crop[3])) throw Failure("Recadrage réservé aux sorties Y'CbCr");
+        std::unique_lock init(render_mutex);
         if (!width) {
             width = base.width; height = base.height;
             if (yuv && (width % 2 || height % 2)) throw Failure("Dimensions impaires incompatibles avec le 4:2:0");
@@ -722,11 +746,15 @@ struct mvo_fel_context {
             // Tampons réutilisés : ni allocation ni défauts de page de 49,8 Mo par image UHD.
             pool = av_buffer_pool_init(static_cast<size_t>(packet_size), nullptr);
             if (!pool) throw std::bad_alloc();
-            rgb = frame();
-            rgb->format = pixel_format(); rgb->width = output_format.width; rgb->height = output_format.height;
         }
+        init.unlock();
         if (base.width != width || base.height != height)
             throw Failure("Changement de dimensions pendant la reconstruction");
+        if (!w.frame) {
+            w.frame = frame();
+            w.frame->format = pixel_format(); w.frame->width = output_format.width; w.frame->height = output_format.height;
+        }
+        AVFrame *rgb = w.frame.get();
         auto out = std::unique_ptr<Rendered>(new Rendered{packet(), output_format.width, output_format.height,
                                                           job.timebase});
         out->packet->buf = av_buffer_pool_get(pool);
@@ -736,13 +764,13 @@ struct mvo_fel_context {
         check(av_image_fill_arrays(rgb->data, rgb->linesize, out->packet->data,
             pixel_format(), output_format.width, output_format.height, 1), "Plans du paquet");
         {
-            Timer pixels(timing[4]);
+            Timer pixels(w.pixels);
 #ifdef MVO_FEL_VULKAN_PROTOTYPE
-            if (gpu_prototype) {
+            if (w.gpu) {
                 const bool ok = yuv
-                    ? fel_gpu_render_yuv(gpu_prototype, job.metadata, job.base.get(), job.enhancement.get(),
-                                         &output_format, rgb.get())
-                    : fel_gpu_render_planar(gpu_prototype, job.metadata, job.base.get(), job.enhancement.get(), rgb.get());
+                    ? fel_gpu_render_yuv(w.gpu, job.metadata, job.base.get(), job.enhancement.get(),
+                                         &output_format, rgb)
+                    : fel_gpu_render_planar(w.gpu, job.metadata, job.base.get(), job.enhancement.get(), rgb);
                 if (!ok) throw Failure("Échec de reconstruction du prototype Vulkan");
             } else
 #endif
@@ -750,7 +778,7 @@ struct mvo_fel_context {
                 if (job.base->format == AV_PIX_FMT_VULKAN) throw Failure("Image Vulkan sans rendu GPU");
                 if (!rows) rows = std::make_unique<RowPool>(render_threads);
                 // Y'CbCr : reconstruction RGB 16 bits intermédiaire, puis conversion par lignes chroma.
-                AVFrame *target = rgb.get();
+                AVFrame *target = rgb;
                 if (yuv) {
                     if (!scratch) {
                         scratch = frame();
@@ -830,23 +858,54 @@ struct mvo_fel_context {
             } catch (const Stopped &) {
             } catch (...) { fail(); }
         });
-        std::thread renderer([&] {
+        // Fils de rendu : un par contexte GPU (lot P), un seul en CPU (lignes déjà parallèles). Les
+        // tickets, attribués à la prise du job sous verrou, rétablissent l'ordre avant l'écriture.
+        std::vector<Worker> workers(1);
+#ifdef MVO_FEL_VULKAN_PROTOTYPE
+        workers[0].gpu = gpu_prototype;
+        if (gpu_prototype) for (void *extra : gpu_extra) { workers.emplace_back(); workers.back().gpu = extra; }
+#endif
+        std::mutex pop_mutex, order_mutex;
+        std::condition_variable order;
+        int64_t next_ticket = 0, next_write = 0;
+        std::atomic<int> active{static_cast<int>(workers.size())};
+        std::atomic<bool> stopping{false};
+        auto render_loop = [&](Worker &w) {
             try {
-                std::unique_ptr<Job> job;
-                while (jobs.pop(job, cancelled, waits[1])) {
-                    auto out = render(*job);
+                for (;;) {
+                    std::unique_ptr<Job> job;
+                    int64_t ticket;
+                    {
+                        std::lock_guard lock(pop_mutex);
+                        if (!jobs.pop(job, cancelled, w.starved)) break;
+                        ticket = next_ticket++;
+                    }
+                    auto out = render(*job, w);
                     job.reset();
-                    if (!rendered.push(std::move(out), cancelled, waits[2])) return;
+                    {
+                        std::unique_lock lock(order_mutex);
+                        order.wait(lock, [&] { return next_write == ticket || stopping.load() || cancelled.load(); });
+                        if (stopping.load() || cancelled.load()) break;
+                    }
+                    const bool pushed = rendered.push(std::move(out), cancelled, w.blocked);
+                    { std::lock_guard lock(order_mutex); ++next_write; }
+                    order.notify_all();
+                    if (!pushed) break;
                 }
-                rendered.close();
-            } catch (...) { fail(); }
-        });
+            } catch (...) { stopping = true; order.notify_all(); fail(); }
+            if (--active == 0) rendered.close();
+        };
+        std::vector<std::thread> renderers;
+        for (auto &w : workers) renderers.emplace_back(render_loop, std::ref(w));
         try {
             std::unique_ptr<Rendered> item;
             while (rendered.pop(item, cancelled, waits[3])) write_rendered(*item);
         } catch (...) { fail(); }
+        stopping = true;
+        order.notify_all();
         decoder.join();
-        renderer.join();
+        for (auto &t : renderers) t.join();
+        for (const auto &w : workers) { timing[4] += w.pixels; waits[1] += w.starved; waits[2] += w.blocked; }
         rows.reset();
         if (failure) std::rethrow_exception(failure);
         check_cancelled();
@@ -1025,9 +1084,14 @@ const char *mvo_fel_statistics(mvo_fel_context *p) {
     long long rescued = p->certified_rescued, undecided = p->certified_undecided;
 #ifdef MVO_FEL_VULKAN_PROTOTYPE
     if (p->gpu_prototype) {
-        long long gpu_rescued = 0, gpu_undecided = 0;
-        fel_gpu_certified(p->gpu_prototype, &gpu_rescued, &gpu_undecided);
-        rescued += gpu_rescued; undecided += gpu_undecided;
+        // Tous les contextes de rendu (lot P).
+        std::vector<void *> contexts{p->gpu_prototype};
+        contexts.insert(contexts.end(), p->gpu_extra.begin(), p->gpu_extra.end());
+        for (void *gpu : contexts) {
+            long long gpu_rescued = 0, gpu_undecided = 0;
+            fel_gpu_certified(gpu, &gpu_rescued, &gpu_undecided);
+            rescued += gpu_rescued; undecided += gpu_undecided;
+        }
     }
 #endif
     text << ",\"certified_rescued\":" << rescued << ",\"certified_undecided\":" << undecided;
@@ -1036,9 +1100,15 @@ const char *mvo_fel_statistics(mvo_fel_context *p) {
     for(size_t i=0;i<p->waits.size();++i)text << ",\"" << waits[i] << "\":" << p->waits[i];
 #ifdef MVO_FEL_VULKAN_PROTOTYPE
     if (p->gpu_prototype) {
-        // Temps GPU mesurés par étape (pl_timer), en millisecondes cumulées.
-        double gpu[5];
-        fel_gpu_timings(p->gpu_prototype, gpu);
+        // Temps GPU mesurés par étape (pl_timer), en millisecondes cumulées sur tous les contextes.
+        double gpu[5] = {};
+        std::vector<void *> contexts{p->gpu_prototype};
+        contexts.insert(contexts.end(), p->gpu_extra.begin(), p->gpu_extra.end());
+        for (void *context : contexts) {
+            double part[5];
+            fel_gpu_timings(context, part);
+            for (int i = 0; i < 5; ++i) gpu[i] += part[i];
+        }
         const char *stages[]={"gpu_import_ms","gpu_bl_ms","gpu_el_ms","gpu_compose_ms","gpu_output_ms"};
         for(int i=0;i<5;++i)text << ",\"" << stages[i] << "\":" << gpu[i];
     }
