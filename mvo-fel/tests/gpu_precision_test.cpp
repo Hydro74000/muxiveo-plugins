@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: LGPL-2.1-or-later
-// Précision du rendu GPU par mode face au CPU (sommes entières exactes, calcul en double), sur des
-// couches aléatoires : mapping identité (annulations de la matrice LMS→RGB, audit du 15/10/2026),
-// matrices Dolby réalistes, et MMR avec signaux exactement sur un pivot. Exact et standard :
-// ≤ 1 code 16 bits ; rapide (float32) : écart mesuré, sans borne générale.
+// Précision du rendu GPU par mode face au CPU certifié, sur des couches aléatoires : mapping
+// identité (annulations de la matrice LMS→RGB, audit du 15/10/2026), matrices Dolby réalistes, et
+// MMR avec signaux exactement sur un pivot. Exact : identique (0 code) ; standard : ≤ 1 code
+// 16 bits ; rapide (float32) : écart mesuré, sans borne générale.
 #include "reconstruction.hpp"
 #include <algorithm>
 #include <cstdlib>
@@ -108,11 +108,11 @@ int main() {
             }
             const char *name = precision == FEL_PRECISION_EXACT ? "exact" : precision == FEL_PRECISION_STANDARD ? "standard" : "rapide";
             std::cout << mode << " / " << name << " : écart max " << worst << " code(s) 16 bits, valeurs ≠ " << differing << '\n';
-            if (precision != FEL_PRECISION_FAST && worst > 1) ok = false;
+            if (worst > (precision == FEL_PRECISION_EXACT ? 0 : precision == FEL_PRECISION_STANDARD ? 1 : 65535)) ok = false;
         }
     }
     av_free(metadata);
     fel_gpu_destroy(gpu);
-    if (!ok) std::cerr << "Précision GPU hors borne (exact/standard : 1 code 16 bits)\n";
+    if (!ok) std::cerr << "Précision GPU hors borne (exact : 0 code, standard : 1 code 16 bits)\n";
     return ok ? 0 : 1;
 }

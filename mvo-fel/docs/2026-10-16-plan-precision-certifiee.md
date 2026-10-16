@@ -74,3 +74,4 @@ Ce que les Tensor Cores ne couvrent pas :
 |---|---|
 | C0 | Fait : table des seuils (parties haute et basse), `scripts/generate_pq_thresholds.py` |
 | C1 | Fait : [CPU certifié](2026-10-16-cpu-certifie.md) |
+| A1 | Fait : [Lent GPU certifié](2026-10-16-gpu-exact-certifie.md), identique au CPU certifié ; débit +20 à 25 % (au lieu de ×2 : l'EOTF en double domine, cible d'A2) |

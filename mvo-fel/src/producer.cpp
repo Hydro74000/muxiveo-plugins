@@ -57,6 +57,7 @@ int fel_gpu_render_yuv(void *, const AVDOVIMetadata *, const AVFrame *, const AV
 void fel_gpu_configure(void *, const fel_output *);
 void fel_gpu_timings(void *, double *);
 int fel_gpu_set_precision(void *, int);
+void fel_gpu_certified(void *, long long *, long long *);
 #endif
 }
 
@@ -296,6 +297,8 @@ struct mvo_fel_context {
     std::array<double,7> timing{}; // ouverture, lecture, BL, EL, pixels, NUT, pipe.
     // Attentes des files : décodage bloqué, rendu affamé, rendu bloqué, écriture affamée.
     std::array<double,4> waits{};
+    // Rendu certifié CPU : composantes reprises en double-double et indécises (aucune attendue).
+    std::atomic<long long> certified_rescued{0}, certified_undecided{0};
     Clock::time_point began{}, ended{};
     std::string statistics;
     mvo_fel_layers layers = nullptr;
@@ -452,11 +455,12 @@ struct mvo_fel_context {
             char name[256];
             fel_gpu_device_name(gpu_prototype, name, sizeof(name));
             if (!fel_gpu_set_precision(gpu_prototype, precision)) {
-                // Précision demandée impossible sans double natif : rendu CPU, en double.
+                // Précision demandée impossible (double natif absent, image non stockable ou
+                // auto-test exact refusé) : rendu CPU certifié.
                 fel_gpu_destroy(gpu_prototype);
                 gpu_prototype = nullptr;
                 av_buffer_unref(&hw_device);
-                backend = std::string("cpu (") + name + " sans calcul double)";
+                backend = std::string("cpu (") + name + " : précision " + precision_label(precision) + " indisponible)";
                 return;
             }
             backend = std::string("vulkan: ") + name + ", " + precision_label(precision);
@@ -763,7 +767,9 @@ struct mvo_fel_context {
                 if (fast && fast->valid()) {
                     rows->run((height + block - 1) / block, [&](int index) {
                         check_cancelled();
-                        fast->rows(job.mapping, *target, index*block, std::min(height, (index+1)*block));
+                        const auto stats = fast->rows(job.mapping, *target, index*block, std::min(height, (index+1)*block));
+                        certified_rescued += stats.rescued;
+                        certified_undecided += stats.undecided;
                     });
                 } else {
                     const muxiveo::fel::FrameSampler bs(base, width, height, false);
@@ -1011,6 +1017,16 @@ const char *mvo_fel_statistics(mvo_fel_context *p) {
     const auto end = p->ended.time_since_epoch().count() ? p->ended : Clock::now();
     const double wall = p->began.time_since_epoch().count() ? std::chrono::duration<double>(end-p->began).count() : 0;
     text << ",\"wall_s\":" << wall << ",\"fps\":" << (wall > 0 ? p->frames/wall : 0);
+    // Reprises du rendu certifié (CPU, et GPU en mode exact) ; indécises : aucune attendue.
+    long long rescued = p->certified_rescued, undecided = p->certified_undecided;
+#ifdef MVO_FEL_VULKAN_PROTOTYPE
+    if (p->gpu_prototype) {
+        long long gpu_rescued = 0, gpu_undecided = 0;
+        fel_gpu_certified(p->gpu_prototype, &gpu_rescued, &gpu_undecided);
+        rescued += gpu_rescued; undecided += gpu_undecided;
+    }
+#endif
+    text << ",\"certified_rescued\":" << rescued << ",\"certified_undecided\":" << undecided;
     // Attentes des files : l'étage le plus attendu par les autres est le goulot.
     const char *waits[]={"decode_blocked_s","render_starved_s","render_blocked_s","output_starved_s"};
     for(size_t i=0;i<p->waits.size();++i)text << ",\"" << waits[i] << "\":" << p->waits[i];

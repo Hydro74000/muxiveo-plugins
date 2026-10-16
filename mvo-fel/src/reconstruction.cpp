@@ -4,6 +4,7 @@
 #include "reconstruction.hpp"
 #include "blue_noise.h"
 #include "certified.hpp"
+#include "certified_abi.h"
 #include <algorithm>
 #include <cmath>
 #include <cstring>
@@ -567,6 +568,33 @@ bool FastReconstruction::bind(const AVFrame &bl, const AVFrame &el, const AVDOVI
     return true;
 }
 
+void FastReconstruction::exact_inputs(const Mapping &mapping, int x, int y, int64_t (&sums)[5], int64_t (&den)[5],
+                                      int &luma_code, std::array<unsigned, 3> &piece) const {
+    const Plane *planes[5] = {&base_chroma[0], &base_chroma[1], &enhancement[0], &enhancement[1], &enhancement[2]};
+    for (int k = 0; k < 5; ++k) {
+        const Plane &p = *planes[k];
+        const auto &hi = p.horizontal.index[x], &hw = p.horizontal.weight[x];
+        const auto &vi = p.vertical.index[y], &vw = p.vertical.weight[y];
+        int64_t sum = 0;
+        for (int b = 0; b < 4; ++b) {
+            const auto *row = reinterpret_cast<const uint16_t *>(p.data + vi[b]*p.stride);
+            int64_t partial = 0;
+            for (int a = 0; a < 4; ++a) partial += int64_t(hw[a])*(row[hi[a]] - p.offset);
+            sum += vw[b]*partial;
+        }
+        sums[k] = sum;
+        den[k] = int64_t(p.vertical.denominator[y])*p.horizontal.denominator[x];
+    }
+    luma_code = reinterpret_cast<const uint16_t *>(luma + y*luma_stride)[x];
+    for (int c = 0; c < 3; ++c) {
+        const auto &curve = mapping.curves[c];
+        const int64_t d = c ? den[c-1] : 1;
+        const int64_t numerator = std::clamp<int64_t>(c ? sums[c-1] : luma_code, 0, 1023*d);
+        piece[c] = 0;
+        while (piece[c]+2 < curve.count && numerator >= int64_t(curve.codes[piece[c]+1]) * d) ++piece[c];
+    }
+}
+
 CertifiedStats FastReconstruction::rows(const Mapping &mapping, AVFrame &rgb, int first_row, int last_row,
                                         bool extended) const {
     // Bornes d'erreur démontrées (docs/2026-10-16-cpu-certifie.md), unité d'arrondi u = 2^-53.
@@ -811,4 +839,67 @@ void convert_rows(const AVFrame &rgb, AVFrame &yuv, const fel_output &output, in
         }
     }
 }
+}
+
+extern "C" int fel_certified_codes(const AVDOVIMetadata *metadata, const uint32_t *entries, int count, uint16_t *codes) {
+    try {
+        const muxiveo::fel::Mapping mapping(*metadata);
+        int undecided = 0;
+        for (int i = 0; i < count; ++i) {
+            const uint32_t *e = entries + size_t(FEL_RESCUE_WORDS)*i;
+            muxiveo::fel::certified::ExactPixel pixel;
+            pixel.luma = static_cast<int>(e[1] & 0xffff);
+            for (int c = 0; c < 3; ++c) pixel.piece[c] = (e[1] >> (16 + 4*c)) & 15;
+            for (int c = 0; c < 2; ++c) { pixel.chroma[c] = int32_t(e[2+c]); pixel.chroma_den[c] = e[4]; }
+            for (int c = 0; c < 3; ++c) { pixel.residual[c] = int32_t(e[5+c]); pixel.residual_den[c] = c ? e[9] : e[8]; }
+            for (int c = 0; c < 3; ++c)
+                if (pixel.piece[c] + 1 >= mapping.curves[c].count || !pixel.chroma_den[0] || !pixel.residual_den[c])
+                    return -1;
+            std::array<uint16_t, 3> rgb{};
+            const unsigned mask = muxiveo::fel::certified::classify(mapping, pixel, 7, rgb);
+            undecided += (mask & 1) + (mask >> 1 & 1) + (mask >> 2 & 1);
+            for (int c = 0; c < 3; ++c) codes[3*i + c] = rgb[c];
+        }
+        return undecided;
+    } catch (const std::exception &) {
+        return -1;
+    }
+}
+
+extern "C" int fel_certified_check(const AVDOVIMetadata *metadata, const AVFrame *bl, const AVFrame *el,
+                                   int stride, const uint32_t *diag, double *worst) {
+    using namespace muxiveo::fel;
+    try {
+        const Mapping mapping(*metadata);
+        FastReconstruction fast(*bl, *el);
+        if (stride <= 0 || !fast.valid() || !fast.bind(*bl, *el, *metadata)) return -1;
+        int mismatches = 0;
+        *worst = 0;
+        for (int y = 0; y < bl->height; y += stride)
+            for (int x = 0; x < bl->width; ++x) {
+                int64_t sums[5], den[5];
+                certified::ExactPixel pixel;
+                fast.exact_inputs(mapping, x, y, sums, den, pixel.luma, pixel.piece);
+                for (int c = 0; c < 2; ++c) { pixel.chroma[c] = sums[c]; pixel.chroma_den[c] = den[c]; }
+                for (int c = 0; c < 3; ++c) { pixel.residual[c] = sums[2+c]; pixel.residual_den[c] = den[2+c]; }
+                std::array<uint16_t, 3> codes{};
+                std::array<certified::DD, 3> linear{};
+                certified::classify(mapping, pixel, 7, codes, &linear);
+                const uint32_t *d = diag + size_t(FEL_DIAG_WORDS)*(size_t(y/stride)*bl->width + x);
+                for (int c = 0; c < 3; ++c, d += 5) {
+                    double value, bound;
+                    const uint64_t vb = d[0] | uint64_t(d[1]) << 32, eb = d[2] | uint64_t(d[3]) << 32;
+                    std::memcpy(&value, &vb, 8);
+                    std::memcpy(&bound, &eb, 8);
+                    if (bound < 1e299) {
+                        const double ratio = std::abs((value - linear[c].hi) - linear[c].lo)/bound;
+                        *worst = std::isfinite(ratio) ? std::max(*worst, ratio) : INFINITY;
+                    }
+                    if ((d[4] >> 16 & 1) && (d[4] & 0xffff) != codes[c]) ++mismatches;
+                }
+            }
+        return mismatches;
+    } catch (const std::exception &) {
+        return -1;
+    }
 }

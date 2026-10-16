@@ -121,6 +121,9 @@ public:
     bool valid() const { return ok; }
     // Plans et offsets NLQ de l'image courante ; false si la géométrie a changé.
     bool bind(const AVFrame &bl, const AVFrame &el, const AVDOVIMetadata &metadata);
+    // Entrées exactes du pixel (x, y) pour une reprise certifiée (après bind).
+    void exact_inputs(const Mapping &mapping, int x, int y, int64_t (&sums)[5], int64_t (&den)[5],
+                      int &luma_code, std::array<unsigned, 3> &piece) const;
     // Codes RGB16 certifiés : arrondi exact de la formule de référence (voir certified.hpp).
     // extended : toutes les composantes calculées en double-double (tests).
     CertifiedStats rows(const Mapping &mapping, AVFrame &rgb, int first_row, int last_row,

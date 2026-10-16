@@ -9,12 +9,17 @@
 #include <libavutil/hwcontext_vulkan.h>
 #include <stdio.h>
 #include "output_format.h"
+#include "certified_abi.h"
 #include <math.h>
 #include <string.h>
 #include <inttypes.h>
 #include <stdlib.h>
 
 extern PFN_vkGetInstanceProcAddr fel_vk_get_proc_addr(void);
+/* Table des seuils PQ (data/pq_thresholds.bin) : 65 535 parties hautes puis basses. */
+extern const unsigned char fel_pq_threshold_bytes[];
+/* Reprises par image au plus (0,8 % d'une image UHD) ; au-delà, échec explicite du rendu. */
+#define FEL_RESCUE_CAPACITY 65536
 
 struct fel_gpu {
     pl_log log;
@@ -39,7 +44,14 @@ struct fel_gpu {
     /* Précision (fel_precision) ; double natif disponible sur le périphérique. */
     int precision, float64;
     pl_tex coef;                /* coefficients du RPU en double (render_precise) */
-    double coef_values[640];
+    double coef_values[674];
+    /* Mode exact certifié : seuils PQ (texture 256 × 256 de doubles), liste compacte des
+     * composantes indécises, correctifs du CPU certifié, diagnostic (lignes y % diag_stride). */
+    int storable;
+    pl_tex thresholds;
+    pl_buf rescue, patch, diag;
+    int diag_stride, self_test;
+    long long rescued, undecided;
 };
 
 static void collect_timers(struct fel_gpu *p)
@@ -54,6 +66,14 @@ void fel_gpu_timings(void *context, double *milliseconds)
 {
     const struct fel_gpu *p = context;
     for (int k = 0; k < 5; ++k) milliseconds[k] = p ? p->gpu_ns[k] / 1e6 : 0;
+}
+
+/* Mode exact : pixels repris par le CPU certifié et composantes indécises, cumulés. */
+void fel_gpu_certified(void *context, long long *rescued, long long *undecided)
+{
+    const struct fel_gpu *p = context;
+    *rescued = p ? p->rescued : 0;
+    *undecided = p ? p->undecided : 0;
 }
 
 int fel_gpu_device_name(void *context, char *buffer, size_t capacity)
@@ -86,6 +106,10 @@ void fel_gpu_destroy(void *context)
         for (int c=0;c<3;++c) pl_tex_destroy(p->vk->gpu, &p->planar[c]);
         pl_tex_destroy(p->vk->gpu, &p->dither);
         pl_tex_destroy(p->vk->gpu, &p->coef);
+        pl_tex_destroy(p->vk->gpu, &p->thresholds);
+        pl_buf_destroy(p->vk->gpu, &p->rescue);
+        pl_buf_destroy(p->vk->gpu, &p->patch);
+        pl_buf_destroy(p->vk->gpu, &p->diag);
         for (int k = 0; k < 5; ++k) pl_timer_destroy(p->vk->gpu, &p->timers[k]);
     }
     pl_dispatch_destroy(&p->dispatch);
@@ -120,8 +144,11 @@ void *fel_gpu_create(int width, int height, const char *device)
     for (int k = 0; k < 5; ++k) p->timers[k] = pl_timer_create(p->vk->gpu);
     pl_fmt fmt = pl_find_fmt(p->vk->gpu, PL_FMT_UNORM, 4, 16, 16, PL_FMT_CAP_RENDERABLE | PL_FMT_CAP_SAMPLEABLE);
     if (!fmt || !p->dispatch) goto fail;
+    /* Image stockable : rendu exact en shader de calcul et correctifs du CPU certifié. */
+    p->storable = (fmt->caps & PL_FMT_CAP_STORABLE) && p->vk->gpu->glsl.compute;
     p->target = pl_tex_create(p->vk->gpu, pl_tex_params(
-        .w = width, .h = height, .format = fmt, .renderable = true, .sampleable = true, .host_readable = true));
+        .w = width, .h = height, .format = fmt, .renderable = true, .sampleable = true, .host_readable = true,
+        .storable = p->storable));
     if (!p->target) goto fail;
     return p;
 fail:
@@ -575,7 +602,8 @@ static int join_layer(struct fel_gpu *p, pl_shader sh, int enhancement)
 
 #define FEL_CHANNEL 206                       /* coefficients par composante */
 #define FEL_GLOBAL (3*FEL_CHANNEL)
-#define FEL_COEFFICIENTS (FEL_GLOBAL + 22)    /* 640 doubles, texture 320 × 1 RGBA32UI */
+#define FEL_EXTRA (FEL_GLOBAL + 22)           /* poids d'erreur des segments (3 × 8), puis ΔM (9) */
+#define FEL_COEFFICIENTS (FEL_EXTRA + 34)     /* 674 doubles, texture 337 × 1 RGBA32UI */
 _Static_assert(FEL_COEFFICIENTS == sizeof(((struct fel_gpu *)0)->coef_values) / sizeof(double), "coefficients");
 
 static const double fel_lms_to_rgb[3][3] = {{3.06441879, -2.16597676, 0.10155818},
@@ -584,7 +612,9 @@ static const double fel_lms_to_rgb[3][3] = {{3.06441879, -2.16597676, 0.10155818
 
 /* Mêmes formules que Mapping (CPU). Disposition par composante : nombre de pivots, pivots
  * (codes), bornes normalisées, pente et seuil NLQ, puis 8 segments de 24 valeurs (méthode,
- * ordre MMR, coefficients). Global : résiduel, offsets, matrices Y'CbCr→LMS' et LMS→RGB. */
+ * ordre MMR, coefficients). Global : résiduel, offsets, matrices Y'CbCr→LMS' et LMS→RGB.
+ * Extra (mode exact) : poids d'erreur des segments comme Mapping::weight (polynôme
+ * 15·Σ|a|, MMR 80·(|c| + Σ|m|)) et erreur ΔM = 3,01·2^-53·Σ|A·B| du produit LMS→RGB. */
 static int fel_coefficients(const AVDOVIMetadata *metadata, double *v)
 {
     const AVDOVIRpuDataHeader *h = av_dovi_get_header(metadata);
@@ -612,13 +642,16 @@ static int fel_coefficients(const AVDOVIMetadata *metadata, double *v)
             if (curve->mapping_idc[k] == AV_DOVI_MAPPING_POLYNOMIAL) {
                 if (curve->poly_order[k] > 2) return 0;
                 for (int j = 0; j <= curve->poly_order[k]; ++j) piece[2 + j] = curve->poly_coef[k][j] * scale;
+                v[FEL_EXTRA + 8*i + k] = 15 * (fabs(piece[2]) + fabs(piece[3]) + fabs(piece[4]));
             } else if (curve->mapping_idc[k] == AV_DOVI_MAPPING_MMR) {
                 if (curve->mmr_order[k] < 1 || curve->mmr_order[k] > 3) return 0;
                 piece[0] = 1;
                 piece[1] = curve->mmr_order[k];
                 piece[2] = curve->mmr_constant[k] * scale;
+                double magnitude = fabs(piece[2]);
                 for (int o = 0; o < curve->mmr_order[k]; ++o)
-                    for (int j = 0; j < 7; ++j) piece[3 + 7*o + j] = curve->mmr_coef[k][o][j] * scale;
+                    for (int j = 0; j < 7; ++j) magnitude += fabs(piece[3 + 7*o + j] = curve->mmr_coef[k][o][j] * scale);
+                v[FEL_EXTRA + 8*i + k] = 80 * magnitude;
             } else return 0;
         }
     }
@@ -626,10 +659,14 @@ static int fel_coefficients(const AVDOVIMetadata *metadata, double *v)
     for (int i = 0; i < 3; ++i) {
         v[FEL_GLOBAL + 1 + i] = av_q2d(c->ycc_to_rgb_offset[i]) * (65536.0 / 65535.0);
         for (int j = 0; j < 3; ++j) {
-            double sum = 0;
-            for (int k = 0; k < 3; ++k) sum += fel_lms_to_rgb[i][k] * av_q2d(c->rgb_to_lms_matrix[3*k + j]);
+            double sum = 0, magnitude = 0;
+            for (int k = 0; k < 3; ++k) {
+                sum += fel_lms_to_rgb[i][k] * av_q2d(c->rgb_to_lms_matrix[3*k + j]);
+                magnitude += fabs(fel_lms_to_rgb[i][k] * av_q2d(c->rgb_to_lms_matrix[3*k + j]));
+            }
             v[FEL_GLOBAL + 4 + 3*i + j] = av_q2d(c->ycc_to_rgb_matrix[3*i + j]);
             v[FEL_GLOBAL + 13 + 3*i + j] = sum;
+            v[FEL_EXTRA + 24 + 3*i + j] = 3.01 * ldexp(1.0, -53) * magnitude;
         }
     }
     for (int k = 0; k < FEL_COEFFICIENTS; ++k) if (!isfinite(v[k])) return 0;
@@ -672,6 +709,14 @@ static const char fel_precise_header[] =
     "if(num<=0.0LF)return 0.0LF;if(den<=0.0LF)return 1.0e30LF;return fel_exp(fel_ln(num/den)*(8192.0LF/1305.0LF));}\n"
     "double fel_oetf(double y){double u=y>0.0LF?fel_exp(fel_ln(y)*0.1593017578125LF):0.0LF;"
     "return fel_exp(fel_ln((0.8359375LF+18.8515625LF*u)/(1.0LF+18.6875LF*u))*78.84375LF);}\n"
+    /* Mode exact certifié : EOTF, conditionnement κ = d ln L / d ln x et majorant |log2 L| + 1 ;
+     * seuils PQ arrondis vers le bas (texture fel_thr). */
+    "double fel_eotf_k(double x,out double kappa,out double mag,out bool pole){kappa=0.0LF;mag=1.0LF;pole=false;"
+    "if(x<=0.0LF)return 0.0LF;int n;double u=fel_expm1n(fel_ln(x)*(32.0LF/2523.0LF),n);if(n!=0)u=(1.0LF+u)*fel_pow2(n)-1.0LF;"
+    "double num=0.1640625LF+u,den=0.1640625LF-18.6875LF*u;if(den<=0.0LF){pole=true;return 0.0LF;}"
+    "if(num<=0.0LF){kappa=1.0e300LF;return 0.0LF;}kappa=(1.0LF+u)/12.56011962890625LF*(1.0LF/num+18.6875LF/den);"
+    "double t=fel_ln(num/den)*(8192.0LF/1305.0LF);mag=abs(t)*1.4426950408889634LF+1.0LF;return fel_exp(t);}\n"
+    "double fel_T(int k){return packDouble2x32(texelFetch(fel_thr,ivec2(k&255,k>>8),0).xy);}\n"
     /* Comparaisons entières exactes sur 64 bits (hi, lo). */
     "uvec2 fel_mul64(uint a,uint b){uint hi,lo;umulExtended(a,b,hi,lo);return uvec2(hi,lo);}\n"
     "bool fel_ge64(uvec2 a,uvec2 b){return a.x>b.x||(a.x==b.x&&a.y>=b.y);}\n"
@@ -703,11 +748,106 @@ static const char fel_precise_header[] =
     "ivec4 iy=texelFetch(" AY ",ivec2(xy.y,0),0),ny=texelFetch(" AY ",ivec2(xy.y,1),0);" \
     "int D=texelFetch(" AX ",ivec2(xy.x,2),0).x*texelFetch(" AY ",ivec2(xy.y,2),0).x;"
 
+/* Seuils PQ en texture RG32UI 256 × 256 (dernier texel : +inf), liste de reprises et correctifs. */
+static int prepare_exact(struct fel_gpu *p)
+{
+    if (p->thresholds && p->rescue && p->patch) return 1;
+    pl_fmt fmt = pl_find_fmt(p->vk->gpu, PL_FMT_UINT, 2, 32, 32, PL_FMT_CAP_SAMPLEABLE);
+    uint32_t *data = malloc(65536 * 2 * sizeof(uint32_t));
+    if (!fmt || !data) { free(data); return 0; }
+    memcpy(data, fel_pq_threshold_bytes, 65535 * sizeof(double));
+    data[2*65535] = 0; data[2*65535 + 1] = 0x7ff00000u;
+    int ok = pl_tex_recreate(p->vk->gpu, &p->thresholds, pl_tex_params(.w = 256, .h = 256, .format = fmt,
+                 .sampleable = true, .host_writable = true)) &&
+             pl_tex_upload(p->vk->gpu, pl_tex_transfer_params(.tex = p->thresholds, .ptr = data));
+    free(data);
+    if (!ok) return 0;
+    p->rescue = pl_buf_create(p->vk->gpu, pl_buf_params(.size = 4 + 4 * FEL_RESCUE_WORDS * (size_t)FEL_RESCUE_CAPACITY,
+                                                        .storable = true, .host_readable = true, .host_writable = true));
+    p->patch = pl_buf_create(p->vk->gpu, pl_buf_params(.size = 12 * (size_t)FEL_RESCUE_CAPACITY,
+                                                       .storable = true, .host_writable = true));
+    return p->rescue && p->patch;
+}
+
+static struct pl_buffer_var uint_array(const char *name, int count, size_t offset)
+{
+    struct pl_buffer_var var = {.var = {.name = name, .type = PL_VAR_UINT, .dim_v = 1, .dim_m = 1, .dim_a = count}};
+    var.layout = pl_std430_layout(offset, &var.var);
+    return var;
+}
+
+/* Correctifs du CPU certifié écrits dans l'image cible (shader de calcul, imageStore). */
+static int apply_patch(struct fel_gpu *p, const uint32_t *patch, uint32_t count)
+{
+    pl_buf_write(p->vk->gpu, p->patch, 0, patch, 12 * (size_t)count);
+    struct pl_buffer_var var = uint_array("fel_patch", 3 * FEL_RESCUE_CAPACITY, 0);
+    const struct pl_shader_desc desc[2] = {
+        {.desc = {.name = "fel_target", .type = PL_DESC_STORAGE_IMG, .access = PL_DESC_ACCESS_WRITEONLY},
+         .binding = {.object = p->target}},
+        {.desc = {.name = "fel_patch_buf", .type = PL_DESC_BUF_STORAGE, .access = PL_DESC_ACCESS_READONLY},
+         .binding = {.object = p->patch}, .buffer_vars = &var, .num_buffer_vars = 1},
+    };
+    const struct pl_shader_var number = {.var = {.name = "fel_patch_count", .type = PL_VAR_UINT, .dim_v = 1,
+                                                 .dim_m = 1, .dim_a = 1}, .data = &count, .dynamic = true};
+    pl_shader sh = pl_dispatch_begin(p->dispatch);
+    int ok = pl_shader_custom(sh, &(struct pl_custom_shader){
+        .body = "uint i=gl_GlobalInvocationID.x;if(i<fel_patch_count){uint a=fel_patch[3u*i],b=fel_patch[3u*i+1u],"
+                "c=fel_patch[3u*i+2u];imageStore(fel_target,ivec2(int(a&0xffffu),int(a>>16)),"
+                "vec4((vec3(float(b&0xffffu),float(b>>16),float(c))+0.25)/65535.0,1.0));}",
+        .input = PL_SHADER_SIG_NONE, .output = PL_SHADER_SIG_NONE, .descriptors = desc, .num_descriptors = 2,
+        .variables = &number, .num_variables = 1, .compute = true, .compute_group_size = {64, 1}});
+    ok = ok && pl_dispatch_compute(p->dispatch, pl_dispatch_compute_params(.shader = &sh,
+                                   .dispatch_size = {(int)((count + 63) / 64), 1, 1}));
+    pl_dispatch_abort(p->dispatch, &sh);
+    return ok;
+}
+
+/* Composantes indécises du rendu exact : liste rapatriée, codes du CPU certifié, correctifs. */
+static int resolve_rescues(struct fel_gpu *p, const AVDOVIMetadata *metadata)
+{
+    uint32_t count = 0;
+    if (!pl_buf_read(p->vk->gpu, p->rescue, 0, &count, sizeof(count))) return 0;
+    if (count > FEL_RESCUE_CAPACITY) {
+        fprintf(stderr, "mvo-fel : %u composantes à reprendre, capacité %d dépassée\n", count, FEL_RESCUE_CAPACITY);
+        return 0;
+    }
+    if (!count) return 1;
+    uint32_t *entries = malloc(4 * FEL_RESCUE_WORDS * (size_t)count), *patch = malloc(12 * (size_t)count);
+    uint16_t *codes = malloc(6 * (size_t)count);
+    int ok = entries && patch && codes &&
+             pl_buf_read(p->vk->gpu, p->rescue, 4, entries, 4 * FEL_RESCUE_WORDS * (size_t)count);
+    const int undecided = ok ? fel_certified_codes(metadata, entries, (int)count, codes) : -1;
+    ok = ok && undecided >= 0;
+    for (uint32_t i = 0; ok && i < count; ++i) {
+        patch[3*i] = entries[FEL_RESCUE_WORDS * i];
+        patch[3*i + 1] = codes[3*i] | (uint32_t)codes[3*i + 1] << 16;
+        patch[3*i + 2] = codes[3*i + 2];
+    }
+    ok = ok && apply_patch(p, patch, count);
+    if (ok) {
+        for (uint32_t i = 0; i < count; ++i) {
+            const uint32_t mask = entries[FEL_RESCUE_WORDS * i + 1] >> 28;
+            p->rescued += (mask & 1) + (mask >> 1 & 1) + (mask >> 2 & 1);
+        }
+        p->undecided += undecided;
+    }
+    free(entries); free(patch); free(codes);
+    return ok;
+}
+
 static int render_precise(struct fel_gpu *p, const AVDOVIMetadata *metadata)
 {
-    if (!upload_coefficients(p, metadata)) return 0;
+    const int exact = p->precision == FEL_PRECISION_EXACT;
+    if (!upload_coefficients(p, metadata) || !prepare_exact(p)) return 0;
+    static const uint32_t zero = 0;
+    if (exact) pl_buf_write(p->vk->gpu, p->rescue, 0, &zero, sizeof(zero));
     const AVDOVIDataMapping *mapping = av_dovi_get_mapping(metadata);
-    const struct pl_shader_desc planes[13] = {
+    struct pl_buffer_var rescue_vars[2] = {uint_array("fel_rescue_count", 1, 0)};
+    rescue_vars[1] = uint_array("fel_rescue", FEL_RESCUE_WORDS * FEL_RESCUE_CAPACITY,
+                                rescue_vars[0].layout.offset + rescue_vars[0].layout.size);
+    const int diag_rows = p->diag_stride > 0 ? (p->height + p->diag_stride - 1) / p->diag_stride : 0;
+    struct pl_buffer_var diag_var = uint_array("fel_diag", diag_rows ? FEL_DIAG_WORDS * diag_rows * p->width : 1, 0);
+    const struct pl_shader_desc planes[16] = {
         {.desc = {.name = "fb0", .type = PL_DESC_SAMPLED_TEX}, .binding = {.object = p->source[0]}},
         {.desc = {.name = "fb1", .type = PL_DESC_SAMPLED_TEX}, .binding = {.object = p->source[1]}},
         {.desc = {.name = "fb2", .type = PL_DESC_SAMPLED_TEX}, .binding = {.object = p->source[2]}},
@@ -721,11 +861,16 @@ static int render_precise(struct fel_gpu *p, const AVDOVIMetadata *metadata)
         {.desc = {.name = "fcx", .type = PL_DESC_SAMPLED_TEX}, .binding = {.object = p->fused_axes[4]}},
         {.desc = {.name = "fcy", .type = PL_DESC_SAMPLED_TEX}, .binding = {.object = p->fused_axes[5]}},
         {.desc = {.name = "fel_coef", .type = PL_DESC_SAMPLED_TEX}, .binding = {.object = p->coef}},
+        {.desc = {.name = "fel_thr", .type = PL_DESC_SAMPLED_TEX}, .binding = {.object = p->thresholds}},
+        {.desc = {.name = "fel_rescue_buf", .type = PL_DESC_BUF_STORAGE, .access = PL_DESC_ACCESS_READWRITE},
+         .binding = {.object = p->rescue}, .buffer_vars = rescue_vars, .num_buffer_vars = 2},
+        {.desc = {.name = "fel_diag_buf", .type = PL_DESC_BUF_STORAGE, .access = PL_DESC_ACCESS_WRITEONLY},
+         .binding = {.object = p->diag}, .buffer_vars = &diag_var, .num_buffer_vars = 1},
     };
-    const int H = FEL_CHANNEL, G = FEL_GLOBAL;
-    char body[16384];
+    const int H = FEL_CHANNEL, G = FEL_GLOBAL, E = FEL_EXTRA;
+    char body[24576];
     int used = snprintf(body, sizeof(body),
-        "ivec2 xy=ivec2(gl_FragCoord.xy);"
+        "ivec2 xy0=ivec2(gl_FragCoord.xy);bool inside=xy0.x<%d&&xy0.y<%d;ivec2 xy=min(xy0,ivec2(%d,%d));"
         "int code=clamp(int(round(texelFetch(fb0,xy,0).r*65535.0)),0,1023);"
         "int tb=0,tr=0,Db,te0=0,te1=0,te2=0,Dl,Dc;"
         "{" FEL_EXACT_TAPS("fbx", "fby")
@@ -760,46 +905,190 @@ static int render_precise(struct fel_gpu *p, const AVDOVIMetadata *metadata)
         "for(int j=0;j<7;++j){double acc=fel_d(P+3+7*(order-1)+j);"
         "for(int k=order-2;k>=0;--k)acc=acc*t7[j]+fel_d(P+3+7*k+j);s+=acc*t7[j];}}"
         "res[c]=clamp(s,fel_d(B+10),fel_d(B+11));}"
-        /* Résiduel EL : zéro entier exact, sinon signe, pente et seuil NLQ. */
+        /* Résiduel EL : zéro entier exact, sinon signe, pente et seuil NLQ (en : poids d'erreur). */
+        "double en[3]=double[3](0.0LF,0.0LF,0.0LF);"
         "if(fel_d(%d)!=0.0LF){int te[3]=int[3](te0,te1,te2);int De[3]=int[3](Dl,Dc,Dc);"
         "for(int c=0;c<3;++c)if(te[c]!=0){double d=double(te[c])/(1023.0LF*double(De[c]));"
-        "res[c]+=sign(d)*(abs(d)*fel_d(c*%d+12)+fel_d(c*%d+13));}}"
+        "res[c]+=sign(d)*(abs(d)*fel_d(c*%d+12)+fel_d(c*%d+13));en[c]=abs(d)*abs(fel_d(c*%d+12))+abs(fel_d(c*%d+13));}}"
         "double v[3];for(int i=0;i<3;++i)v[i]=res[i]-fel_d(%d+1+i);"
         "double xd[3];for(int i=0;i<3;++i)xd[i]=fel_d(%d+4+3*i)*v[0]+fel_d(%d+5+3*i)*v[1]+fel_d(%d+6+3*i)*v[2];"
-        "vec3 out3;bool refine=true;",
+        "vec3 out3;",
+        p->width, p->height, p->width - 1, p->height - 1,
         mapping->nlq[0].nlq_offset, mapping->nlq[1].nlq_offset, mapping->nlq[2].nlq_offset,
-        H, H, G, H, H, G, G, G, G);
-    if (p->precision == FEL_PRECISION_STANDARD && used > 0 && used < (int)sizeof(body))
+        H, H, G, H, H, H, H, G, G, G, G);
+    if (!exact && used > 0 && used < (int)sizeof(body))
         used += snprintf(body + used, sizeof(body) - used,
             /* Float32 avec borne estimée (premier ordre, marges ×8 ; validée par stress, sans
              * preuve formelle) : erreur relative de L (EOTF), annulation de la matrice LMS→RGB,
              * puis PQ. La PQ est concave : sa pente sur [y-e, y+e] est maximale en y-e, d'où la
              * pente prise en y-e ; si y ≤ e, PQ(2e) majore l'écart. */
-            "refine=false;float fL[3],fR[3];"
+            "bool refine=false;float fL[3],fR[3];"
             "for(int i=0;i<3;++i){float x=float(xd[i]),rel;fL[i]=f_eotf(x,1.0e-7*abs(x),rel);fR[i]=rel;"
             "if(rel>1.0e20)refine=true;}"
             "for(int i=0;i<3&&!refine;++i){float y=0.0,ey=0.0;"
             "for(int k=0;k<3;++k){float m=float(fel_d(%d+13+3*i+k));y+=m*fL[k];ey+=abs(m)*fL[k]*(fR[k]+1.0e-6);}"
             "float slope;float pq=f_oetf(y,slope);float err;"
             "if(y>ey){f_oetf(y-ey,slope);err=slope*ey+2.0e-6*pq;}else err=f_oetf(2.0*ey,slope);"
-            "if(err*65535.0>0.4)refine=true;out3[i]=(floor(clamp(pq,0.0,1.0)*65535.0+0.5)+0.25)/65535.0;}",
-            G);
-    if (used > 0 && used < (int)sizeof(body))
-        used += snprintf(body + used, sizeof(body) - used,
+            "if(err*65535.0>0.4)refine=true;out3[i]=(floor(clamp(pq,0.0,1.0)*65535.0+0.5)+0.25)/65535.0;}"
             /* Double : EOTF, matrice LMS→RGB, OETF ; entier 16 bits arrondi au plus proche,
              * écrit avec +0,25 (exact quel que soit l'arrondi UNORM du pilote). */
             "if(refine){double lms[3];for(int i=0;i<3;++i)lms[i]=fel_eotf(xd[i]);"
             "for(int i=0;i<3;++i){double y=fel_d(%d+13+3*i)*lms[0]+fel_d(%d+14+3*i)*lms[1]+fel_d(%d+15+3*i)*lms[2];"
             "out3[i]=(float(floor(clamp(fel_oetf(y),0.0LF,1.0LF)*65535.0LF+0.5LF))+0.25)/65535.0;}}"
             "color=vec4(out3,1.0);",
-            G, G, G);
+            G, G, G, G);
+    if (exact && used > 0 && used < (int)sizeof(body))
+        used += snprintf(body + used, sizeof(body) - used,
+            /* Exact certifié : bornes du CPU certifié (docs/2026-10-16-cpu-certifie.md) avec
+             * u = 2^-52 (une erreur d'un ulp entier par opération double du GPU), classement entre
+             * seuils PQ ; composante indécise : code candidat, puis correctif du CPU certifié. */
+            "const double U=1.0LF/4503599627370496.0LF;"
+            "int seg[3];double ev[3];"
+            "for(int c=0;c<3;++c){seg[c]=(piece[c]-c*%d-14)/24;"
+            "ev[c]=(fel_d(%d+8*c+seg[c])+1.0LF)*U+5.3LF*U*en[c]+2.02LF*U*abs(fel_d(%d+1+c))+5.03LF*U*abs(v[c]);}"
+            "double L[3],eL[3];bool pole=false;"
+            "for(int i=0;i<3;++i){double e=1.01LF*(abs(fel_d(%d+4+3*i))*ev[0]+abs(fel_d(%d+5+3*i))*ev[1]+abs(fel_d(%d+6+3*i))*ev[2]);"
+            "double s=xd[i],k,mag;bool pl;double l=fel_eotf_k(s,k,mag,pl);pole=pole||pl;"
+            "if(s+e<=7.3095590257839e-7LF){L[i]=0.0LF;eL[i]=0.0LF;}"
+            "else{L[i]=l;eL[i]=s-e>7.3095590257840e-7LF&&k*e<=1.0e-6LF*s&&e<=1.0e-6LF*s"
+            "?l*((800.0LF*k+60.0LF+4.2LF*mag)*U+1.01LF*k*e/s)+1.0e-300LF:1.0e300LF;}}"
+            "uint mask=0u;"
+            "for(int c=0;c<3;++c){double R=0.0LF,e=0.0LF;"
+            "for(int k=0;k<3;++k){double M=fel_d(%d+13+3*c+k),dM=fel_d(%d+24+3*c+k);"
+            "R+=M*L[k];e+=(abs(M)*(1.0LF+4.0LF*U)+dM)*eL[k]+(dM+3.01LF*U*abs(M))*L[k];}"
+            "e=e*(1.0LF+1.0e-12LF)+4.0LF*U*abs(R)+1.0e-300LF;"
+            "int q=0;if(R>0.0LF){float y=float(R),sl;q=y>=1.0?65535:clamp(int(floor(f_oetf(y,sl)*65535.0+0.5)),0,65535);}"
+            "for(int i=0;i<8&&q<65535&&R>fel_T(q);++i)++q;"
+            "for(int i=0;i<8&&q>0&&R<=fel_T(q-1);++i)--q;"
+            "bool certain=!pole&&(q==0||R-e>fel_T(q-1))&&(q==65535||R+e<=fel_T(q));"
+            "if(!certain)mask|=1u<<c;"
+            "out3[c]=(float(q)+0.25)/65535.0;",
+            H, E, G, G, G, G, G, E);
+    if (exact && diag_rows && used > 0 && used < (int)sizeof(body))
+        used += snprintf(body + used, sizeof(body) - used,
+            "if(inside&&xy.y%%%d==0){uint b=%du*(uint(xy.y/%d)*%du+uint(xy.x))+5u*uint(c);"
+            "uvec2 r=unpackDouble2x32(R),w=unpackDouble2x32(e);fel_diag[b]=r.x;fel_diag[b+1u]=r.y;"
+            "fel_diag[b+2u]=w.x;fel_diag[b+3u]=w.y;fel_diag[b+4u]=uint(q)|(certain?65536u:0u);}",
+            p->diag_stride, FEL_DIAG_WORDS, p->diag_stride, p->width);
+    if (exact && used > 0 && used < (int)sizeof(body))
+        used += snprintf(body + used, sizeof(body) - used,
+            "}"
+            "if(mask!=0u&&inside){uint i=atomicAdd(fel_rescue_count,1u);if(i<%du){uint b=%du*i;"
+            "fel_rescue[b]=uint(xy.x)|(uint(xy.y)<<16);"
+            "fel_rescue[b+1u]=uint(code)|(uint(seg[0])<<16)|(uint(seg[1])<<20)|(uint(seg[2])<<24)|(mask<<28);"
+            "fel_rescue[b+2u]=uint(tb);fel_rescue[b+3u]=uint(tr);fel_rescue[b+4u]=uint(Db);fel_rescue[b+5u]=uint(te0);"
+            "fel_rescue[b+6u]=uint(te1);fel_rescue[b+7u]=uint(te2);fel_rescue[b+8u]=uint(Dl);fel_rescue[b+9u]=uint(Dc);}}"
+            "color=vec4(out3,1.0);",
+            FEL_RESCUE_CAPACITY, FEL_RESCUE_WORDS);
     if (used <= 0 || used >= (int)sizeof(body)) return 0;
     pl_shader sh = pl_dispatch_begin(p->dispatch);
     int ok = pl_shader_custom(sh, &(struct pl_custom_shader){.header = fel_precise_header, .body = body,
-        .input = PL_SHADER_SIG_NONE, .output = PL_SHADER_SIG_COLOR, .descriptors = planes, .num_descriptors = 13,
-        .output_w = p->width, .output_h = p->height});
+        .input = PL_SHADER_SIG_NONE, .output = PL_SHADER_SIG_COLOR, .descriptors = planes,
+        .num_descriptors = exact ? (diag_rows ? 16 : 15) : 14,
+        .output_w = p->width, .output_h = p->height, .compute = exact, .compute_group_size = {16, 16}});
     ok = ok && pl_dispatch_finish(p->dispatch, pl_dispatch_params(.timer = p->timers[3], .shader = &sh, .target = p->target));
     pl_dispatch_abort(p->dispatch, &sh);
+    return ok && (!exact || resolve_rescues(p, metadata));
+}
+
+/* Couche 4:2:0 10 bits aléatoire (générateur congruentiel), position chroma en haut à gauche. */
+static AVFrame *test_layer(int width, int height, uint32_t *state, int low, int high)
+{
+    AVFrame *frame = av_frame_alloc();
+    if (!frame) return NULL;
+    frame->format = AV_PIX_FMT_YUV420P10LE; frame->width = width; frame->height = height;
+    frame->chroma_location = AVCHROMA_LOC_TOPLEFT;
+    if (av_frame_get_buffer(frame, 32) < 0) { av_frame_free(&frame); return NULL; }
+    for (int c = 0; c < 3; ++c)
+        for (int y = 0; y < (c ? (height + 1) / 2 : height); ++y) {
+            uint16_t *row = (uint16_t *)(frame->data[c] + y * frame->linesize[c]);
+            for (int x = 0; x < (c ? (width + 1) / 2 : width); ++x) {
+                *state = *state * 1664525u + 1013904223u;
+                row[x] = (uint16_t)(low + (*state >> 8) % (uint32_t)(high - low + 1));
+            }
+        }
+    return frame;
+}
+
+/* RPU de test : matrices Dolby réalistes ; mmr : matrices identité et segment MMR d'ordre 2 à
+ * fortes annulations (plages de codes du test fel_gpu_precision, signaux dans le domaine PQ). */
+static void test_metadata(AVDOVIMetadata *metadata, int mmr)
+{
+    AVDOVIRpuDataHeader *header = av_dovi_get_header(metadata);
+    AVDOVIDataMapping *mapping = av_dovi_get_mapping(metadata);
+    AVDOVIColorMetadata *color = av_dovi_get_color(metadata);
+    static const int ycc[9] = {65536, 0, 91881, 65536, -22554, -46802, 65536, 116130, 0};
+    static const int lms[9] = {4408196, 5353728, 238131, 1619851, 7586529, 793630, 0, 257773, 9740729};
+    header->bl_bit_depth = header->el_bit_depth = 10;
+    header->coef_log2_denom = 16;
+    header->disable_residual_flag = 0;
+    mapping->nlq_method_idc = AV_DOVI_NLQ_LINEAR_DZ;
+    for (int c = 0; c < 3; ++c) {
+        AVDOVIReshapingCurve *curve = &mapping->curves[c];
+        memset(curve, 0, sizeof(*curve));
+        curve->num_pivots = 2; curve->pivots[1] = 1023;
+        curve->poly_order[0] = 1; curve->poly_coef[0][1] = 65536;
+        if (mmr) {
+            curve->num_pivots = 3; curve->pivots[1] = 400; curve->pivots[2] = 1023;
+            curve->mapping_idc[1] = AV_DOVI_MAPPING_MMR;
+            curve->mmr_order[1] = 2; curve->mmr_constant[1] = 2000;
+            for (int k = 0; k < 2; ++k)
+                for (int j = 0; j < 7; ++j) curve->mmr_coef[1][k][j] = 3000 * (j + 1) * (k ? -1 : 1);
+        }
+        mapping->nlq[c].nlq_offset = 512;
+        mapping->nlq[c].linear_deadzone_slope = 64;
+        mapping->nlq[c].linear_deadzone_threshold = 32;
+        color->ycc_to_rgb_offset[c] = (AVRational){!mmr && c ? 32768 : 0, 65536};
+        for (int j = 0; j < 3; ++j) {
+            color->ycc_to_rgb_matrix[3*c + j] = mmr ? (AVRational){c == j, 1} : (AVRational){ycc[3*c + j], 65536};
+            color->rgb_to_lms_matrix[3*c + j] = mmr ? (AVRational){c == j, 1} : (AVRational){lms[3*c + j], 10000000};
+        }
+    }
+}
+
+/* Auto-test du rendu exact sur ce GPU, à la taille de l'image : couches aléatoires, deux RPU.
+ * Sur deux lignes, chaque valeur linéaire R̂ du GPU doit rester à moins de la moitié de sa borne
+ * de la valeur double-double, et chaque code certain égaler le code certifié du CPU. Échec :
+ * mode exact refusé (rendu CPU). Le bilan est écrit sur stderr si MVO_FEL_GPU_SELF_TEST est défini. */
+static int render_target(struct fel_gpu *p, const AVDOVIMetadata *metadata, const AVFrame *bl, const AVFrame *el);
+static int fel_gpu_self_test(struct fel_gpu *p)
+{
+    size_t size = 0;
+    AVDOVIMetadata *metadata = av_dovi_metadata_alloc(&size);
+    uint32_t state = 12345;
+    int ok = metadata != NULL;
+    double worst = 0;
+    int mismatches = 0;
+    const long long rescued = p->rescued, undecided = p->undecided;
+    p->diag_stride = p->height > 1 ? p->height / 2 : 1;
+    const int rows = (p->height + p->diag_stride - 1) / p->diag_stride;
+    const size_t words = (size_t)FEL_DIAG_WORDS * rows * p->width;
+    uint32_t *diag = malloc(4 * words);
+    p->diag = ok && diag ? pl_buf_create(p->vk->gpu, pl_buf_params(.size = 4 * words, .storable = true,
+                                                                   .host_readable = true)) : NULL;
+    ok = ok && p->diag;
+    for (int mmr = 0; ok && mmr < 2; ++mmr) {
+        test_metadata(metadata, mmr);
+        AVFrame *bl = test_layer(p->width, p->height, &state, mmr ? 0 : 200, mmr ? 1023 : 760);
+        AVFrame *el = test_layer((p->width + 1) / 2, (p->height + 1) / 2, &state, mmr ? 0 : 200, mmr ? 1023 : 760);
+        double ratio = 0;
+        ok = bl && el && render_target(p, metadata, bl, el) &&
+             pl_buf_read(p->vk->gpu, p->diag, 0, diag, 4 * words);
+        const int count = ok ? fel_certified_check(metadata, bl, el, p->diag_stride, diag, &ratio) : -1;
+        ok = ok && count >= 0;
+        mismatches += count > 0 ? count : 0;
+        if (ratio > worst || ratio != ratio) worst = ratio;
+        av_frame_free(&bl); av_frame_free(&el);
+    }
+    ok = ok && mismatches == 0 && worst <= 0.5;
+    if (getenv("MVO_FEL_GPU_SELF_TEST"))
+        fprintf(stderr, "mvo-fel : auto-test exact %s (écart / borne %.4g, codes différents %d)\n",
+                ok ? "réussi" : "refusé", worst, mismatches);
+    pl_buf_destroy(p->vk->gpu, &p->diag);
+    p->diag_stride = 0;
+    p->rescued = rescued; p->undecided = undecided;
+    free(diag);
+    av_free(metadata);
     return ok;
 }
 
@@ -807,7 +1096,14 @@ int fel_gpu_set_precision(void *context, int precision)
 {
     struct fel_gpu *p = context;
     if (precision < FEL_PRECISION_FAST || precision > FEL_PRECISION_EXACT ||
-        (precision != FEL_PRECISION_FAST && !p->float64)) return 0;
+        (precision != FEL_PRECISION_FAST && !p->float64) || (precision == FEL_PRECISION_EXACT && !p->storable)) return 0;
+    if (precision == FEL_PRECISION_EXACT && !p->self_test) {
+        const int previous = p->precision;
+        p->precision = precision;
+        p->self_test = fel_gpu_self_test(p) ? 1 : -1;
+        p->precision = previous;
+    }
+    if (precision == FEL_PRECISION_EXACT && p->self_test < 0) return 0;
     p->precision = precision;
     return 1;
 }
@@ -908,14 +1204,21 @@ static int prepare_dither(struct fel_gpu *p, int mode)
     return 1;
 }
 
-static int dispatch(struct fel_gpu *p, pl_tex target, const char *body, int w, int h)
+/* floor(A/D + t/8192) en double, entiers exacts (|A|, D·8192 < 2^53) : quotient corrigé puis
+ * comparaison du reste au seuil de tramage, sans int64 ni arrondi de division. */
+static const char fel_quantize_header[] =
+    "double fel_quant(double A,double D,double t){double q=floor(A/D),r=A-q*D;"
+    "for(int i=0;i<2;++i){if(r<0.0LF){q-=1.0LF;r+=D;}if(r>=D){q+=1.0LF;r-=D;}}"
+    "return q+(r*8192.0LF>=D*(8192.0LF-t)?1.0LF:0.0LF);}\n";
+
+static int dispatch(struct fel_gpu *p, pl_tex target, const char *header, const char *body, int w, int h)
 {
     const struct pl_shader_desc descriptors[2] = {
         {.desc = {.name = "fel_rgb", .type = PL_DESC_SAMPLED_TEX}, .binding = {.object = p->target}},
         {.desc = {.name = "fel_threshold", .type = PL_DESC_SAMPLED_TEX}, .binding = {.object = p->dither}},
     };
     pl_shader sh = pl_dispatch_begin(p->dispatch);
-    int ok = pl_shader_custom(sh, &(struct pl_custom_shader){.body = body, .input = PL_SHADER_SIG_NONE,
+    int ok = pl_shader_custom(sh, &(struct pl_custom_shader){.header = header, .body = body, .input = PL_SHADER_SIG_NONE,
         .output = PL_SHADER_SIG_COLOR, .descriptors = descriptors, .num_descriptors = 2,
         .output_w = w, .output_h = h});
     ok = ok && pl_dispatch_finish(p->dispatch, pl_dispatch_params(.timer = p->timers[4], .shader = &sh, .target = target));
@@ -925,7 +1228,8 @@ static int dispatch(struct fel_gpu *p, pl_tex target, const char *body, int w, i
 
 /* Y'CbCr BT.2020nc limité, 4:2:0 bilinéaire au point chroma, quantification tramée :
  * mêmes formules que convert_rows (CPU). Entiers écrits avec +0,25 : exacts que le
- * pilote arrondisse au plus proche ou vers zéro. v = NULL : chroma entrelacée (P010). */
+ * pilote arrondisse au plus proche ou vers zéro. v = NULL : chroma entrelacée (P010).
+ * Mode exact : arithmétique entière exacte de convert_rows, simulée en double (fel_quant). */
 static int convert(struct fel_gpu *p, const struct fel_output *o, pl_tex y, pl_tex u, pl_tex v)
 {
     /* Constantes en expressions entières : snprintf("%g") suit LC_NUMERIC (virgule
@@ -952,19 +1256,19 @@ static int convert(struct fel_gpu *p, const struct fel_output *o, pl_tex y, pl_t
         "float k = clamp(floor((219.0*l + 16.0)*%d.0 + texelFetch(fel_threshold, xy & 63, 0).r), 0.0, %d.0);"
         "color = vec4(k*U + B, 0.0, 0.0, 1.0);",
         numerator, denominator, denominator, o->crop_x, o->crop_y, scale, maximum);
-    /* Mode exact : mêmes formules, même ordre et double comme convert_rows (CPU), sans
-     * contraction en FMA (precise) : codes identiques au CPU. */
+    /* Mode exact : luma floor(219·S·2^(d-8)/(10000·65535) + t) + 16·2^(d-8), S = 2627R + 6780G + 593B. */
     const int exact = p->precision == FEL_PRECISION_EXACT;
     if (exact)
         snprintf(body, sizeof(body),
             "const float U = %d.0/%d.0, B = 0.25/%d.0;"
             "ivec2 xy=ivec2(gl_FragCoord.xy);"
-            "dvec3 c=dvec3(round(texelFetch(fel_rgb, xy + ivec2(%d, %d), 0).rgb*65535.0))/65535.0LF;"
-            "precise double l=0.2627LF*c.r+(1.0LF-0.2627LF-0.0593LF)*c.g+0.0593LF*c.b;"
-            "precise double q=(219.0LF*l+16.0LF)*%d.0LF+double(texelFetch(fel_threshold, xy & 63, 0).r);"
-            "color = vec4(float(clamp(floor(q),0.0LF,%d.0LF))*U + B, 0.0, 0.0, 1.0);",
-            numerator, denominator, denominator, o->crop_x, o->crop_y, scale, maximum);
-    if (!dispatch(p, y, body, o->width, o->height)) return 0;
+            "dvec3 c=dvec3(round(texelFetch(fel_rgb, xy + ivec2(%d, %d), 0).rgb*65535.0));"
+            "double A=219.0LF*(2627.0LF*c.r+6780.0LF*c.g+593.0LF*c.b)*%d.0LF;"
+            "double t=double(round(texelFetch(fel_threshold, xy & 63, 0).r*8192.0));"
+            "double k=min(16.0LF*%d.0LF+fel_quant(A,655350000.0LF,t),%d.0LF);"
+            "color = vec4(float(k)*U + B, 0.0, 0.0, 1.0);",
+            numerator, denominator, denominator, o->crop_x, o->crop_y, scale, scale, maximum);
+    if (!dispatch(p, y, exact ? fel_quantize_header : NULL, body, o->width, o->height)) return 0;
     for (int plane = 0; plane < (v ? 2 : 1); ++plane) {
         const char *store = !v ? "color = vec4(qb*U + B, qr*U + B, 0.0, 1.0);"
                           : plane == 0 ? "color = vec4(qb*U + B, 0.0, 0.0, 1.0);" : "color = vec4(qr*U + B, 0.0, 0.0, 1.0);";
@@ -985,27 +1289,30 @@ static int convert(struct fel_gpu *p, const struct fel_output *o, pl_tex y, pl_t
             numerator, denominator, denominator, wx[0], wx[1], wx[2], wx[3], wy[0], wy[1], wy[2], wy[3],
             o->crop_x, fx, o->crop_y, fy, p->width - 1, p->height - 1,
             scale, maximum, scale, maximum, store);
+        /* Chroma exacte : poids en 8es par axe (sommes sur 64), 224·cb = 7X/(4·k·65535),
+         * X = 9407B - 2627R - 6780G (k = 9407) ou 7373R - 6780G - 593B (k = 7373). */
         if (exact)
             snprintf(body, sizeof(body),
                 "const float U = %d.0/%d.0, B = 0.25/%d.0;"
-                "const double WX[4] = double[4](%d.0LF/16.0LF, %d.0LF/16.0LF, %d.0LF/16.0LF, %d.0LF/16.0LF);"
-                "const double WY[4] = double[4](%d.0LF/16.0LF, %d.0LF/16.0LF, %d.0LF/16.0LF, %d.0LF/16.0LF);"
+                "const double WX[4] = double[4](%d.0LF, %d.0LF, %d.0LF, %d.0LF);"
+                "const double WY[4] = double[4](%d.0LF, %d.0LF, %d.0LF, %d.0LF);"
                 "ivec2 ij = ivec2(gl_FragCoord.xy);"
-                "precise dvec3 s = dvec3(0.0LF);"
+                "dvec3 s = dvec3(0.0LF);"
                 "for (int b = 0; b < 4; b++) for (int a = 0; a < 4; a++) {"
                 "  double w = WX[a]*WY[b]; if (w == 0.0LF) continue;"
                 "  ivec2 q = clamp(ivec2(%d + 2*ij.x + %d + a, %d + 2*ij.y + %d + b), ivec2(0), ivec2(%d, %d));"
-                "  s += w*(dvec3(round(texelFetch(fel_rgb, q, 0).rgb*65535.0))/65535.0LF); }"
-                "precise double l = 0.2627LF*s.r+(1.0LF-0.2627LF-0.0593LF)*s.g+0.0593LF*s.b;"
-                "precise double cb = (s.b - l)/(2.0LF*(1.0LF-0.0593LF)), cr = (s.r - l)/(2.0LF*(1.0LF-0.2627LF));"
-                "precise double vb = (224.0LF*cb + 128.0LF)*%d.0LF + double(texelFetch(fel_threshold, (ij + ivec2(21, 11)) & 63, 0).r);"
-                "precise double vr = (224.0LF*cr + 128.0LF)*%d.0LF + double(texelFetch(fel_threshold, (ij + ivec2(43, 37)) & 63, 0).r);"
-                "float qb = float(clamp(floor(vb), 0.0LF, %d.0LF)), qr = float(clamp(floor(vr), 0.0LF, %d.0LF));"
+                "  s += w*dvec3(round(texelFetch(fel_rgb, q, 0).rgb*65535.0)); }"
+                "double tb = double(round(texelFetch(fel_threshold, (ij + ivec2(21, 11)) & 63, 0).r*8192.0));"
+                "double tr = double(round(texelFetch(fel_threshold, (ij + ivec2(43, 37)) & 63, 0).r*8192.0));"
+                "float qb = float(min(128.0LF*%d.0LF + fel_quant(7.0LF*(9407.0LF*s.b-2627.0LF*s.r-6780.0LF*s.g)*%d.0LF,"
+                "  4.0LF*9407.0LF*65535.0LF, tb), %d.0LF));"
+                "float qr = float(min(128.0LF*%d.0LF + fel_quant(7.0LF*(7373.0LF*s.r-6780.0LF*s.g-593.0LF*s.b)*%d.0LF,"
+                "  4.0LF*7373.0LF*65535.0LF, tr), %d.0LF));"
                 "%s",
-                numerator, denominator, denominator, wx[0], wx[1], wx[2], wx[3], wy[0], wy[1], wy[2], wy[3],
+                numerator, denominator, denominator, wx[0]/2, wx[1]/2, wx[2]/2, wx[3]/2, wy[0]/2, wy[1]/2, wy[2]/2, wy[3]/2,
                 o->crop_x, fx, o->crop_y, fy, p->width - 1, p->height - 1,
-                scale, scale, maximum, maximum, store);
-        if (!dispatch(p, plane == 0 ? u : v, body, o->width / 2, o->height / 2)) return 0;
+                scale, scale, maximum, scale, scale, maximum, store);
+        if (!dispatch(p, plane == 0 ? u : v, exact ? fel_quantize_header : NULL, body, o->width / 2, o->height / 2)) return 0;
     }
     return 1;
 }
@@ -1141,8 +1448,9 @@ void *fel_gpu_import(const void *context,int width,int height)
     for (int k = 0; k < 5; ++k) p->timers[k] = pl_timer_create(p->vk->gpu);
     pl_fmt fmt=pl_find_fmt(p->vk->gpu,PL_FMT_UNORM,4,16,16,PL_FMT_CAP_RENDERABLE | PL_FMT_CAP_SAMPLEABLE);
     if(!fmt || !p->dispatch)goto fail;
+    p->storable=(fmt->caps & PL_FMT_CAP_STORABLE) && p->vk->gpu->glsl.compute;
     p->target=pl_tex_create(p->vk->gpu,pl_tex_params(.w=width,.h=height,.format=fmt,
-        .renderable=true,.sampleable=true));
+        .renderable=true,.sampleable=true,.storable=p->storable));
     if(!p->target)goto fail;
     return p;
 fail:

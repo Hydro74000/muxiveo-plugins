@@ -52,7 +52,7 @@ toujours la référence certifiée, quel que soit le mode.
 
 | Mode | Calcul GPU | Écart au CPU | RTX 4070 Ti SUPER | iGPU Raphael |
 |---|---|---|---:|---:|
-| `exact` (Lent, recommandé) | double natif partout, conversion Y'CbCr comprise | identique au bit près | 27,6 i/s | 2,1 i/s |
+| `exact` (Lent, recommandé) | double natif, classement certifié entre seuils PQ, reprises par le CPU certifié, Y'CbCr en entiers exacts ([détails](docs/2026-10-16-gpu-exact-certifie.md)) | identique au bit près (référence certifiée) | 33–34,5 i/s | 2,5 i/s |
 | `standard` | float32 reformulé, borne d'erreur par pixel, recalcul en double au-delà de 0,4 code | ≤ 1 code 16 bits | 66,7 i/s | 8,1 i/s |
 | `fast` (défaut de l'ABI) | décodage Dolby Vision libplacebo en float32 | jusqu'à ~300 codes PQ12 aux couleurs extrêmes | 67 i/s | 20,8 i/s |
 
