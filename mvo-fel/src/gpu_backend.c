@@ -51,6 +51,7 @@ struct fel_gpu {
     pl_tex thresholds;
     pl_buf rescue, patch, diag;
     int diag_stride, self_test;
+    int force_rescue;           /* tests : toutes les composantes reprises par le CPU certifié */
     long long rescued, undecided;
 };
 
@@ -66,6 +67,12 @@ void fel_gpu_timings(void *context, double *milliseconds)
 {
     const struct fel_gpu *p = context;
     for (int k = 0; k < 5; ++k) milliseconds[k] = p ? p->gpu_ns[k] / 1e6 : 0;
+}
+
+/* Tests : toutes les composantes du mode exact reprises par le CPU certifié (chaîne de reprise). */
+void fel_gpu_force_rescue(void *context, int enabled)
+{
+    ((struct fel_gpu *)context)->force_rescue = enabled != 0;
 }
 
 /* Mode exact : pixels repris par le CPU certifié et composantes indécises, cumulés. */
@@ -776,25 +783,39 @@ static struct pl_buffer_var uint_array(const char *name, int count, size_t offse
     return var;
 }
 
-/* Correctifs du CPU certifié écrits dans l'image cible (shader de calcul, imageStore). */
-static int apply_patch(struct fel_gpu *p, const uint32_t *patch, uint32_t count)
+static int precise_descriptors(struct fel_gpu *p, struct pl_shader_desc *d, struct pl_buffer_var *rescue_vars,
+                               enum pl_desc_access rescue_access);
+
+/* Correctifs du CPU certifié écrits dans l'image cible (shader de calcul, imageStore) : premier
+ * pixel de chaque plage listée, puis les pixels de droite aux entrées identiques, tant que l'écart
+ * avec le dernier trouvé ne dépasse pas 4 (règle de liste du rendu exact). */
+static int apply_patch(struct fel_gpu *p, const char *header, const uint32_t *patch, uint32_t count)
 {
     pl_buf_write(p->vk->gpu, p->patch, 0, patch, 12 * (size_t)count);
-    struct pl_buffer_var var = uint_array("fel_patch", 3 * FEL_RESCUE_CAPACITY, 0);
-    const struct pl_shader_desc desc[2] = {
-        {.desc = {.name = "fel_target", .type = PL_DESC_STORAGE_IMG, .access = PL_DESC_ACCESS_WRITEONLY},
-         .binding = {.object = p->target}},
-        {.desc = {.name = "fel_patch_buf", .type = PL_DESC_BUF_STORAGE, .access = PL_DESC_ACCESS_READONLY},
-         .binding = {.object = p->patch}, .buffer_vars = &var, .num_buffer_vars = 1},
-    };
+    struct pl_buffer_var rescue_vars[2], var = uint_array("fel_patch", 3 * FEL_RESCUE_CAPACITY, 0);
+    struct pl_shader_desc desc[17];
+    precise_descriptors(p, desc, rescue_vars, PL_DESC_ACCESS_READONLY);
+    desc[15] = (struct pl_shader_desc){.desc = {.name = "fel_target", .type = PL_DESC_STORAGE_IMG,
+        .access = PL_DESC_ACCESS_WRITEONLY}, .binding = {.object = p->target}};
+    desc[16] = (struct pl_shader_desc){.desc = {.name = "fel_patch_buf", .type = PL_DESC_BUF_STORAGE,
+        .access = PL_DESC_ACCESS_READONLY}, .binding = {.object = p->patch}, .buffer_vars = &var, .num_buffer_vars = 1};
     const struct pl_shader_var number = {.var = {.name = "fel_patch_count", .type = PL_VAR_UINT, .dim_v = 1,
                                                  .dim_m = 1, .dim_a = 1}, .data = &count, .dynamic = true};
+    char body[2048];
+    snprintf(body, sizeof(body),
+        "uint i=gl_GlobalInvocationID.x;if(i<fel_patch_count){uint b=%du*i,w=fel_patch[3u*i+1u];"
+        "ivec2 xy=ivec2(int(fel_rescue[b]&0xffffu),int(fel_rescue[b]>>16));"
+        "vec4 v=vec4((vec3(float(w&0xffffu),float(w>>16),float(fel_patch[3u*i+2u]))+0.25)/65535.0,1.0);"
+        "imageStore(fel_target,xy,v);"
+        "int last=xy.x;for(int x=xy.x+1;x<%d&&x-last<=4;++x){int c1,b1,r1,d1,f0,f1,f2,l1,k1;"
+        "fel_inputs(ivec2(x,xy.y),c1,b1,r1,d1,f0,f1,f2,l1,k1);"
+        "if(uint(c1)==(fel_rescue[b+1u]&0xffffu)&&uint(b1)==fel_rescue[b+2u]&&uint(r1)==fel_rescue[b+3u]&&"
+        "uint(d1)==fel_rescue[b+4u]&&uint(f0)==fel_rescue[b+5u]&&uint(f1)==fel_rescue[b+6u]&&uint(f2)==fel_rescue[b+7u]&&"
+        "uint(l1)==fel_rescue[b+8u]&&uint(k1)==fel_rescue[b+9u]){imageStore(fel_target,ivec2(x,xy.y),v);last=x;}}}",
+        FEL_RESCUE_WORDS, p->width);
     pl_shader sh = pl_dispatch_begin(p->dispatch);
-    int ok = pl_shader_custom(sh, &(struct pl_custom_shader){
-        .body = "uint i=gl_GlobalInvocationID.x;if(i<fel_patch_count){uint a=fel_patch[3u*i],b=fel_patch[3u*i+1u],"
-                "c=fel_patch[3u*i+2u];imageStore(fel_target,ivec2(int(a&0xffffu),int(a>>16)),"
-                "vec4((vec3(float(b&0xffffu),float(b>>16),float(c))+0.25)/65535.0,1.0));}",
-        .input = PL_SHADER_SIG_NONE, .output = PL_SHADER_SIG_NONE, .descriptors = desc, .num_descriptors = 2,
+    int ok = pl_shader_custom(sh, &(struct pl_custom_shader){.header = header, .body = body,
+        .input = PL_SHADER_SIG_NONE, .output = PL_SHADER_SIG_NONE, .descriptors = desc, .num_descriptors = 17,
         .variables = &number, .num_variables = 1, .compute = true, .compute_group_size = {64, 1}});
     ok = ok && pl_dispatch_compute(p->dispatch, pl_dispatch_compute_params(.shader = &sh,
                                    .dispatch_size = {(int)((count + 63) / 64), 1, 1}));
@@ -803,7 +824,7 @@ static int apply_patch(struct fel_gpu *p, const uint32_t *patch, uint32_t count)
 }
 
 /* Composantes indécises du rendu exact : liste rapatriée, codes du CPU certifié, correctifs. */
-static int resolve_rescues(struct fel_gpu *p, const AVDOVIMetadata *metadata)
+static int resolve_rescues(struct fel_gpu *p, const AVDOVIMetadata *metadata, const char *header)
 {
     uint32_t count = 0;
     if (!pl_buf_read(p->vk->gpu, p->rescue, 0, &count, sizeof(count))) return 0;
@@ -823,7 +844,7 @@ static int resolve_rescues(struct fel_gpu *p, const AVDOVIMetadata *metadata)
         patch[3*i + 1] = codes[3*i] | (uint32_t)codes[3*i + 1] << 16;
         patch[3*i + 2] = codes[3*i + 2];
     }
-    ok = ok && apply_patch(p, patch, count);
+    ok = ok && apply_patch(p, header, patch, count);
     if (ok) {
         for (uint32_t i = 0; i < count; ++i) {
             const uint32_t mask = entries[FEL_RESCUE_WORDS * i + 1] >> 28;
@@ -835,44 +856,15 @@ static int resolve_rescues(struct fel_gpu *p, const AVDOVIMetadata *metadata)
     return ok;
 }
 
-static int render_precise(struct fel_gpu *p, const AVDOVIMetadata *metadata)
+/* En-tête du rendu précis : fonctions communes et entrées exactes d'un pixel (code BL Y, sommes
+ * Spline16 entières et dénominateurs), offsets NLQ de l'image. */
+static int precise_header(char *header, size_t size, const AVDOVIMetadata *metadata)
 {
-    const int exact = p->precision == FEL_PRECISION_EXACT;
-    if (!upload_coefficients(p, metadata) || !prepare_exact(p)) return 0;
-    static const uint32_t zero = 0;
-    if (exact) pl_buf_write(p->vk->gpu, p->rescue, 0, &zero, sizeof(zero));
     const AVDOVIDataMapping *mapping = av_dovi_get_mapping(metadata);
-    struct pl_buffer_var rescue_vars[2] = {uint_array("fel_rescue_count", 1, 0)};
-    rescue_vars[1] = uint_array("fel_rescue", FEL_RESCUE_WORDS * FEL_RESCUE_CAPACITY,
-                                rescue_vars[0].layout.offset + rescue_vars[0].layout.size);
-    const int diag_rows = p->diag_stride > 0 ? (p->height + p->diag_stride - 1) / p->diag_stride : 0;
-    struct pl_buffer_var diag_var = uint_array("fel_diag", diag_rows ? FEL_DIAG_WORDS * diag_rows * p->width : 1, 0);
-    const struct pl_shader_desc planes[16] = {
-        {.desc = {.name = "fb0", .type = PL_DESC_SAMPLED_TEX}, .binding = {.object = p->source[0]}},
-        {.desc = {.name = "fb1", .type = PL_DESC_SAMPLED_TEX}, .binding = {.object = p->source[1]}},
-        {.desc = {.name = "fb2", .type = PL_DESC_SAMPLED_TEX}, .binding = {.object = p->source[2]}},
-        {.desc = {.name = "fe0", .type = PL_DESC_SAMPLED_TEX}, .binding = {.object = p->source[3]}},
-        {.desc = {.name = "fe1", .type = PL_DESC_SAMPLED_TEX}, .binding = {.object = p->source[4]}},
-        {.desc = {.name = "fe2", .type = PL_DESC_SAMPLED_TEX}, .binding = {.object = p->source[5]}},
-        {.desc = {.name = "fbx", .type = PL_DESC_SAMPLED_TEX}, .binding = {.object = p->fused_axes[0]}},
-        {.desc = {.name = "fby", .type = PL_DESC_SAMPLED_TEX}, .binding = {.object = p->fused_axes[1]}},
-        {.desc = {.name = "fex", .type = PL_DESC_SAMPLED_TEX}, .binding = {.object = p->fused_axes[2]}},
-        {.desc = {.name = "fey", .type = PL_DESC_SAMPLED_TEX}, .binding = {.object = p->fused_axes[3]}},
-        {.desc = {.name = "fcx", .type = PL_DESC_SAMPLED_TEX}, .binding = {.object = p->fused_axes[4]}},
-        {.desc = {.name = "fcy", .type = PL_DESC_SAMPLED_TEX}, .binding = {.object = p->fused_axes[5]}},
-        {.desc = {.name = "fel_coef", .type = PL_DESC_SAMPLED_TEX}, .binding = {.object = p->coef}},
-        {.desc = {.name = "fel_thr", .type = PL_DESC_SAMPLED_TEX}, .binding = {.object = p->thresholds}},
-        {.desc = {.name = "fel_rescue_buf", .type = PL_DESC_BUF_STORAGE, .access = PL_DESC_ACCESS_READWRITE},
-         .binding = {.object = p->rescue}, .buffer_vars = rescue_vars, .num_buffer_vars = 2},
-        {.desc = {.name = "fel_diag_buf", .type = PL_DESC_BUF_STORAGE, .access = PL_DESC_ACCESS_WRITEONLY},
-         .binding = {.object = p->diag}, .buffer_vars = &diag_var, .num_buffer_vars = 1},
-    };
-    const int H = FEL_CHANNEL, G = FEL_GLOBAL, E = FEL_EXTRA;
-    char body[24576];
-    int used = snprintf(body, sizeof(body),
-        "ivec2 xy0=ivec2(gl_FragCoord.xy);bool inside=xy0.x<%d&&xy0.y<%d;ivec2 xy=min(xy0,ivec2(%d,%d));"
-        "int code=clamp(int(round(texelFetch(fb0,xy,0).r*65535.0)),0,1023);"
-        "int tb=0,tr=0,Db,te0=0,te1=0,te2=0,Dl,Dc;"
+    const int used = snprintf(header, size, "%s"
+        "void fel_inputs(ivec2 xy,out int code,out int tb,out int tr,out int Db,out int te0,out int te1,out int te2,"
+        "out int Dl,out int Dc){code=clamp(int(round(texelFetch(fb0,xy,0).r*65535.0)),0,1023);"
+        "tb=0;tr=0;te0=0;te1=0;te2=0;"
         "{" FEL_EXACT_TAPS("fbx", "fby")
         "for(int b=0;b<4;b++){int rb=0,rr=0;for(int a=0;a<4;a++){ivec2 q=ivec2(ix[a],iy[b]);"
         "rb+=nx[a]*int(round(texelFetch(fb1,q,0).r*65535.0));rr+=nx[a]*int(round(texelFetch(fb2,q,0).r*65535.0));}"
@@ -883,7 +875,49 @@ static int render_precise(struct fel_gpu *p, const AVDOVIMetadata *metadata)
         "{" FEL_EXACT_TAPS("fcx", "fcy")
         "for(int b=0;b<4;b++){int r1=0,r2=0;for(int a=0;a<4;a++){ivec2 q=ivec2(ix[a],iy[b]);"
         "r1+=nx[a]*(int(round(texelFetch(fe1,q,0).r*65535.0))-%d);r2+=nx[a]*(int(round(texelFetch(fe2,q,0).r*65535.0))-%d);}"
-        "te1+=ny[b]*r1;te2+=ny[b]*r2;}Dc=D;}"
+        "te1+=ny[b]*r1;te2+=ny[b]*r2;}Dc=D;}}\n",
+        fel_precise_header, mapping->nlq[0].nlq_offset, mapping->nlq[1].nlq_offset, mapping->nlq[2].nlq_offset);
+    return used > 0 && used < (int)size;
+}
+
+/* Descripteurs du rendu précis (sources, axes entiers, coefficients, seuils), puis liste de reprises. */
+static int precise_descriptors(struct fel_gpu *p, struct pl_shader_desc *d, struct pl_buffer_var *rescue_vars,
+                               enum pl_desc_access rescue_access)
+{
+    static const char *names[12] = {"fb0", "fb1", "fb2", "fe0", "fe1", "fe2", "fbx", "fby", "fex", "fey", "fcx", "fcy"};
+    for (int i = 0; i < 12; ++i)
+        d[i] = (struct pl_shader_desc){.desc = {.name = names[i], .type = PL_DESC_SAMPLED_TEX},
+                                       .binding = {.object = i < 6 ? p->source[i] : p->fused_axes[i - 6]}};
+    d[12] = (struct pl_shader_desc){.desc = {.name = "fel_coef", .type = PL_DESC_SAMPLED_TEX}, .binding = {.object = p->coef}};
+    d[13] = (struct pl_shader_desc){.desc = {.name = "fel_thr", .type = PL_DESC_SAMPLED_TEX}, .binding = {.object = p->thresholds}};
+    rescue_vars[0] = uint_array("fel_rescue_count", 1, 0);
+    rescue_vars[1] = uint_array("fel_rescue", FEL_RESCUE_WORDS * FEL_RESCUE_CAPACITY,
+                                rescue_vars[0].layout.offset + rescue_vars[0].layout.size);
+    d[14] = (struct pl_shader_desc){.desc = {.name = "fel_rescue_buf", .type = PL_DESC_BUF_STORAGE, .access = rescue_access},
+                                    .binding = {.object = p->rescue}, .buffer_vars = rescue_vars, .num_buffer_vars = 2};
+    return 15;
+}
+
+static int render_precise(struct fel_gpu *p, const AVDOVIMetadata *metadata)
+{
+    const int exact = p->precision == FEL_PRECISION_EXACT;
+    if (!upload_coefficients(p, metadata) || !prepare_exact(p)) return 0;
+    static const uint32_t zero = 0;
+    if (exact) pl_buf_write(p->vk->gpu, p->rescue, 0, &zero, sizeof(zero));
+    char header[sizeof(fel_precise_header) + 4096];
+    if (!precise_header(header, sizeof(header), metadata)) return 0;
+    struct pl_buffer_var rescue_vars[2];
+    const int diag_rows = p->diag_stride > 0 ? (p->height + p->diag_stride - 1) / p->diag_stride : 0;
+    struct pl_buffer_var diag_var = uint_array("fel_diag", diag_rows ? FEL_DIAG_WORDS * diag_rows * p->width : 1, 0);
+    struct pl_shader_desc planes[16];
+    precise_descriptors(p, planes, rescue_vars, PL_DESC_ACCESS_READWRITE);
+    planes[15] = (struct pl_shader_desc){.desc = {.name = "fel_diag_buf", .type = PL_DESC_BUF_STORAGE,
+        .access = PL_DESC_ACCESS_WRITEONLY}, .binding = {.object = p->diag}, .buffer_vars = &diag_var, .num_buffer_vars = 1};
+    const int H = FEL_CHANNEL, G = FEL_GLOBAL, E = FEL_EXTRA;
+    char body[24576];
+    int used = snprintf(body, sizeof(body),
+        "ivec2 xy0=ivec2(gl_FragCoord.xy);bool inside=xy0.x<%d&&xy0.y<%d;ivec2 xy=min(xy0,ivec2(%d,%d));"
+        "int code,tb,tr,Db,te0,te1,te2,Dl,Dc;fel_inputs(xy,code,tb,tr,Db,te0,te1,te2,Dl,Dc);"
         /* Signaux BL bornés à [0, 1023·D] ; segment choisi par comparaison entière exacte. */
         "uvec2 full64=fel_mul64(1023u,uint(Db));uvec2 X64[3];X64[0]=uvec2(0u,uint(code));"
         "X64[1]=uvec2(0u,uint(max(tb,0)));X64[2]=uvec2(0u,uint(max(tr,0)));"
@@ -914,7 +948,6 @@ static int render_precise(struct fel_gpu *p, const AVDOVIMetadata *metadata)
         "double xd[3];for(int i=0;i<3;++i)xd[i]=fel_d(%d+4+3*i)*v[0]+fel_d(%d+5+3*i)*v[1]+fel_d(%d+6+3*i)*v[2];"
         "vec3 out3;",
         p->width, p->height, p->width - 1, p->height - 1,
-        mapping->nlq[0].nlq_offset, mapping->nlq[1].nlq_offset, mapping->nlq[2].nlq_offset,
         H, H, G, H, H, H, H, G, G, G, G);
     if (!exact && used > 0 && used < (int)sizeof(body))
         used += snprintf(body + used, sizeof(body) - used,
@@ -973,22 +1006,30 @@ static int render_precise(struct fel_gpu *p, const AVDOVIMetadata *metadata)
     if (exact && used > 0 && used < (int)sizeof(body))
         used += snprintf(body + used, sizeof(body) - used,
             "}"
-            "if(mask!=0u&&inside){uint i=atomicAdd(fel_rescue_count,1u);if(i<%du){uint b=%du*i;"
+            "if(%d!=0)mask=7u;"
+            /* Zone uniforme : un pixel dont les entrées brutes égalent celles d'un voisin de gauche à
+             * distance ≤ 4 (phases Spline16 de période ≤ 4 : chroma EL suréchantillonnée ×4) a le même
+             * calcul, donc le même masque : il n'est pas listé, la passe de correctifs propage le code
+             * du premier pixel de la plage vers la droite. */
+            "bool head=true;for(int s=1;s<=4&&head&&mask!=0u;++s)if(xy.x>=s){int c1,b1,r1,d1,f0,f1,f2,l1,k1;"
+            "fel_inputs(xy-ivec2(s,0),c1,b1,r1,d1,f0,f1,f2,l1,k1);"
+            "head=!(c1==code&&b1==tb&&r1==tr&&d1==Db&&f0==te0&&f1==te1&&f2==te2&&l1==Dl&&k1==Dc);}"
+            "if(mask!=0u&&inside&&head){uint i=atomicAdd(fel_rescue_count,1u);if(i<%du){uint b=%du*i;"
             "fel_rescue[b]=uint(xy.x)|(uint(xy.y)<<16);"
             "fel_rescue[b+1u]=uint(code)|(uint(seg[0])<<16)|(uint(seg[1])<<20)|(uint(seg[2])<<24)|(mask<<28);"
             "fel_rescue[b+2u]=uint(tb);fel_rescue[b+3u]=uint(tr);fel_rescue[b+4u]=uint(Db);fel_rescue[b+5u]=uint(te0);"
             "fel_rescue[b+6u]=uint(te1);fel_rescue[b+7u]=uint(te2);fel_rescue[b+8u]=uint(Dl);fel_rescue[b+9u]=uint(Dc);}}"
             "color=vec4(out3,1.0);",
-            FEL_RESCUE_CAPACITY, FEL_RESCUE_WORDS);
+            p->force_rescue, FEL_RESCUE_CAPACITY, FEL_RESCUE_WORDS);
     if (used <= 0 || used >= (int)sizeof(body)) return 0;
     pl_shader sh = pl_dispatch_begin(p->dispatch);
-    int ok = pl_shader_custom(sh, &(struct pl_custom_shader){.header = fel_precise_header, .body = body,
+    int ok = pl_shader_custom(sh, &(struct pl_custom_shader){.header = header, .body = body,
         .input = PL_SHADER_SIG_NONE, .output = PL_SHADER_SIG_COLOR, .descriptors = planes,
         .num_descriptors = exact ? (diag_rows ? 16 : 15) : 14,
         .output_w = p->width, .output_h = p->height, .compute = exact, .compute_group_size = {16, 16}});
     ok = ok && pl_dispatch_finish(p->dispatch, pl_dispatch_params(.timer = p->timers[3], .shader = &sh, .target = p->target));
     pl_dispatch_abort(p->dispatch, &sh);
-    return ok && (!exact || resolve_rescues(p, metadata));
+    return ok && (!exact || resolve_rescues(p, metadata, header));
 }
 
 /* Couche 4:2:0 10 bits aléatoire (générateur congruentiel), position chroma en haut à gauche. */

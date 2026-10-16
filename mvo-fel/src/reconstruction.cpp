@@ -9,6 +9,7 @@
 #include <cmath>
 #include <cstring>
 #include <limits>
+#include <map>
 #include <stdexcept>
 #if (defined(__x86_64__) || defined(__i386__)) && (defined(__GNUC__) || defined(__clang__))
 #include <immintrin.h>
@@ -734,7 +735,16 @@ CertifiedStats FastReconstruction::rows(const Mapping &mapping, AVFrame &rgb, in
                 uncertain[x] |= static_cast<unsigned char>((extended || !certain) << c);
             }
         if (!finite) throw std::runtime_error("Pixel reconstruit non fini");
-        // Reprises en double-double des composantes non décidées (liste compacte par ligne).
+        // Reprises en double-double des composantes non décidées (liste compacte par ligne). Zone
+        // uniforme : entrées identiques à l'une des quatre dernières reprises (phases Spline16 de
+        // période ≤ 4), résultat réutilisé.
+        struct Rescued {
+            certified::ExactPixel pixel{};
+            unsigned mask = 0, undecided = 0;
+            std::array<uint16_t, 3> exact{};
+            std::array<certified::DD, 3> value{};
+        } recent[4];
+        int oldest = 0;
         for (int x = 0; x < width; ++x) {
             if (!uncertain[x]) continue;
             int32_t sums[5];
@@ -745,9 +755,22 @@ CertifiedStats FastReconstruction::rows(const Mapping &mapping, AVFrame &rgb, in
             for (int c = 0; c < 2; ++c) { pixel.chroma[c] = sums[c]; pixel.chroma_den[c] = den[c]; }
             for (int c = 0; c < 3; ++c) { pixel.residual[c] = sums[2+c]; pixel.residual_den[c] = den[2+c]; }
             pixel.piece = pieces_at(x, sums, den);
-            std::array<uint16_t, 3> exact{};
-            std::array<certified::DD, 3> value{};
-            const unsigned undecided = certified::classify(mapping, pixel, uncertain[x], exact, &value);
+            const Rescued *hit = nullptr;
+            for (const auto &r : recent)
+                if (r.mask && (uncertain[x] & ~r.mask) == 0 && pixel.luma == r.pixel.luma &&
+                    pixel.chroma == r.pixel.chroma && pixel.chroma_den == r.pixel.chroma_den &&
+                    pixel.residual == r.pixel.residual && pixel.residual_den == r.pixel.residual_den) hit = &r;
+            if (!hit) {
+                Rescued &r = recent[oldest];
+                oldest = (oldest + 1) & 3;
+                r.undecided = certified::classify(mapping, pixel, uncertain[x], r.exact, &r.value);
+                r.pixel = pixel;
+                r.mask = uncertain[x];
+                hit = &r;
+            }
+            const auto &exact = hit->exact;
+            const auto &value = hit->value;
+            const unsigned undecided = hit->undecided;
             for (int c = 0; c < 3; ++c) {
                 if (!(uncertain[x] >> c & 1)) continue;
                 const size_t k = c*size_t(width) + x;
@@ -845,8 +868,18 @@ extern "C" int fel_certified_codes(const AVDOVIMetadata *metadata, const uint32_
     try {
         const muxiveo::fel::Mapping mapping(*metadata);
         int undecided = 0;
+        // Entrées identiques (une plage par ligne d'une zone uniforme) : un seul calcul.
+        std::map<std::array<uint32_t, FEL_RESCUE_WORDS - 1>, std::pair<std::array<uint16_t, 3>, int>> known;
         for (int i = 0; i < count; ++i) {
             const uint32_t *e = entries + size_t(FEL_RESCUE_WORDS)*i;
+            std::array<uint32_t, FEL_RESCUE_WORDS - 1> key;
+            std::copy(e + 1, e + FEL_RESCUE_WORDS, key.begin());
+            key[0] &= 0x0fffffff;  // masque des composantes indécises exclu : codes des trois calculés
+            if (const auto found = known.find(key); found != known.end()) {
+                for (int c = 0; c < 3; ++c) codes[3*i + c] = found->second.first[c];
+                undecided += found->second.second;
+                continue;
+            }
             muxiveo::fel::certified::ExactPixel pixel;
             pixel.luma = static_cast<int>(e[1] & 0xffff);
             for (int c = 0; c < 3; ++c) pixel.piece[c] = (e[1] >> (16 + 4*c)) & 15;
@@ -857,8 +890,10 @@ extern "C" int fel_certified_codes(const AVDOVIMetadata *metadata, const uint32_
                     return -1;
             std::array<uint16_t, 3> rgb{};
             const unsigned mask = muxiveo::fel::certified::classify(mapping, pixel, 7, rgb);
-            undecided += (mask & 1) + (mask >> 1 & 1) + (mask >> 2 & 1);
+            const int count_undecided = (mask & 1) + (mask >> 1 & 1) + (mask >> 2 & 1);
+            undecided += count_undecided;
             for (int c = 0; c < 3; ++c) codes[3*i + c] = rgb[c];
+            known.emplace(key, std::make_pair(rgb, count_undecided));
         }
         return undecided;
     } catch (const std::exception &) {

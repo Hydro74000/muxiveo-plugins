@@ -93,6 +93,15 @@ void fast_matches_reference(AVDOVIMetadata &metadata) {
         curve.mmr_order[1] = 2; curve.mmr_constant[1] = 2000;
         for (int k = 0; k < 2; ++k) for (int j = 0; j < 7; ++j) curve.mmr_coef[1][k][j] = 3000*(j+1)*(k ? -1 : 1);
     }
+    // Couches uniformes : reprises consécutives identiques (cache du pixel précédent en mode étendu).
+    for (unsigned seed = 1; seed <= 20; ++seed) {
+        std::mt19937 random(seed);
+        const int value = std::uniform_int_distribution<int>(64, 940)(random);
+        if (const int worst = fast_error(metadata, random, value, value); worst > 2) {
+            std::cerr << "chemin rapide uniforme, graine " << seed << " : " << worst << " codes 16 bits\n";
+            std::exit(1);
+        }
+    }
     // 200 graines : signaux exactement sur un pivot compris (segment choisi sur valeurs exactes).
     for (unsigned seed = 1; seed <= 200; ++seed) {
         std::mt19937 random(seed);

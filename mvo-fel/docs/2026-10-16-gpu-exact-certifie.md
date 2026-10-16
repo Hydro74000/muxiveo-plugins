@@ -10,7 +10,12 @@ Le mode `exact` (Lent) du GPU produit désormais **la référence certifiée** :
 2. **Borne d'erreur.** Chaque valeur linéaire R̂ est encadrée par la borne du CPU certifié, avec u = 2⁻⁵² : chaque opération double du GPU peut se tromper d'un ulp entier, ce qui couvre une division moins précise que l'IEEE.
 3. **Classement.** Le code candidat vient d'une OETF float32, ajustée par au plus 8 pas. Il est classé entre les seuils PQ arrondis vers le bas, lus dans une texture 256 × 256 de doubles. Le test de certitude est celui du CPU.
 4. **Liste compacte.** Une composante non décidée garde son code candidat. Son pixel est ajouté, par compteur atomique, à une liste de 10 mots : position, code BL Y, segments, masque, sommes Spline16 et dénominateurs. La liste est rapatriée après la passe ; le CPU certifié calcule les codes exacts à partir de ces entrées, sans relire les images. Une passe de calcul les écrit ensuite dans l'image cible (`imageStore`). Capacité : 65 536 pixels par image ; au-delà, le rendu échoue explicitement.
-5. **Y'CbCr exact.** La conversion reprend l'arithmétique entière du CPU, simulée en double : tous les entiers restent sous 2⁵³, et `fel_quant` corrige le quotient puis compare le reste au seuil de tramage. Aucun `shaderInt64` n'est requis.
+5. **Zones uniformes.** Dans une zone parfaitement uniforme dont la valeur tombe près d'un seuil, tous les pixels sont indécis.
+   - Un pixel dont les entrées brutes égalent celles d'un voisin de gauche à distance ≤ 4 n'est pas listé : son calcul est identique, donc son masque aussi. La distance 4 vient de la période des phases Spline16 : la chroma EL est suréchantillonnée ×4.
+   - La passe de correctifs propage le code du premier pixel de la plage vers la droite, tant que l'écart avec le dernier pixel identique ne dépasse pas 4.
+   - Une image UHD entièrement uniforme liste ainsi environ 3 pixels par ligne au lieu de 3 840.
+   - Côté CPU, les reprises réutilisent le résultat de l'une des quatre dernières, et les entrées GPU identiques ne sont calculées qu'une fois.
+6. **Y'CbCr exact.** La conversion reprend l'arithmétique entière du CPU, simulée en double : tous les entiers restent sous 2⁵³, et `fel_quant` corrige le quotient puis compare le reste au seuil de tramage. Aucun `shaderInt64` n'est requis.
 
 Conditions sur le périphérique : double natif, image cible stockable (RGBA16 UNORM) et shaders de calcul. Sinon, le mode exact est refusé et le rendu passe sur le CPU certifié.
 
@@ -34,6 +39,7 @@ Sinon, le mode exact est refusé et le rendu passe sur le CPU. Un pilote dont l'
 |---|---|
 | Auto-test (RTX 4070 Ti SUPER, iGPU Raphael) | réussi : écart ≤ 0,082 × borne, 0 code différent |
 | `fel_gpu_precision_test`, 3 × 200 graines (identité, matrices réelles, MMR) | exact : **0 code différent** du CPU certifié sur les deux GPU ; standard ≤ 1 |
+| Reprise forcée (toutes les composantes listées), couches aléatoires et uniformes, 200 graines | 0 code différent ; couches uniformes : 3 pixels listés par ligne |
 | Attestation de schéma 4 (3 scènes réelles, RTX et Raphael, transport direct P010) | réussie : `exact` identique au CPU certifié octet pour octet, RGB et Y'CbCr ; acceptée par `package.py` |
 | Reprises sur scènes réelles (RTX, compteur `certified_rescued`) | extrait de référence : 7 284 composantes sur 300 images (24 par image) ; Ryan : 3 par image ; Toy Story 5 : 23 ; Moana : 11 ; **0 indécise** |
 | Débit, 300 images UHD, sortie 10 bits | RTX : 27,6 → 33–34,5 i/s (composition 18,8 ms) ; Raphael : 2,1 → 2,5 i/s |

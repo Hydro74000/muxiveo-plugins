@@ -15,6 +15,8 @@ void *fel_gpu_create(int, int, const char *);
 void fel_gpu_destroy(void *);
 int fel_gpu_render(void *, const AVDOVIMetadata *, const AVFrame *, const AVFrame *, uint16_t *);
 int fel_gpu_set_precision(void *, int);
+void fel_gpu_force_rescue(void *, int);
+void fel_gpu_certified(void *, long long *, long long *);
 }
 using namespace muxiveo::fel;
 
@@ -76,17 +78,26 @@ int main() {
     bool ok = true;
     auto *metadata = av_dovi_metadata_alloc(nullptr);
     std::vector<uint16_t> rgba(64*32*4);
-    for (const std::string mode : {"identity", "real", "mmr"}) {
-        metadata_for(*metadata, mode);
+    // forced / flat : mode exact, toutes les composantes reprises par le CPU certifié, sur couches
+    // aléatoires puis uniformes (plages d'entrées identiques propagées par la passe de correctifs).
+    for (const std::string mode : {"identity", "real", "mmr", "forced", "flat"}) {
+        const bool forced = mode == "forced" || mode == "flat";
+        metadata_for(*metadata, forced ? "real" : mode);
         const Mapping m(*metadata);
-        const int low = mode == "mmr" ? 0 : mode == "real" ? 200 : 64, high = mode == "mmr" ? 1023 : mode == "real" ? 760 : 940;
+        const int low = mode == "mmr" ? 0 : forced || mode == "real" ? 200 : 64, high = mode == "mmr" ? 1023 : forced || mode == "real" ? 760 : 940;
+        fel_gpu_force_rescue(gpu, forced);
         for (const int precision : {FEL_PRECISION_EXACT, FEL_PRECISION_STANDARD, FEL_PRECISION_FAST}) {
+            if (forced && precision != FEL_PRECISION_EXACT) continue;
             if (!fel_gpu_set_precision(gpu, precision)) return 1;
             int worst = 0;
             long differing = 0;
+            long long rescued_before, undecided_before;
+            fel_gpu_certified(gpu, &rescued_before, &undecided_before);
             for (unsigned seed = 1; seed <= 200; ++seed) {
                 std::mt19937 random(seed);
-                AVFrame *bl = layer(64, 32, random, low, high), *el = layer(32, 16, random, low, high);
+                const int value = std::uniform_int_distribution<int>(low, high)(random);
+                AVFrame *bl = mode == "flat" ? layer(64, 32, random, value, value) : layer(64, 32, random, low, high);
+                AVFrame *el = mode == "flat" ? layer(32, 16, random, value, value) : layer(32, 16, random, low, high);
                 AVFrame *cpu = av_frame_alloc();
                 cpu->format = AV_PIX_FMT_GBRP16LE; cpu->width = 64; cpu->height = 32;
                 if (av_frame_get_buffer(cpu, 32) < 0) return 1;
@@ -107,7 +118,15 @@ int main() {
                 for (AVFrame *f : {bl, el, cpu}) av_frame_free(&f);
             }
             const char *name = precision == FEL_PRECISION_EXACT ? "exact" : precision == FEL_PRECISION_STANDARD ? "standard" : "rapide";
-            std::cout << mode << " / " << name << " : écart max " << worst << " code(s) 16 bits, valeurs ≠ " << differing << '\n';
+            long long rescued, undecided;
+            fel_gpu_certified(gpu, &rescued, &undecided);
+            std::cout << mode << " / " << name << " : écart max " << worst << " code(s) 16 bits, valeurs ≠ " << differing;
+            if (forced) std::cout << ", composantes listées " << rescued - rescued_before;
+            std::cout << '\n';
+            // Uniforme : une plage par phase et par ligne (≤ 4 × 32 lignes × 3 composantes par image) ;
+            // aléatoire : tous les pixels.
+            if ((mode == "flat" && rescued - rescued_before > 200*4*32*3) ||
+                (mode == "forced" && rescued - rescued_before < 200*64*32*3*9/10) || undecided != undecided_before) ok = false;
             if (worst > (precision == FEL_PRECISION_EXACT ? 0 : precision == FEL_PRECISION_STANDARD ? 1 : 65535)) ok = false;
         }
     }
