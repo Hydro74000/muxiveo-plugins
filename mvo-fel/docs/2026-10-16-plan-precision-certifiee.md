@@ -75,3 +75,4 @@ Ce que les Tensor Cores ne couvrent pas :
 | C0 | Fait : table des seuils (parties haute et basse), `scripts/generate_pq_thresholds.py` |
 | C1 | Fait : [CPU certifié](2026-10-16-cpu-certifie.md) |
 | A1 | Fait : [Lent GPU certifié](2026-10-16-gpu-exact-certifie.md), identique au CPU certifié ; débit +20 à 25 % (au lieu de ×2 : l'EOTF en double domine, cible d'A2) |
+| B0 | Fait : [banc](2026-10-16-b0-entiers-multimots.md) ; Raphael 0,54× (critère 2× non atteint) : **B1 arrêté**. RTX : 2,64× plus rapide que le double, candidat pour le mapping d'A2 et référence de T0 |
