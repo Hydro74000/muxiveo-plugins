@@ -3,6 +3,7 @@
 #include "fel_direct_abi.h"
 #include "reconstruction.hpp"
 #include "output_format.h"
+#include "frame_stats.h"
 #include <algorithm>
 #include <atomic>
 #include <array>
@@ -61,6 +62,7 @@ int fel_gpu_fixed_variant(const void *);
 int fel_gpu_inherit(void *, const void *);
 void fel_gpu_certified(void *, long long *, long long *);
 int fel_gpu_take_overflow(void *);
+int fel_gpu_frame_statistics(void *, int, int, int, int, fel_frame_stats *);
 void fel_gpu_set_cpu_threads(void *, int);
 #endif
 }
@@ -255,11 +257,14 @@ struct Job {
     muxiveo::fel::Mapping mapping;
     int64_t pts, duration;
     AVRational timebase;
+    bool scene_start = false;  // drapeau de changement de plan du RPU propre de l'image
 };
 struct Rendered {
     Packet packet;
     int width, height;
     AVRational timebase;
+    std::unique_ptr<fel_frame_stats> stats;  // statistiques de l'image (mvo_fel_set_frame_statistics)
+    bool scene_start = false;
 };
 }
 
@@ -290,6 +295,12 @@ struct mvo_fel_context {
     // (mêmes octets) ; le verrou sérialise ce chemin entre les fils de rendu GPU.
     std::mutex cpu_mutex;
     std::atomic<long long> cpu_rescue_frames{0};
+    // Statistiques de l'image finale (JSON Lines, mvo_fel_set_frame_statistics) : fichier, image
+    // suivante, histogramme de maxRGB du plan en cours (écrit à la fin du plan).
+    std::string stats_path;
+    AVIOContext *stats_io = nullptr;
+    int64_t stats_frame = 0, scene_first = -1, scene_frames = 0;
+    std::array<uint64_t, FEL_STATS_BINS> scene_hist{};
 #ifdef MVO_FEL_VULKAN_PROTOTYPE
     void *gpu_prototype = nullptr;
     bool gpu_attempted = false;
@@ -345,6 +356,7 @@ struct mvo_fel_context {
         avformat_close_input(&input);
         if (output) { output->pb = nullptr; avformat_free_context(output); }
         if (io) { av_freep(&io->buffer); avio_context_free(&io); }
+        avio_closep(&stats_io);
         av_buffer_pool_uninit(&pool);
     }
     void check_cancelled() {
@@ -745,8 +757,10 @@ struct mvo_fel_context {
             last_pts = pts;
             const int64_t duration = raw ? 1 : base->duration;
             ++emitted;
+            // Changement de plan : RPU propre seulement (une courbe héritée ne commence pas de plan).
+            const bool scene_start = !base_only && av_dovi_get_color(metadata)->scene_refresh_flag;
             if (!emit(std::unique_ptr<Job>(new Job{std::move(base), std::move(enhancement), metadata,
-                                                    std::move(mapping), pts, duration, timebase})))
+                                                    std::move(mapping), pts, duration, timebase, scene_start})))
                 return false;
         }
         return true;
@@ -773,6 +787,78 @@ struct mvo_fel_context {
         if (!leading_done) el.ready.clear();  // cible au-delà de la dernière image
         if (!bl.ready.empty() || !el.ready.empty())
             throw Failure("Fin de flux BL/EL désalignée : nombre d'images EL différent des images BL avec RPU");
+    }
+    // Statistiques CPU (frame_stats.h) sur la fenêtre encodée d'une image GBRP16 (plans G, B, R) :
+    // lignes par blocs parallèles, histogrammes fusionnés sous verrou ; même résultat que le GPU.
+    void cpu_statistics(const AVFrame &image, bool yuv, fel_frame_stats &stats) {
+        const int x0 = yuv ? output_format.crop_x : 0, y0 = yuv ? output_format.crop_y : 0;
+        const int w = output_format.width, h = output_format.height;
+        constexpr int block = 8;
+        std::vector<uint32_t> row_words(size_t(FEL_STATS_ROW_WORDS)*h);
+        fel_stats_reset(&stats);
+        std::mutex merge;
+        rows->run((h + block - 1) / block, [&](int index) {
+            check_cancelled();
+            std::array<uint32_t, FEL_STATS_BINS> hm{}, hy{};
+            for (int j = index*block; j < std::min(h, (index + 1)*block); ++j) {
+                const auto line = [&](int plane) {
+                    return reinterpret_cast<const uint16_t *>(image.data[plane] + (y0 + j)*image.linesize[plane]) + x0;
+                };
+                fel_stats_row(line(2), line(0), line(1), w, hm.data(), hy.data(), row_words.data() + size_t(FEL_STATS_ROW_WORDS)*j);
+            }
+            std::lock_guard lock(merge);
+            for (int k = 0; k < FEL_STATS_BINS; ++k) { stats.hist_maxrgb[k] += hm[k]; stats.hist_y[k] += hy[k]; }
+        });
+        fel_stats_add_rows(&stats, row_words.data(), h, w);
+    }
+    // Ligne JSON des statistiques d'une image, puis histogramme du plan à sa fin (écriture ordonnée).
+    void write_statistics(const Rendered &item) {
+        if (!stats_io) {
+            check(avio_open(&stats_io, stats_path.c_str(), AVIO_FLAG_WRITE), "Fichier de statistiques");
+            std::ostringstream head;
+            head.imbue(std::locale::classic());
+            head << "{\"format\":\"mvo-fel-frame-statistics\",\"version\":1,\"bins\":" << FEL_STATS_BINS
+                 << ",\"width\":" << item.width << ",\"height\":" << item.height << "}\n";
+            avio_write(stats_io, reinterpret_cast<const unsigned char *>(head.str().data()), int(head.str().size()));
+        }
+        const fel_frame_stats &s = *item.stats;
+        if (item.scene_start || scene_first < 0) flush_scene();
+        if (scene_first < 0) scene_first = stats_frame;
+        ++scene_frames;
+        for (int k = 0; k < FEL_STATS_BINS; ++k) scene_hist[k] += s.hist_maxrgb[k];
+        const float *eotf = fel_stats_eotf(), *edges = fel_stats_edges();
+        // Percentile 99,99 % de Y : borne haute de la case atteinte (valeur sous laquelle tombe 99,99 %).
+        const uint64_t target = s.pixels - s.pixels/10000;
+        uint64_t total = 0;
+        int bin = FEL_STATS_BINS - 1;
+        for (int k = 0; k < FEL_STATS_BINS; ++k) {
+            total += s.hist_y[k];
+            if (total >= target) { bin = k; break; }
+        }
+        std::ostringstream line;
+        line.imbue(std::locale::classic());
+        line << std::setprecision(9) << "{\"frame\":" << stats_frame << ",\"scene_start\":" << (item.scene_start ? "true" : "false")
+             << ",\"max_nits\":[" << eotf[s.max_code[0]] << ',' << eotf[s.max_code[1]] << ',' << eotf[s.max_code[2]] << ']'
+             << ",\"avg_nits\":" << (s.pixels ? s.sum_maxrgb/double(s.pixels) : 0.0)
+             << ",\"y9999_nits\":" << edges[bin + 1]
+             << ",\"y100\":" << (s.pixels ? double(s.y_le_100)/double(s.pixels) : 0.0) << "}\n";
+        avio_write(stats_io, reinterpret_cast<const unsigned char *>(line.str().data()), int(line.str().size()));
+        ++stats_frame;
+    }
+    // Histogramme de maxRGB du plan terminé (cases non vides : [case, nombre]).
+    void flush_scene() {
+        if (scene_first < 0 || !scene_frames) return;
+        std::ostringstream line;
+        line.imbue(std::locale::classic());
+        line << "{\"scene_first\":" << scene_first << ",\"frames\":" << scene_frames << ",\"maxrgb_hist\":[";
+        bool first = true;
+        for (int k = 0; k < FEL_STATS_BINS; ++k)
+            if (scene_hist[k]) { line << (first ? "" : ",") << '[' << k << ',' << scene_hist[k] << ']'; first = false; }
+        line << "]}\n";
+        avio_write(stats_io, reinterpret_cast<const unsigned char *>(line.str().data()), int(line.str().size()));
+        scene_hist.fill(0);
+        scene_first = -1;
+        scene_frames = 0;
     }
     // Copie logicielle yuv420p10le d'une image décodée par Vulkan Video (P010), pour le CPU certifié.
     static Frame software_copy(const AVFrame &hw) {
@@ -824,7 +910,8 @@ struct mvo_fel_context {
         }
         AVFrame *rgb = w.frame.get();
         auto out = std::unique_ptr<Rendered>(new Rendered{packet(), output_format.width, output_format.height,
-                                                          job.timebase});
+                                                          job.timebase, nullptr, job.scene_start});
+        if (!stats_path.empty()) out->stats = std::make_unique<fel_frame_stats>();
         out->packet->buf = av_buffer_pool_get(pool);
         if (!out->packet->buf) throw std::bad_alloc();
         out->packet->data = out->packet->buf->data;
@@ -844,6 +931,10 @@ struct mvo_fel_context {
                     : fel_gpu_render_planar(w.gpu, job.metadata, job.base.get(), job.enhancement.get(), rgb);
                 if (!ok && !fel_gpu_take_overflow(w.gpu)) throw Failure("Échec de reconstruction du prototype Vulkan");
                 on_cpu = !ok;
+                // Statistiques sur la cible RGB du GPU, fenêtre encodée (recadrage des sorties Y'CbCr).
+                if (ok && out->stats && !fel_gpu_frame_statistics(w.gpu, yuv ? output_format.crop_x : 0,
+                        yuv ? output_format.crop_y : 0, output_format.width, output_format.height, out->stats.get()))
+                    throw Failure("Statistiques de l'image impossibles sur le GPU");
                 if (on_cpu) {
                     cpu_lock = std::unique_lock(cpu_mutex);
                     ++cpu_rescue_frames;
@@ -900,6 +991,7 @@ struct mvo_fel_context {
                     muxiveo::fel::convert_rows(*scratch, *rgb, output_format, index*block,
                                                std::min(chroma_rows, (index+1)*block));
                 });
+                if (out->stats) cpu_statistics(yuv ? *scratch : *rgb, yuv, *out->stats);
             }
         }
         auto &p = *out->packet;
@@ -913,6 +1005,7 @@ struct mvo_fel_context {
         Timer nut(timing[5]);
         av_packet_rescale_ts(item.packet.get(), item.timebase, out_stream->time_base);
         check(av_interleaved_write_frame(output, item.packet.get()), "Écriture NUT");
+        if (item.stats) write_statistics(item);
         ++frames;
         if (progress) progress(opaque, frames);
     }
@@ -994,6 +1087,11 @@ struct mvo_fel_context {
         if (!frames) throw Failure("Aucune image FEL reconstruite");
         check(av_write_trailer(output), "Fin NUT");
         avio_flush(io); check(io->error, "Vidange NUT");
+        if (stats_io) {
+            flush_scene();
+            avio_flush(stats_io); check(stats_io->error, "Écriture des statistiques");
+            avio_closep(&stats_io);
+        }
     }
     void stop_prefetch() {
         if (!prefetcher.joinable()) return;
@@ -1002,6 +1100,7 @@ struct mvo_fel_context {
     }
     int next() {
         if (!started) {
+            if (!stats_path.empty()) throw Failure("Statistiques de l'image indisponibles en transport direct");
             started = true; pulling = true; began = Clock::now();
             { Timer timer(timing[0]); open(); }
             // Décodage de l'image suivante pendant le rendu de la précédente par l'appelant.
@@ -1040,9 +1139,9 @@ struct mvo_fel_context {
 uint32_t mvo_fel_abi_version() { return MVO_FEL_ABI; }
 const char *mvo_fel_capabilities() {
 #ifdef MVO_FEL_VULKAN_PROTOTYPE
-    return "{\"abi\":1,\"version\":\"" MVO_FEL_VERSION "\",\"transport\":\"nut\",\"pixel_format\":\"gbrp16le\",\"cpu\":true,\"backend\":\"vulkan-prototype\",\"statistics\":1,\"device_selection\":1,\"seek\":1,\"fd_output\":1,\"timestamps\":[\"source\",\"zero\"],\"crop\":1,\"output_formats\":[\"gbrp16le\",\"yuv420p16le\",\"yuv420p10le\",\"yuv420p\"],\"dithers\":[\"none\",\"ordered\",\"blue\"],\"direct_formats\":[\"p010\"],\"precision\":[\"exact\",\"standard\",\"fast\"],\"device_features\":[\"float64\"],\"render_workers\":[1,4],\"experimental\":true}";
+    return "{\"abi\":1,\"version\":\"" MVO_FEL_VERSION "\",\"transport\":\"nut\",\"pixel_format\":\"gbrp16le\",\"cpu\":true,\"backend\":\"vulkan-prototype\",\"statistics\":1,\"device_selection\":1,\"seek\":1,\"fd_output\":1,\"timestamps\":[\"source\",\"zero\"],\"crop\":1,\"output_formats\":[\"gbrp16le\",\"yuv420p16le\",\"yuv420p10le\",\"yuv420p\"],\"dithers\":[\"none\",\"ordered\",\"blue\"],\"direct_formats\":[\"p010\"],\"precision\":[\"exact\",\"standard\",\"fast\"],\"device_features\":[\"float64\"],\"render_workers\":[1,4],\"frame_statistics\":1,\"experimental\":true}";
 #else
-    return "{\"abi\":1,\"version\":\"" MVO_FEL_VERSION "\",\"transport\":\"nut\",\"pixel_format\":\"gbrp16le\",\"cpu\":true,\"statistics\":1,\"device_selection\":1,\"seek\":1,\"fd_output\":1,\"timestamps\":[\"source\",\"zero\"],\"crop\":1,\"output_formats\":[\"gbrp16le\",\"yuv420p16le\",\"yuv420p10le\",\"yuv420p\"],\"dithers\":[\"none\",\"ordered\",\"blue\"],\"precision\":[\"exact\",\"standard\",\"fast\"],\"device_features\":[\"float64\"]}";
+    return "{\"abi\":1,\"version\":\"" MVO_FEL_VERSION "\",\"transport\":\"nut\",\"pixel_format\":\"gbrp16le\",\"cpu\":true,\"statistics\":1,\"device_selection\":1,\"seek\":1,\"fd_output\":1,\"timestamps\":[\"source\",\"zero\"],\"crop\":1,\"output_formats\":[\"gbrp16le\",\"yuv420p16le\",\"yuv420p10le\",\"yuv420p\"],\"dithers\":[\"none\",\"ordered\",\"blue\"],\"precision\":[\"exact\",\"standard\",\"fast\"],\"device_features\":[\"float64\"],\"frame_statistics\":1}";
 #endif
 }
 int mvo_fel_classify(const uint8_t *nal, size_t size) {
@@ -1137,6 +1236,12 @@ int mvo_fel_set_precision(mvo_fel_context *p, const char *mode) {
     if (value != "exact" && value != "standard" && value != "fast") return -1;
     p->precision = value == "exact" ? FEL_PRECISION_EXACT : value == "standard" ? FEL_PRECISION_STANDARD
                                                                                   : FEL_PRECISION_FAST;
+    return 0;
+}
+int mvo_fel_set_frame_statistics(mvo_fel_context *p, const char *path) {
+    if (!p || p->started || !path || !*path) return -1;
+    fel_stats_eotf();  // tables communes initialisées avant tout fil de rendu
+    p->stats_path = path;
     return 0;
 }
 int mvo_fel_set_render_workers(mvo_fel_context *p, int count) {

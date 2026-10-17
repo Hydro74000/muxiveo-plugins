@@ -26,3 +26,4 @@ _mvo_fel_set_precision
 _mvo_fel_set_render_workers
 _mvo_fel_vulkan_precision
 _mvo_fel_devices_features
+_mvo_fel_set_frame_statistics

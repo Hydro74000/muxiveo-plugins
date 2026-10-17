@@ -102,8 +102,53 @@ def smoke(library: Path, fixture: Path, output: Path | None = None, device: str 
     yuv_output(lib, fixture)
     precision_modes(lib, fixture, device)
     missing_layers(lib, fixture, device)
-    print("ABI, NUT, 12 images/B-frames, seek, descripteur, Y'CbCr, précisions, AU sans RPU ni EL, "
+    frame_statistics(lib, fixture, device)
+    print("ABI, NUT, 12 images/B-frames, seek, descripteur, Y'CbCr, précisions, AU sans RPU ni EL, statistiques, "
           "fermeture aval, annulation, piste invalide et erreur de lecture : OK")
+
+
+def frame_statistics(lib, fixture: Path, device: str) -> None:
+    """Statistiques de l'image : format, plans, fenêtre recadrée ; fichier CPU identique au GPU."""
+    assert json.loads(lib.mvo_fel_capabilities()).get("frame_statistics") == 1
+    lib.mvo_fel_set_frame_statistics.argtypes = [c.c_void_p, c.c_char_p]
+    lib.mvo_fel_set_frame_statistics.restype = c.c_int
+
+    def run(engine: str, path: Path, yuv: bool) -> list[dict]:
+        handle = lib.mvo_fel_create(str(fixture.resolve()).encode(), 0, 2, 24000, 1001)
+        assert handle
+        try:
+            assert lib.mvo_fel_set_device(handle, engine.encode("ascii")) == 0
+            if yuv:
+                assert lib.mvo_fel_set_output(handle, b"yuv420p10le", b"topleft", b"none") == 0
+                assert lib.mvo_fel_set_crop(handle, 0, 8, 2, 8) == 0
+            assert lib.mvo_fel_set_frame_statistics(handle, b"") == -1
+            assert lib.mvo_fel_set_frame_statistics(handle, str(path).encode()) == 0
+            result = lib.mvo_fel_run(handle, WRITE(lambda *_: 0), PROGRESS(lambda *_: None), None)
+            assert result == 0, lib.mvo_fel_error(handle)
+            assert lib.mvo_fel_set_frame_statistics(handle, str(path).encode()) == -1
+        finally:
+            lib.mvo_fel_destroy(handle)
+        return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+
+    with tempfile.TemporaryDirectory(prefix="fel-stats-") as temporary:
+        for yuv, (width, height) in ((False, (256, 144)), (True, (254, 128))):
+            cpu_path, gpu_path = Path(temporary) / f"cpu-{yuv}.jsonl", Path(temporary) / f"gpu-{yuv}.jsonl"
+            lines = run("cpu", cpu_path, yuv)
+            run(device, gpu_path, yuv)
+            assert cpu_path.read_bytes() == gpu_path.read_bytes(), yuv
+            header, frames = lines[0], [line for line in lines if "frame" in line]
+            scenes = [line for line in lines if "scene_first" in line]
+            assert header["format"] == "mvo-fel-frame-statistics" and header["bins"] == 1024
+            assert (header["width"], header["height"]) == (width, height), header
+            assert [f["frame"] for f in frames] == list(range(12))
+            # Plans contigus couvrant toutes les images ; histogrammes complets.
+            assert scenes[0]["scene_first"] == 0 and sum(scene["frames"] for scene in scenes) == 12
+            for scene, following in zip(scenes, scenes[1:] + [None]):
+                if following:
+                    assert following["scene_first"] == scene["scene_first"] + scene["frames"]
+                assert sum(count for _, count in scene["maxrgb_hist"]) == scene["frames"]*width*height
+            for f in frames:
+                assert 0 <= f["y100"] <= 1 and f["avg_nits"] <= max(f["max_nits"]) + 1e-3 and f["y9999_nits"] > 0, f
 
 
 def strip_layers(fixture: Path, output: Path, units: dict[int, set[int]]) -> None:

@@ -63,6 +63,11 @@ MVO_FEL_EXPORT int mvo_fel_set_precision(mvo_fel_context *, const char *mode);
 /* Extension additive ABI 1 (capacité render_workers : [min, max]) : images en vol du rendu GPU, une
  * par fil et par contexte sur le même périphérique (2 par défaut). Avant run ; sans effet en CPU. */
 MVO_FEL_EXPORT int mvo_fel_set_render_workers(mvo_fel_context *, int count);
+/* Extension additive ABI 1 (capacité frame_statistics) : statistiques de chaque image produite
+ * (fenêtre encodée, RGB reconstruit : maxRGB, luminance, maxima par canal) et histogramme de maxRGB
+ * de chaque plan Dolby Vision, en JSON Lines UTF-8 dans path. Avant mvo_fel_run / mvo_fel_run_fd ;
+ * refusé en transport direct (mvo_fel_next_layers). Format : docs/statistiques-image.md. */
+MVO_FEL_EXPORT int mvo_fel_set_frame_statistics(mvo_fel_context *, const char *path);
 MVO_FEL_EXPORT int mvo_fel_set_output(mvo_fel_context *, const char *pixel_format,
     const char *chroma_location, const char *dither);
 /* Mesures locales après run ; pipe_s est inclus dans nut_s. */

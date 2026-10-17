@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.22)
-project(mvo-fel VERSION 0.2.1 LANGUAGES C CXX)
+project(mvo-fel VERSION 0.3.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -28,7 +28,7 @@ foreach(shader fixed_point fixed_render)
     DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/src/shaders/${shader}.glsl ${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_text.cmake)
   list(APPEND MVO_FEL_GLSL_SOURCES ${output})
 endforeach()
-add_library(fel_math STATIC src/reconstruction.cpp src/certified.cpp src/fixed_point.cpp ${MVO_FEL_PQ_SOURCE}
+add_library(fel_math STATIC src/reconstruction.cpp src/certified.cpp src/fixed_point.cpp src/frame_stats.c ${MVO_FEL_PQ_SOURCE}
             ${MVO_FEL_GLSL_SOURCES})
 target_include_directories(fel_math PUBLIC include)
 target_link_libraries(fel_math PUBLIC PkgConfig::AV)
@@ -80,6 +80,8 @@ else()
   target_compile_options(fel_math PRIVATE -Wall -Wextra -Wpedantic -fno-trapping-math)
   # Reprises double-double : transformations exactes, aucune contraction en FMA.
   set_source_files_properties(src/certified.cpp PROPERTIES COMPILE_OPTIONS -ffp-contract=off)
+  # Statistiques : luminance identique au shader « precise » (aucune contraction).
+  set_source_files_properties(src/frame_stats.c PROPERTIES COMPILE_OPTIONS -ffp-contract=off)
 endif()
 
 include(CTest)

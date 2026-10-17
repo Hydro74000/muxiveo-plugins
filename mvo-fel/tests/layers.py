@@ -39,7 +39,18 @@ def main() -> None:
                 assert lib.mvo_fel_next_layers(handle, callback, None) == 5
         finally:
             lib.mvo_fel_destroy(handle)
-    print('Pull : douze images ordonnées, cadence rationnelle, EOF, fermeture, annulation et lecture : OK')
+    # Statistiques de l'image : réservées aux transports NUT (refus explicite, erreur 1).
+    lib.mvo_fel_set_frame_statistics.argtypes = [c.c_void_p, c.c_char_p]
+    lib.mvo_fel_set_frame_statistics.restype = c.c_int
+    handle = lib.mvo_fel_create(str(fixture.resolve()).encode(), 0, 2, 24000, 1001)
+    try:
+        assert lib.mvo_fel_set_frame_statistics(handle, b'stats.jsonl') == 0
+        assert lib.mvo_fel_next_layers(handle, CALLBACK(lambda *_: 0), None) == 1
+        assert b'transport direct' in lib.mvo_fel_error(handle)
+    finally:
+        lib.mvo_fel_destroy(handle)
+    print('Pull : douze images ordonnées, cadence rationnelle, EOF, fermeture, annulation, lecture et '
+          'refus des statistiques : OK')
 
 
 if __name__ == '__main__':
