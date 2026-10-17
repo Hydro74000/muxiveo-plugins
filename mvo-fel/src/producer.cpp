@@ -258,6 +258,7 @@ struct Job {
     int64_t pts, duration;
     AVRational timebase;
     bool scene_start = false;  // drapeau de changement de plan du RPU propre de l'image
+    std::array<int, 4> active{};  // zone active L5 du RPU (marges gauche, haut, droite, bas)
 };
 struct Rendered {
     Packet packet;
@@ -265,6 +266,7 @@ struct Rendered {
     AVRational timebase;
     std::unique_ptr<fel_frame_stats> stats;  // statistiques de l'image (mvo_fel_set_frame_statistics)
     bool scene_start = false;
+    std::array<int, 4> window{};  // fenêtre mesurée (x, y, largeur, hauteur), coordonnées de la source
 };
 }
 
@@ -759,8 +761,12 @@ struct mvo_fel_context {
             ++emitted;
             // Changement de plan : RPU propre seulement (une courbe héritée ne commence pas de plan).
             const bool scene_start = !base_only && av_dovi_get_color(metadata)->scene_refresh_flag;
+            // Zone active (L5) : bandes noires exclues des statistiques de l'image.
+            std::array<int, 4> active{};
+            if (const AVDOVIDmData *l5 = av_dovi_find_level(metadata, 5))
+                active = {l5->l5.left_offset, l5->l5.top_offset, l5->l5.right_offset, l5->l5.bottom_offset};
             if (!emit(std::unique_ptr<Job>(new Job{std::move(base), std::move(enhancement), metadata,
-                                                    std::move(mapping), pts, duration, timebase, scene_start})))
+                                                    std::move(mapping), pts, duration, timebase, scene_start, active})))
                 return false;
         }
         return true;
@@ -788,11 +794,20 @@ struct mvo_fel_context {
         if (!bl.ready.empty() || !el.ready.empty())
             throw Failure("Fin de flux BL/EL désalignée : nombre d'images EL différent des images BL avec RPU");
     }
-    // Statistiques CPU (frame_stats.h) sur la fenêtre encodée d'une image GBRP16 (plans G, B, R) :
-    // lignes par blocs parallèles, histogrammes fusionnés sous verrou ; même résultat que le GPU.
-    void cpu_statistics(const AVFrame &image, bool yuv, fel_frame_stats &stats) {
+    // Fenêtre mesurée (coordonnées de la source) : fenêtre encodée (recadrage des sorties Y'CbCr)
+    // limitée à la zone active L5 ; fenêtre encodée entière si l'intersection est vide.
+    std::array<int, 4> statistics_window(const Job &job, bool yuv) const {
         const int x0 = yuv ? output_format.crop_x : 0, y0 = yuv ? output_format.crop_y : 0;
-        const int w = output_format.width, h = output_format.height;
+        const int x1 = x0 + output_format.width, y1 = y0 + output_format.height;
+        const int ax0 = std::max(x0, job.active[0]), ay0 = std::max(y0, job.active[1]);
+        const int ax1 = std::min(x1, width - job.active[2]), ay1 = std::min(y1, height - job.active[3]);
+        if (ax1 <= ax0 || ay1 <= ay0) return {x0, y0, x1 - x0, y1 - y0};
+        return {ax0, ay0, ax1 - ax0, ay1 - ay0};
+    }
+    // Statistiques CPU (frame_stats.h) sur la fenêtre d'une image GBRP16 pleine taille (plans G, B, R) :
+    // lignes par blocs parallèles, histogrammes fusionnés sous verrou ; même résultat que le GPU.
+    void cpu_statistics(const AVFrame &image, const std::array<int, 4> &window, fel_frame_stats &stats) {
+        const int x0 = window[0], y0 = window[1], w = window[2], h = window[3];
         constexpr int block = 8;
         std::vector<uint32_t> row_words(size_t(FEL_STATS_ROW_WORDS)*h);
         fel_stats_reset(&stats);
@@ -841,7 +856,9 @@ struct mvo_fel_context {
              << ",\"max_nits\":[" << eotf[s.max_code[0]] << ',' << eotf[s.max_code[1]] << ',' << eotf[s.max_code[2]] << ']'
              << ",\"avg_nits\":" << (s.pixels ? s.sum_maxrgb/double(s.pixels) : 0.0)
              << ",\"y9999_nits\":" << edges[bin + 1]
-             << ",\"y100\":" << (s.pixels ? double(s.y_le_100)/double(s.pixels) : 0.0) << "}\n";
+             << ",\"y100\":" << (s.pixels ? double(s.y_le_100)/double(s.pixels) : 0.0)
+             << ",\"window\":[" << item.window[0] << ',' << item.window[1] << ',' << item.window[2] << ','
+             << item.window[3] << "]}\n";
         avio_write(stats_io, reinterpret_cast<const unsigned char *>(line.str().data()), int(line.str().size()));
         ++stats_frame;
     }
@@ -931,10 +948,12 @@ struct mvo_fel_context {
                     : fel_gpu_render_planar(w.gpu, job.metadata, job.base.get(), job.enhancement.get(), rgb);
                 if (!ok && !fel_gpu_take_overflow(w.gpu)) throw Failure("Échec de reconstruction du prototype Vulkan");
                 on_cpu = !ok;
-                // Statistiques sur la cible RGB du GPU, fenêtre encodée (recadrage des sorties Y'CbCr).
-                if (ok && out->stats && !fel_gpu_frame_statistics(w.gpu, yuv ? output_format.crop_x : 0,
-                        yuv ? output_format.crop_y : 0, output_format.width, output_format.height, out->stats.get()))
-                    throw Failure("Statistiques de l'image impossibles sur le GPU");
+                // Statistiques sur la cible RGB du GPU (fenêtre encodée ∩ zone active L5).
+                if (ok && out->stats) {
+                    const auto window = out->window = statistics_window(job, yuv);
+                    if (!fel_gpu_frame_statistics(w.gpu, window[0], window[1], window[2], window[3], out->stats.get()))
+                        throw Failure("Statistiques de l'image impossibles sur le GPU");
+                }
                 if (on_cpu) {
                     cpu_lock = std::unique_lock(cpu_mutex);
                     ++cpu_rescue_frames;
@@ -991,7 +1010,7 @@ struct mvo_fel_context {
                     muxiveo::fel::convert_rows(*scratch, *rgb, output_format, index*block,
                                                std::min(chroma_rows, (index+1)*block));
                 });
-                if (out->stats) cpu_statistics(yuv ? *scratch : *rgb, yuv, *out->stats);
+                if (out->stats) cpu_statistics(yuv ? *scratch : *rgb, out->window = statistics_window(job, yuv), *out->stats);
             }
         }
         auto &p = *out->packet;

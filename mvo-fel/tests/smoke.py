@@ -146,7 +146,10 @@ def frame_statistics(lib, fixture: Path, device: str) -> None:
             for scene, following in zip(scenes, scenes[1:] + [None]):
                 if following:
                     assert following["scene_first"] == scene["scene_first"] + scene["frames"]
-                assert sum(count for _, count in scene["maxrgb_hist"]) == scene["frames"]*width*height
+                # Fenêtre mesurée : fenêtre encodée (zone active L5 entière sur la séquence de test).
+                windows = [f["window"] for f in frames[scene["scene_first"]:scene["scene_first"] + scene["frames"]]]
+                assert all(w[2:] == [width, height] for w in windows), windows
+                assert sum(count for _, count in scene["maxrgb_hist"]) == sum(w[2]*w[3] for w in windows)
             for f in frames:
                 assert 0 <= f["y100"] <= 1 and f["avg_nits"] <= max(f["max_nits"]) + 1e-3 and f["y9999_nits"] > 0, f
 

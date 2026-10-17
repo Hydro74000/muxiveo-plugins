@@ -10,7 +10,10 @@ métadonnées de la source décrivent la BL, pas l'image reconstruite.
 ## Mesure
 
 - Entrée : codes RGB PQ 16 bits (BT.2020) de l'image reconstruite, avant la conversion Y'CbCr,
-  sur la fenêtre encodée (recadrage compris pour les sorties Y'CbCr, image entière en RGB).
+  sur la fenêtre encodée (recadrage compris pour les sorties Y'CbCr, image entière en RGB),
+  limitée à la zone active du RPU de l'image (L5) : les bandes noires sont exclues, y compris
+  quand le format change en cours de film. Sans L5, ou si l'intersection est vide, fenêtre
+  encodée entière.
 - Lumière linéaire par une table EOTF PQ de 65 536 valeurs float (nits), calculée en double.
 - maxRGB = max(R, G, B) ; luminance Y = 0,2627 R + 0,6780 G + 0,0593 B, en float, sans
   contraction FMA (`precise` sur GPU, `-ffp-contract=off` sur CPU).
@@ -32,7 +35,7 @@ Première ligne :
 Une ligne par image produite, dans l'ordre :
 
 ```json
-{"frame":0,"scene_start":true,"max_nits":[1563.6,1054.1,921.5],"avg_nits":13.0,"y9999_nits":426.5,"y100":0.97}
+{"frame":0,"scene_start":true,"max_nits":[1563.6,1054.1,921.5],"avg_nits":13.0,"y9999_nits":426.5,"y100":0.97,"window":[0,280,3840,1600]}
 ```
 
 - `scene_start` : drapeau de changement de plan du RPU Dolby Vision de l'image (faux pour une
@@ -40,6 +43,7 @@ Une ligne par image produite, dans l'ordre :
 - `max_nits` : maxima de R, G, B (nits) ; `avg_nits` : moyenne de maxRGB (nits).
 - `y9999_nits` : borne haute de la case de Y atteinte à 99,99 % des pixels.
 - `y100` : part des pixels de luminance ≤ 100 nits.
+- `window` : fenêtre mesurée (x, y, largeur, hauteur), en pixels de la source.
 
 À la fin de chaque plan (changement de plan suivant ou fin du flux) :
 
