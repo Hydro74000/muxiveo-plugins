@@ -12,3 +12,9 @@ le RPU épinglé avec FFmpeg/libx265 et dovi_tool installés.
 
 Cette séquence valide le transport et les associations de couches. Elle ne
 remplace ni la référence numérique, ni la validation visuelle d'un FEL réel.
+
+`synthetic-fel-mixed-gop.hevc` est la même séquence avec une BL sans B-frames
+(`make_fixture.py --bl-bframes 0`) face à l'EL à trois B-frames : flux non
+conforme dont les couches d'une même access unit ne sont pas affichées au même
+instant. Le plugin les apparie par rang de présentation et doit produire
+exactement l'image de `synthetic-fel.hevc`.

@@ -60,6 +60,8 @@ int fel_gpu_set_precision(void *, int);
 int fel_gpu_fixed_variant(const void *);
 int fel_gpu_inherit(void *, const void *);
 void fel_gpu_certified(void *, long long *, long long *);
+int fel_gpu_take_overflow(void *);
+void fel_gpu_set_cpu_threads(void *, int);
 #endif
 }
 
@@ -119,7 +121,6 @@ struct Layer {
         decoder->pkt_timebase = stream->time_base;
         decoder->thread_count = threads;
         decoder->err_recognition = AV_EF_EXPLODE;
-        decoder->flags |= AV_CODEC_FLAG_COPY_OPAQUE;
         if (hardware) {
             decoder->hw_device_ctx = av_buffer_ref(hardware);
             if (!decoder->hw_device_ctx) throw std::bad_alloc();
@@ -285,6 +286,10 @@ struct mvo_fel_context {
     std::unique_ptr<RowPool> rows;
     std::unique_ptr<muxiveo::fel::FastReconstruction> fast;
     int render_threads = 1;
+    // Images refaites sur le CPU certifié après saturation de la liste des indécises du GPU
+    // (mêmes octets) ; le verrou sérialise ce chemin entre les fils de rendu GPU.
+    std::mutex cpu_mutex;
+    std::atomic<long long> cpu_rescue_frames{0};
 #ifdef MVO_FEL_VULKAN_PROTOTYPE
     void *gpu_prototype = nullptr;
     bool gpu_attempted = false;
@@ -422,6 +427,15 @@ struct mvo_fel_context {
         const int bl_threads = cpu_render ? std::max(1, threads/4) : std::max(1, threads/3);
         const int el_threads = cpu_render ? 1 : std::max(1, threads/3);
         render_threads = std::max(1, threads - bl_threads - el_threads);
+#ifdef MVO_FEL_VULKAN_PROTOTYPE
+        // Indécises reprises par le CPU certifié : fils de rendu CPU (inactifs en mode GPU) répartis
+        // entre les contextes, jamais au-delà du budget donné par l'appelant.
+        if (gpu_prototype) {
+            const int share = std::max(1, render_threads / int(1 + gpu_extra.size()));
+            fel_gpu_set_cpu_threads(gpu_prototype, share);
+            for (void *extra : gpu_extra) fel_gpu_set_cpu_threads(extra, share);
+        }
+#endif
         bl.init(stream, "bl_rpu", bl_threads, hw_decode ? hw_device : nullptr);
         el.init(stream, "el", el_threads, hw_decode ? hw_device : nullptr);
     }
@@ -595,14 +609,19 @@ struct mvo_fel_context {
         // Image clé antérieure ; un échec garde la lecture depuis le début (même résultat).
         av_seek_frame(input, stream_index, target, AVSEEK_FLAG_BACKWARD);
     }
-    // Images antérieures à la cible, dont les RASL/RADL d'un GOP ouvert : leurs PTS
-    // précèdent l'image clé atteinte. Chaque couche les écarte avant l'appariement.
-    void drop_leading(Layer &layer) {
-        while (target != AV_NOPTS_VALUE && !layer.ready.empty()) {
-            const auto pts = layer.ready.front()->pts;
-            if (pts != AV_NOPTS_VALUE && pts >= target) break;
-            layer.ready.pop_front();
+    // Images antérieures à la cible, dont les RASL/RADL d'un GOP ouvert : leurs PTS précèdent
+    // l'image clé atteinte. Écartées sur la BL, puis autant d'images sur l'EL (même rang de
+    // présentation : les PTS de l'EL ne sont pas fiables si sa structure de GOP diffère).
+    int64_t leading = 0, el_leading = 0;
+    bool leading_done = false;
+    void drop_leading() {
+        while (!leading_done && !bl.ready.empty()) {
+            const auto pts = bl.ready.front()->pts;
+            if (target == AV_NOPTS_VALUE || (pts != AV_NOPTS_VALUE && pts >= target)) { leading_done = true; break; }
+            bl.ready.pop_front();
+            ++leading;
         }
+        while (el_leading < leading && !el.ready.empty()) { el.ready.pop_front(); ++el_leading; }
     }
     int64_t output_pts(const AVFrame &base) const {
         if (raw) return emitted;
@@ -658,29 +677,61 @@ struct mvo_fel_context {
              : value == FEL_PRECISION_STANDARD ? "précision standard (hybride borné)" : "précision rapide (float32)";
     }
     using Emit = std::function<bool(std::unique_ptr<Job>)>;
-    // Apparie BL/EL/RPU dans l'ordre de présentation ; false si emit demande l'arrêt.
+    // Image BL sans RPU propre (AU sans RPU ni EL, images finales de certains disques) : courbe
+    // persistante de FFmpeg (dernier RPU reçu), résiduel désactivé, EL précédent comme plan
+    // neutre (non lu). Aucune EL de ce rang n'est consommée.
+    Frame last_el;
+    std::atomic<long long> bl_only_frames{0};
+    static bool own_rpu(const AVFrame &f) { return av_frame_get_side_data(&f, AV_FRAME_DATA_DOVI_RPU_BUFFER); }
+    static void disable_residual(AVFrame &base) {
+        const auto *sd = av_frame_get_side_data(&base, AV_FRAME_DATA_DOVI_METADATA);
+        if (!sd) throw Failure("RPU absent de l'image BL");
+        AVBufferRef *copy = av_buffer_alloc(sd->size);
+        if (!copy) throw std::bad_alloc();
+        std::memcpy(copy->data, sd->data, sd->size);
+        av_dovi_get_header(reinterpret_cast<AVDOVIMetadata *>(copy->data))->disable_residual_flag = 1;
+        av_frame_remove_side_data(&base, AV_FRAME_DATA_DOVI_METADATA);
+        if (!av_frame_new_side_data_from_buf(&base, AV_FRAME_DATA_DOVI_METADATA, copy)) {
+            av_buffer_unref(&copy);
+            throw std::bad_alloc();
+        }
+    }
+    // Apparie BL/EL/RPU par rang de présentation (n-ième image BL avec la n-ième image EL), quelle
+    // que soit la structure de GOP de chaque couche ; false si emit demande l'arrêt. Une EL manquante
+    // ou en trop décale les rangs suivants : couche orpheline en fin de flux, refusée.
     bool pair(const Emit &emit) {
-        drop_leading(bl); drop_leading(el);
-        while (!bl.ready.empty() && !el.ready.empty()) {
+        drop_leading();
+        if (!leading_done || el_leading < leading) return true;
+        while (!bl.ready.empty()) {
             check_cancelled();
+            const bool base_only = !own_rpu(*bl.ready.front());
+            if (!base_only && el.ready.empty()) break;  // EL de même rang encore en décodage
             auto base = std::move(bl.ready.front()); bl.ready.pop_front();
-            auto enhancement = std::move(el.ready.front()); el.ready.pop_front();
-            if (!base->opaque_ref || !enhancement->opaque_ref ||
-                base->opaque_ref->size != sizeof(int64_t) || enhancement->opaque_ref->size != sizeof(int64_t) ||
-                std::memcmp(base->opaque_ref->data, enhancement->opaque_ref->data, sizeof(int64_t)))
-                throw Failure("Désalignement des access units BL/EL");
-            if (!raw && (base->pts == AV_NOPTS_VALUE || base->pts != enhancement->pts))
-                throw Failure("Horodatages BL/EL absents ou différents");
+            Frame enhancement;
+            if (base_only) {
+                if (!last_el) throw Failure("Image BL sans RPU ni EL avant la première image FEL");
+                enhancement.reset(av_frame_clone(last_el.get()));
+                if (!enhancement) throw std::bad_alloc();
+                disable_residual(*base);
+            } else {
+                enhancement = std::move(el.ready.front()); el.ready.pop_front();
+                last_el.reset(av_frame_clone(enhancement.get()));
+                if (!last_el) throw std::bad_alloc();
+            }
+            if (!raw && base->pts == AV_NOPTS_VALUE) throw Failure("Horodatage BL absent");
             const auto *sd = av_frame_get_side_data(base.get(), AV_FRAME_DATA_DOVI_METADATA);
             if (!sd) throw Failure("RPU absent de l'image BL");
-            const auto *original = av_frame_get_side_data(base.get(), AV_FRAME_DATA_DOVI_RPU_BUFFER);
-            if (!original) throw Failure("RPU original absent de l'image BL");
-            const int kind = mvo_fel_classify(original->data, original->size);
-            if (kind != 1 && kind != 3) throw Failure("RPU original invalide ou sans FEL pendant le décodage");
+            if (!base_only) {
+                const auto *original = av_frame_get_side_data(base.get(), AV_FRAME_DATA_DOVI_RPU_BUFFER);
+                if (!original) throw Failure("RPU original absent de l'image BL");
+                const int kind = mvo_fel_classify(original->data, original->size);
+                if (kind != 1 && kind != 3) throw Failure("RPU original invalide ou sans FEL pendant le décodage");
+            }
             const auto *metadata = reinterpret_cast<const AVDOVIMetadata *>(sd->data);
             muxiveo::fel::Mapping mapping(*metadata);
-            if (!mapping.residual) throw Failure("Résiduel désactivé pendant la reconstruction FEL");
+            if (!base_only && !mapping.residual) throw Failure("Résiduel désactivé pendant la reconstruction FEL");
             if (skipped < skip) { ++skipped; continue; }
+            if (base_only) ++bl_only_frames;
             if (base->width <= 0 || base->height <= 0 || base->width > 8192 || base->height > 8192)
                 throw Failure("Dimensions source invalides");
             const auto timebase = raw ? av_inv_q(fps) : stream->time_base;
@@ -703,7 +754,6 @@ struct mvo_fel_context {
     // Lecture, décodage BL/EL et appariement jusqu'à la fin du flux.
     void decode_all(const Emit &emit) {
         auto p = packet();
-        int64_t identity = 0;
         for (;;) {
             check_cancelled();
             int ret;
@@ -711,10 +761,6 @@ struct mvo_fel_context {
             if (ret == AVERROR_EOF) break;
             check(ret, "Lecture source", MVO_FEL_INPUT_ERROR);
             if (p->stream_index == stream_index) {
-                av_buffer_unref(&p->opaque_ref);
-                p->opaque_ref = av_buffer_alloc(sizeof(identity));
-                if (!p->opaque_ref) throw std::bad_alloc();
-                std::memcpy(p->opaque_ref->data, &identity, sizeof(identity)); ++identity;
                 { Timer timer(timing[2]); bl.send(p.get()); }
                 { Timer timer(timing[3]); el.send(p.get()); }
                 if (!pair(emit)) return;
@@ -724,7 +770,30 @@ struct mvo_fel_context {
         { Timer timer(timing[2]); bl.send(nullptr); }
         { Timer timer(timing[3]); el.send(nullptr); }
         if (!pair(emit)) return;
-        if (!bl.ready.empty() || !el.ready.empty()) throw Failure("Fin de flux BL/EL désalignée");
+        if (!leading_done) el.ready.clear();  // cible au-delà de la dernière image
+        if (!bl.ready.empty() || !el.ready.empty())
+            throw Failure("Fin de flux BL/EL désalignée : nombre d'images EL différent des images BL avec RPU");
+    }
+    // Copie logicielle yuv420p10le d'une image décodée par Vulkan Video (P010), pour le CPU certifié.
+    static Frame software_copy(const AVFrame &hw) {
+        Frame host = frame(), out = frame();
+        check(av_hwframe_transfer_data(host.get(), &hw, 0), "Copie de l'image GPU");
+        if (host->format != AV_PIX_FMT_P010LE) throw Failure("Image GPU non P010");
+        out->format = AV_PIX_FMT_YUV420P10LE; out->width = hw.width; out->height = hw.height;
+        check(av_frame_get_buffer(out.get(), 0), "Image logicielle");
+        check(av_frame_copy_props(out.get(), &hw), "Propriétés de l'image");
+        for (int y = 0; y < hw.height; ++y) {
+            const auto *a = reinterpret_cast<const uint16_t *>(host->data[0] + y*host->linesize[0]);
+            auto *b = reinterpret_cast<uint16_t *>(out->data[0] + y*out->linesize[0]);
+            for (int x = 0; x < hw.width; ++x) b[x] = a[x] >> 6;
+        }
+        for (int y = 0; y < (hw.height + 1)/2; ++y) {
+            const auto *a = reinterpret_cast<const uint16_t *>(host->data[1] + y*host->linesize[1]);
+            auto *u = reinterpret_cast<uint16_t *>(out->data[1] + y*out->linesize[1]);
+            auto *v = reinterpret_cast<uint16_t *>(out->data[2] + y*out->linesize[2]);
+            for (int x = 0; x < (hw.width + 1)/2; ++x) { u[x] = a[2*x] >> 6; v[x] = a[2*x + 1] >> 6; }
+        }
+        return out;
     }
     // Reconstruction d'une image dans un paquet du pool (thread de rendu uniquement).
     // Plusieurs fils de rendu en mode GPU (lot P) : initialisation sous verrou, cadre et contexte par fil.
@@ -764,17 +833,31 @@ struct mvo_fel_context {
             pixel_format(), output_format.width, output_format.height, 1), "Plans du paquet");
         {
             Timer pixels(w.pixels);
+            bool on_cpu = true;
+            std::unique_lock<std::mutex> cpu_lock;
+            Frame held_base, held_el;  // images GPU d'origine : job.metadata pointe dans leurs données
 #ifdef MVO_FEL_VULKAN_PROTOTYPE
             if (w.gpu) {
                 const bool ok = yuv
                     ? fel_gpu_render_yuv(w.gpu, job.metadata, job.base.get(), job.enhancement.get(),
                                          &output_format, rgb)
                     : fel_gpu_render_planar(w.gpu, job.metadata, job.base.get(), job.enhancement.get(), rgb);
-                if (!ok) throw Failure("Échec de reconstruction du prototype Vulkan");
-            } else
+                if (!ok && !fel_gpu_take_overflow(w.gpu)) throw Failure("Échec de reconstruction du prototype Vulkan");
+                on_cpu = !ok;
+                if (on_cpu) {
+                    cpu_lock = std::unique_lock(cpu_mutex);
+                    ++cpu_rescue_frames;
+                    if (job.base->format == AV_PIX_FMT_VULKAN) {
+                        held_base = std::move(job.base); held_el = std::move(job.enhancement);
+                        job.base = software_copy(*held_base);
+                        job.enhancement = software_copy(*held_el);
+                    }
+                }
+            }
 #endif
-            {
-                if (job.base->format == AV_PIX_FMT_VULKAN) throw Failure("Image Vulkan sans rendu GPU");
+            if (on_cpu) {
+                const AVFrame &base = *job.base;  // copie logicielle après un repli GPU
+                if (base.format == AV_PIX_FMT_VULKAN) throw Failure("Image Vulkan sans rendu GPU");
                 if (!rows) rows = std::make_unique<RowPool>(render_threads);
                 // Y'CbCr : reconstruction RGB 16 bits intermédiaire, puis conversion par lignes chroma.
                 AVFrame *target = rgb;
@@ -1101,6 +1184,10 @@ const char *mvo_fel_statistics(mvo_fel_context *p) {
     }
 #endif
     text << ",\"certified_rescued\":" << rescued << ",\"certified_undecided\":" << undecided;
+    // Images sans RPU ni EL recomposées sans résiduel (courbe du RPU précédent).
+    text << ",\"bl_only_frames\":" << p->bl_only_frames.load();
+    // Images refaites sur le CPU certifié (liste des indécises du GPU saturée).
+    text << ",\"cpu_rescue_frames\":" << p->cpu_rescue_frames.load();
     // Attentes des files : l'étage le plus attendu par les autres est le goulot.
     const char *waits[]={"decode_blocked_s","render_starved_s","render_blocked_s","output_starved_s"};
     for(size_t i=0;i<p->waits.size();++i)text << ",\"" << waits[i] << "\":" << p->waits[i];

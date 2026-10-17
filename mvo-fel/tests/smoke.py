@@ -4,6 +4,9 @@ from __future__ import annotations
 import argparse
 import ctypes as c
 import json
+import os
+import re
+import tempfile
 from pathlib import Path
 
 WRITE = c.CFUNCTYPE(c.c_int, c.c_void_p, c.c_void_p, c.c_size_t)
@@ -98,8 +101,79 @@ def smoke(library: Path, fixture: Path, output: Path | None = None, device: str 
     fd_output(lib, fixture)
     yuv_output(lib, fixture)
     precision_modes(lib, fixture, device)
-    print("ABI, NUT, 12 images/B-frames, seek, descripteur, Y'CbCr, précisions, fermeture aval, annulation, "
-          "piste invalide et erreur de lecture : OK")
+    missing_layers(lib, fixture, device)
+    print("ABI, NUT, 12 images/B-frames, seek, descripteur, Y'CbCr, précisions, AU sans RPU ni EL, "
+          "fermeture aval, annulation, piste invalide et erreur de lecture : OK")
+
+
+def strip_layers(fixture: Path, output: Path, units: dict[int, set[int]]) -> None:
+    """Copie du flux sans les NAL indiqués (62 RPU, 63 EL) des access units choisies (ordre de décodage)."""
+    data = fixture.read_bytes()
+    starts = [m.start() - (m.start() > 0 and data[m.start() - 1] == 0) for m in re.finditer(b"\x00\x00\x01", data)]
+    kept, unit = bytearray(), -1
+    for begin, end in zip(starts, starts[1:] + [len(data)]):
+        header = data.index(b"\x00\x00\x01", begin) + 3
+        kind = (data[header] >> 1) & 0x3F
+        if kind < 32 and data[header + 2] & 0x80:  # première tranche d'une image
+            unit += 1
+        if kind not in units.get(unit, ()):
+            kept += data[begin:end]
+    output.write_bytes(bytes(kept))
+
+
+def missing_layers(lib, fixture: Path, device: str) -> None:
+    """AU sans RPU ni EL : recomposées sans résiduel (CPU = GPU exact) ; RPU ou EL seul : refusé.
+
+    BL et EL de structures de GOP différentes : appariées par rang de présentation.
+    """
+    lib.mvo_fel_statistics.argtypes = [c.c_void_p]
+    lib.mvo_fel_statistics.restype = c.c_char_p
+
+    def render(path: Path, engine: str) -> tuple[int, bytes, dict]:
+        handle = lib.mvo_fel_create(str(path).encode(), 0, 2, 24000, 1001)
+        assert handle
+        data = bytearray()
+        try:
+            assert lib.mvo_fel_set_precision(handle, b"exact") == 0
+            assert lib.mvo_fel_set_device(handle, engine.encode("ascii")) == 0
+            result = lib.mvo_fel_run(handle, WRITE(lambda _o, p, n: data.extend(c.string_at(p, n)) or 0),
+                                     PROGRESS(lambda *_: None), None)
+            statistics = json.loads(lib.mvo_fel_statistics(handle) or b"{}")
+            statistics["gpu"] = (lib.mvo_fel_backend(handle) or b"").startswith(b"vulkan")
+            return result, bytes(data), statistics
+        finally:
+            lib.mvo_fel_destroy(handle)
+
+    with tempfile.TemporaryDirectory(prefix="fel-missing-") as temporary:
+        stripped = Path(temporary) / "stripped.hevc"
+        _, complete, statistics = render(fixture.resolve(), "cpu")
+        assert statistics["bl_only_frames"] == 0
+        # AU non référencées (TRAIL_N) : deux en fin de flux comme certains disques, une en milieu de flux.
+        for units, count in (({10: {62, 63}, 11: {62, 63}}, 2), ({3: {62, 63}}, 1)):
+            strip_layers(fixture, stripped, units)
+            result, cpu, statistics = render(stripped, "cpu")
+            assert result == 0 and statistics["frames"] == 12 and statistics["bl_only_frames"] == count, (units, statistics)
+            assert len(cpu) == len(complete) and cpu != complete
+            result, gpu, statistics = render(stripped, device)
+            assert result == 0 and gpu == cpu and statistics["bl_only_frames"] == count, (units, result, statistics)
+        # RPU sans EL, EL sans RPU (couche orpheline en fin de flux), IDR sans couche : refusés.
+        for units in ({10: {63}}, {10: {62}}, {0: {62, 63}}):
+            strip_layers(fixture, stripped, units)
+            assert render(stripped, "cpu")[0] != 0, units
+    # Liste des indécises du GPU saturée (simulée) : chaque image refaite sur le CPU certifié, mêmes octets.
+    os.environ["MVO_FEL_TEST_OVERFLOW"] = "1"
+    try:
+        result, data, statistics = render(fixture.resolve(), device)
+    finally:
+        del os.environ["MVO_FEL_TEST_OVERFLOW"]
+    assert result == 0 and data == complete, (result, statistics)
+    assert statistics["cpu_rescue_frames"] == (12 if statistics["gpu"] else 0), statistics
+    # GOP différents (BL sans B-frames, EL à trois B-frames) : appariement par rang de présentation,
+    # même image que la séquence conforme (couches grises identiques une fois décodées).
+    mixed = fixture.with_name("synthetic-fel-mixed-gop.hevc")
+    for engine in ("cpu", device):
+        result, data, statistics = render(mixed, engine)
+        assert result == 0 and statistics["frames"] == 12 and data == complete, (engine, result, statistics)
 
 
 def precision_modes(lib, fixture: Path, device: str) -> None:

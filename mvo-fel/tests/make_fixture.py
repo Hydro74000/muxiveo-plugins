@@ -12,6 +12,8 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("fel_rpu", type=Path, help="assets/tests/fel_orig.bin du dépôt dovi_tool épinglé")
     parser.add_argument("output", type=Path)
+    # 0 : BL sans B-frames face à une EL à trois B-frames (GOP différents, flux non conforme).
+    parser.add_argument("--bl-bframes", type=int, default=3)
     args = parser.parse_args()
     with tempfile.TemporaryDirectory(prefix="fel-fixture-") as temporary:
         work = Path(temporary)
@@ -24,11 +26,11 @@ def main() -> None:
             "edits": {"0-11": 0}}}))
         corrected = work / "rpu.bin"
         subprocess.run(["dovi_tool", "editor", "-i", str(rpu), "-j", str(edit), "-o", str(corrected)], check=True)
-        for name, size in (("bl", "256x144"), ("el", "128x72")):
+        for name, size, bframes in (("bl", "256x144", args.bl_bframes), ("el", "128x72", 3)):
             subprocess.run(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i",
                 f"color=gray:s={size}:r=24000/1001", "-frames:v", "12", "-pix_fmt", "yuv420p10le",
                 "-c:v", "libx265", "-x265-params",
-                "log-level=0:pools=1:frame-threads=1:keyint=12:min-keyint=12:scenecut=0:bframes=3:chromaloc=2",
+                f"log-level=0:pools=1:frame-threads=1:keyint=12:min-keyint=12:scenecut=0:bframes={bframes}:chromaloc=2",
                 str(work / f"{name}.hevc")], check=True)
         subprocess.run(["dovi_tool", "inject-rpu", "-i", str(work / "el.hevc"),
             "-r", str(corrected), "-o", str(work / "el-rpu.hevc")], check=True)

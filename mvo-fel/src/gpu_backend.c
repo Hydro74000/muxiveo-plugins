@@ -22,10 +22,16 @@ extern const unsigned char fel_pq_threshold_bytes[];
 /* Shaders GLSL de la virgule fixe (src/shaders, intégrés par CMake). */
 extern const char fel_glsl_fixed_point[], fel_glsl_fixed_render[];
 /* Reprises par image au plus (0,8 % d'une image UHD) ; au-delà, échec explicite du rendu. */
-#define FEL_RESCUE_CAPACITY 65536
+/* Liste des indécises du mode exact : capacité initiale, agrandie à la demande jusqu'au plafond
+ * (au-delà, l'appelant refait l'image sur le CPU certifié). */
+#define FEL_RESCUE_INITIAL 65536u
+#define FEL_RESCUE_MAX (1u << 22)
 
 struct fel_gpu {
     pl_log log;
+    int overflow;               /* liste des indécises saturée pendant le dernier rendu */
+    uint32_t capacity, needed;  /* capacité de la liste ; entrées demandées par l'image saturée */
+    int cpu_threads;            /* fils du CPU certifié pour les indécises restantes (budget du plugin) */
     pl_vulkan vk;
     pl_dispatch dispatch;
     pl_tex source[6], middle[6], scaled[6], target, planar[3];
@@ -95,6 +101,22 @@ int fel_gpu_debug_fixed(void *context, const AVDOVIMetadata *metadata, const AVF
     return ok;
 }
 
+/* Fils du CPU certifié pour les indécises restantes d'une image (au moins 1) : part du budget de
+ * threads du plugin attribuée à ce contexte par l'appelant. */
+void fel_gpu_set_cpu_threads(void *context, int threads)
+{
+    ((struct fel_gpu *)context)->cpu_threads = threads > 1 ? threads : 1;
+}
+
+/* Tests : capacité de la liste des indécises (agrandie ensuite à la demande). */
+void fel_gpu_set_rescue_capacity(void *context, unsigned capacity)
+{
+    struct fel_gpu *p = context;
+    pl_buf_destroy(p->vk->gpu, &p->rescue);
+    pl_buf_destroy(p->vk->gpu, &p->patch);
+    p->capacity = capacity ? capacity : FEL_RESCUE_INITIAL;
+}
+
 /* Tests : toutes les composantes du mode exact reprises par le CPU certifié (chaîne de reprise). */
 void fel_gpu_force_rescue(void *context, int enabled)
 {
@@ -129,6 +151,21 @@ void fel_gpu_certified(void *context, long long *rescued, long long *undecided)
     const struct fel_gpu *p = context;
     *rescued = p ? p->rescued : 0;
     *undecided = p ? p->undecided : 0;
+}
+
+/* Tests (MVO_FEL_TEST_OVERFLOW) : saturation de la liste des indécises simulée à chaque image. */
+static int simulated_overflow(void)
+{
+    return getenv("MVO_FEL_TEST_OVERFLOW") != NULL;
+}
+
+/* Échec du dernier rendu dû à la saturation de la liste des indécises (remis à zéro à la lecture). */
+int fel_gpu_take_overflow(void *context)
+{
+    struct fel_gpu *p = context;
+    const int overflow = p && p->overflow;
+    if (p) p->overflow = 0;
+    return overflow;
 }
 
 int fel_gpu_device_name(void *context, char *buffer, size_t capacity)
@@ -823,6 +860,7 @@ static const char fel_common_header[] =
 /* Seuils PQ en texture RG32UI 256 × 256 (dernier texel : +inf), liste de reprises et correctifs. */
 static int prepare_exact(struct fel_gpu *p)
 {
+    if (!p->capacity) p->capacity = FEL_RESCUE_INITIAL;
     if (p->thresholds && p->rescue && p->patch && p->left) return 1;
     pl_fmt fmt = pl_find_fmt(p->vk->gpu, PL_FMT_UINT, 2, 32, 32, PL_FMT_CAP_SAMPLEABLE);
     uint32_t *data = malloc(65536 * 2 * sizeof(uint32_t));
@@ -834,9 +872,9 @@ static int prepare_exact(struct fel_gpu *p)
              pl_tex_upload(p->vk->gpu, pl_tex_transfer_params(.tex = p->thresholds, .ptr = data));
     free(data);
     if (!ok) return 0;
-    p->rescue = pl_buf_create(p->vk->gpu, pl_buf_params(.size = 4 + 4 * FEL_RESCUE_WORDS * (size_t)FEL_RESCUE_CAPACITY,
+    p->rescue = pl_buf_create(p->vk->gpu, pl_buf_params(.size = 4 + 4 * FEL_RESCUE_WORDS * (size_t)p->capacity,
                                                         .storable = true, .host_readable = true, .host_writable = true));
-    p->patch = pl_buf_create(p->vk->gpu, pl_buf_params(.size = 12 * (size_t)FEL_RESCUE_CAPACITY,
+    p->patch = pl_buf_create(p->vk->gpu, pl_buf_params(.size = 12 * (size_t)p->capacity,
                                                        .storable = true, .host_readable = true, .host_writable = true));
     p->left = pl_buf_create(p->vk->gpu, pl_buf_params(.size = 4, .storable = true, .host_readable = true,
                                                       .host_writable = true));
@@ -859,7 +897,7 @@ static int precise_descriptors(struct fel_gpu *p, struct pl_shader_desc *d, stru
 static int apply_patch(struct fel_gpu *p, const char *header, const uint32_t *patch, uint32_t count)
 {
     if (patch) pl_buf_write(p->vk->gpu, p->patch, 0, patch, 12 * (size_t)count);   /* sinon : déjà sur le GPU */
-    struct pl_buffer_var rescue_vars[2], var = uint_array("fel_patch", 3 * FEL_RESCUE_CAPACITY, 0);
+    struct pl_buffer_var rescue_vars[2], var = uint_array("fel_patch", 3 * (int)p->capacity, 0);
     struct pl_shader_desc desc[17];
     precise_descriptors(p, desc, rescue_vars, PL_DESC_ACCESS_READONLY);
     desc[15] = (struct pl_shader_desc){.desc = {.name = "fel_target", .type = PL_DESC_STORAGE_IMG,
@@ -895,8 +933,9 @@ static int resolve_rescues(struct fel_gpu *p, const AVDOVIMetadata *metadata, co
 {
     uint32_t count = 0;
     if (!pl_buf_read(p->vk->gpu, p->rescue, 0, &count, sizeof(count))) return 0;
-    if (count > FEL_RESCUE_CAPACITY) {
-        fprintf(stderr, "mvo-fel : %u composantes à reprendre, capacité %d dépassée\n", count, FEL_RESCUE_CAPACITY);
+    if (count > p->capacity || simulated_overflow()) {
+        p->overflow = 1;          /* liste agrandie et image refaite (render_target), sinon CPU certifié */
+        p->needed = simulated_overflow() ? UINT32_MAX : count;
         return 0;
     }
     if (!count) return 1;
@@ -904,7 +943,7 @@ static int resolve_rescues(struct fel_gpu *p, const AVDOVIMetadata *metadata, co
     uint16_t *codes = malloc(6 * (size_t)count);
     int ok = entries && patch && codes &&
              pl_buf_read(p->vk->gpu, p->rescue, 4, entries, 4 * FEL_RESCUE_WORDS * (size_t)count);
-    const int undecided = ok ? fel_certified_codes(metadata, entries, (int)count, codes) : -1;
+    const int undecided = ok ? fel_certified_codes_threads(metadata, entries, (int)count, codes, p->cpu_threads) : -1;
     ok = ok && undecided >= 0;
     for (uint32_t i = 0; ok && i < count; ++i) {
         patch[3*i] = entries[FEL_RESCUE_WORDS * i];
@@ -963,7 +1002,7 @@ static int precise_descriptors(struct fel_gpu *p, struct pl_shader_desc *d, stru
     d[12] = (struct pl_shader_desc){.desc = {.name = "fel_coef", .type = PL_DESC_SAMPLED_TEX}, .binding = {.object = p->coef}};
     d[13] = (struct pl_shader_desc){.desc = {.name = "fel_thr", .type = PL_DESC_SAMPLED_TEX}, .binding = {.object = p->thresholds}};
     rescue_vars[0] = uint_array("fel_rescue_count", 1, 0);
-    rescue_vars[1] = uint_array("fel_rescue", FEL_RESCUE_WORDS * FEL_RESCUE_CAPACITY,
+    rescue_vars[1] = uint_array("fel_rescue", FEL_RESCUE_WORDS * (int)p->capacity,
                                 rescue_vars[0].layout.offset + rescue_vars[0].layout.size);
     d[14] = (struct pl_shader_desc){.desc = {.name = "fel_rescue_buf", .type = PL_DESC_BUF_STORAGE, .access = rescue_access},
                                     .binding = {.object = p->rescue}, .buffer_vars = rescue_vars, .num_buffer_vars = 2};
@@ -990,7 +1029,7 @@ static int rescue_epilogue(const struct fel_gpu *p, char *body, size_t size, int
         "fel_rescue[b+2u]=uint(tb);fel_rescue[b+3u]=uint(tr);fel_rescue[b+4u]=uint(Db);fel_rescue[b+5u]=uint(te0);"
         "fel_rescue[b+6u]=uint(te1);fel_rescue[b+7u]=uint(te2);fel_rescue[b+8u]=uint(Dl);fel_rescue[b+9u]=uint(Dc);}}"
         "color=vec4(out3,1.0);",
-        p->force_rescue, FEL_RESCUE_CAPACITY, FEL_RESCUE_WORDS);
+        p->force_rescue, p->capacity, FEL_RESCUE_WORDS);
 }
 
 static int render_precise(struct fel_gpu *p, const AVDOVIMetadata *metadata)
@@ -999,6 +1038,7 @@ static int render_precise(struct fel_gpu *p, const AVDOVIMetadata *metadata)
     if (!upload_coefficients(p, metadata) || !prepare_exact(p)) return 0;
     static const uint32_t zero = 0;
     if (exact) pl_buf_write(p->vk->gpu, p->rescue, 0, &zero, sizeof(zero));
+    p->overflow = 0;
     char header[FEL_HEADER_SIZE];
     if (!precise_header(header, sizeof(header), metadata, fel_double_header, "")) return 0;
     struct pl_buffer_var rescue_vars[2];
@@ -1161,13 +1201,14 @@ static int resolve_fixed(struct fel_gpu *p, const AVDOVIMetadata *metadata, cons
 {
     uint32_t count = 0, left = 0;
     if (!pl_buf_read(p->vk->gpu, p->rescue, 0, &count, sizeof(count))) return 0;
-    if (count > FEL_RESCUE_CAPACITY) {
-        fprintf(stderr, "mvo-fel : %u composantes à reprendre, capacité %d dépassée\n", count, FEL_RESCUE_CAPACITY);
+    if (count > p->capacity || simulated_overflow()) {
+        p->overflow = 1;          /* liste agrandie et image refaite (render_target), sinon CPU certifié */
+        p->needed = simulated_overflow() ? UINT32_MAX : count;
         return 0;
     }
     if (!count) return 1;
     pl_buf_write(p->vk->gpu, p->left, 0, &left, sizeof(left));
-    struct pl_buffer_var patch_var = uint_array("fel_patch", 3 * FEL_RESCUE_CAPACITY, 0), left_var = uint_array("fel_left", 1, 0);
+    struct pl_buffer_var patch_var = uint_array("fel_patch", 3 * (int)p->capacity, 0), left_var = uint_array("fel_left", 1, 0);
     struct pl_shader_desc desc[16];
     memcpy(desc, d, 14 * sizeof(*desc));                                       /* sources, seuils Q0.96, liste */
     desc[14] = (struct pl_shader_desc){.desc = {.name = "fel_patch_buf", .type = PL_DESC_BUF_STORAGE,
@@ -1210,7 +1251,7 @@ static int resolve_fixed(struct fel_gpu *p, const AVDOVIMetadata *metadata, cons
             memcpy(subset + FEL_RESCUE_WORDS * n, entries + FEL_RESCUE_WORDS * i, 4 * FEL_RESCUE_WORDS);
             index[n++] = i;
         }
-    const int undecided = ok && n ? fel_certified_codes(metadata, subset, (int)n, codes) : 0;
+    const int undecided = ok && n ? fel_certified_codes_threads(metadata, subset, (int)n, codes, p->cpu_threads) : 0;
     ok = ok && undecided >= 0;
     for (uint32_t k = 0; ok && k < n; ++k) {
         patch[3*index[k] + 1] = codes[3*k] | (uint32_t)codes[3*k + 1] << 16;
@@ -1229,6 +1270,7 @@ static int render_fixed(struct fel_gpu *p, const AVDOVIMetadata *metadata)
     if (!upload_coefficients(p, metadata) || !prepare_exact(p) || !prepare_fixed(p)) return 0;
     static const uint32_t zero = 0;
     pl_buf_write(p->vk->gpu, p->rescue, 0, &zero, sizeof(zero));
+    p->overflow = 0;
     const size_t prefix_size = strlen(fel_glsl_fixed_point) + 1024;
     char *prefix = malloc(prefix_size), *header = malloc(prefix_size + FEL_HEADER_SIZE + strlen(fel_glsl_fixed_render)),
          *patch_header = malloc(FEL_HEADER_SIZE);
@@ -1344,7 +1386,7 @@ static void test_metadata(AVDOVIMetadata *metadata, int mmr)
  * Sur deux lignes, chaque valeur linéaire R̂ du GPU doit rester à moins de la moitié de sa borne
  * de la valeur double-double, et chaque code certain égaler le code certifié du CPU. Échec :
  * mode exact refusé (rendu CPU). Le bilan est écrit sur stderr si MVO_FEL_GPU_SELF_TEST est défini. */
-static int render_target(struct fel_gpu *p, const AVDOVIMetadata *metadata, const AVFrame *bl, const AVFrame *el);
+static int render_target_once(struct fel_gpu *p, const AVDOVIMetadata *metadata, const AVFrame *bl, const AVFrame *el);
 /* Auto-test d'une variante du mode exact (0 double, 1 virgule fixe), à la taille de l'image, sur
  * deux RPU : sur deux lignes, |R̂ - R| ≤ moitié de la borne face au double-double et codes certains
  * identiques au CPU certifié. ms : temps GPU de composition des deux images. */
@@ -1370,7 +1412,7 @@ static int self_test_variant(struct fel_gpu *p, int fixed, AVDOVIMetadata *metad
         collect_timers(p);
         const double before = p->gpu_ns[3];
         ok = bl && el && (!fixed || fel_fixed_params(metadata, p->fixed_words, FEL_FIXED_WORDS)) &&
-             render_target(p, metadata, bl, el) && pl_buf_read(p->vk->gpu, p->diag, 0, diag, 4 * words);
+             render_target_once(p, metadata, bl, el) && pl_buf_read(p->vk->gpu, p->diag, 0, diag, 4 * words);
         pl_gpu_finish(p->vk->gpu);
         collect_timers(p);
         *ms += (p->gpu_ns[3] - before) / 1e6;
@@ -1498,8 +1540,8 @@ static int render_fast(struct fel_gpu *p, const AVDOVIMetadata *metadata)
     return ok;
 }
 
-static int render_target(struct fel_gpu *p, const AVDOVIMetadata *metadata,
-                         const AVFrame *bl, const AVFrame *el)
+static int render_target_once(struct fel_gpu *p, const AVDOVIMetadata *metadata,
+                              const AVFrame *bl, const AVFrame *el)
 {
     /* Phases rationnelles : une seule passe lit les plans (aucune texture 4K intermédiaire). */
     const int fused = (getenv("MVO_FEL_GPU_UNFUSED") == NULL || p->precision != FEL_PRECISION_FAST) &&
@@ -1533,6 +1575,29 @@ static int render_target(struct fel_gpu *p, const AVDOVIMetadata *metadata,
     pl_dispatch_abort(p->dispatch, &sh);
     pl_shader_free(&eh);
     return ok;
+}
+
+/* Liste des indécises saturée : capacité portée à la puissance de deux suffisante (plafond
+ * FEL_RESCUE_MAX), tampons recréés au prochain rendu ; 0 au-delà du plafond. */
+static int grow_rescue(struct fel_gpu *p)
+{
+    if (p->needed > FEL_RESCUE_MAX) return 0;
+    uint32_t capacity = p->capacity ? p->capacity : FEL_RESCUE_INITIAL;
+    while (capacity < p->needed) capacity *= 2;
+    pl_buf_destroy(p->vk->gpu, &p->rescue);
+    pl_buf_destroy(p->vk->gpu, &p->patch);
+    p->capacity = capacity;
+    return prepare_exact(p);
+}
+
+/* Rendu d'une image ; liste des indécises agrandie et image refaite tant qu'elle sature (au plus
+ * jusqu'au plafond, puis échec signalé par fel_gpu_take_overflow). */
+static int render_target(struct fel_gpu *p, const AVDOVIMetadata *metadata, const AVFrame *bl, const AVFrame *el)
+{
+    for (;;) {
+        if (render_target_once(p, metadata, bl, el)) return 1;
+        if (!p->overflow || !grow_rescue(p)) return 0;
+    }
 }
 
 int fel_gpu_render(void *context, const AVDOVIMetadata *metadata,

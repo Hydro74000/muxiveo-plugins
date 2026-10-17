@@ -16,6 +16,8 @@ void fel_gpu_destroy(void *);
 int fel_gpu_render(void *, const AVDOVIMetadata *, const AVFrame *, const AVFrame *, uint16_t *);
 int fel_gpu_set_precision(void *, int);
 void fel_gpu_force_rescue(void *, int);
+void fel_gpu_set_rescue_capacity(void *, unsigned);
+void fel_gpu_set_cpu_threads(void *, int);
 int fel_gpu_fixed_variant(const void *);
 void fel_gpu_certified(void *, long long *, long long *);
 }
@@ -89,12 +91,17 @@ int main() {
     // forced / flat : mode exact, toutes les composantes reprises par le CPU certifié, sur couches
     // aléatoires puis uniformes (plages d'entrées identiques propagées par la passe de correctifs).
     // level1 : toutes listées puis reprises par le second niveau GPU (virgule fixe, lot L).
-    for (const std::string mode : {"identity", "real", "mmr", "forced", "flat", "level1"}) {
-        const bool forced = mode == "forced" || mode == "flat" || mode == "level1";
+    // grow : comme level1, liste limitée à 16 entrées : agrandie à la demande, image refaite sur le GPU.
+    for (const std::string mode : {"identity", "real", "mmr", "forced", "flat", "level1", "grow"}) {
+        const bool level1 = mode == "level1" || mode == "grow";
+        const bool forced = mode == "forced" || mode == "flat" || level1;
+        fel_gpu_set_rescue_capacity(gpu, mode == "grow" ? 16 : 0);
+        // forced : ≈ 2 048 entrées par image, reprises par le CPU certifié sur 4 fils (plages parallèles).
+        fel_gpu_set_cpu_threads(gpu, mode == "forced" ? 4 : 1);
         metadata_for(*metadata, forced ? "real" : mode);
         const Mapping m(*metadata);
         const int low = mode == "mmr" ? 0 : forced || mode == "real" ? 200 : 64, high = mode == "mmr" ? 1023 : forced || mode == "real" ? 760 : 940;
-        fel_gpu_force_rescue(gpu, mode == "level1" ? 2 : forced);
+        fel_gpu_force_rescue(gpu, level1 ? 2 : forced);
         for (const int precision : {FEL_PRECISION_EXACT, FEL_PRECISION_STANDARD, FEL_PRECISION_FAST}) {
             if (forced && precision != FEL_PRECISION_EXACT) continue;
             if (!fel_gpu_set_precision(gpu, precision)) return 1;
@@ -137,7 +144,7 @@ int main() {
             if ((mode == "flat" && rescued - rescued_before > 200*4*32*3) ||
                 (mode == "forced" && rescued - rescued_before < 200*64*32*3*9/10) || undecided != undecided_before) ok = false;
             // Second niveau GPU (virgule fixe) : le CPU ne reprend presque rien.
-            if (mode == "level1" && fel_gpu_fixed_variant(gpu) && rescued - rescued_before > 200*64*32*3/100) ok = false;
+            if (level1 && fel_gpu_fixed_variant(gpu) && rescued - rescued_before > 200*64*32*3/100) ok = false;
             if (worst > (precision == FEL_PRECISION_EXACT ? 0 : precision == FEL_PRECISION_STANDARD ? 1 : 65535)) ok = false;
         }
     }

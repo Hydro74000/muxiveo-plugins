@@ -16,6 +16,11 @@ extern "C" {
 /* Codes RGB16 certifiés (R, G, B par entrée). Renvoie le nombre de composantes indécises,
  * -1 si le RPU ou un signal est refusé. */
 int fel_certified_codes(const AVDOVIMetadata *metadata, const uint32_t *entries, int count, uint16_t *codes);
+/* Idem sur au plus threads fils (plages contiguës, mêmes codes), à partir de
+ * FEL_CERTIFIED_PARALLEL_MIN entrées ; en deçà, un seul fil. */
+#define FEL_CERTIFIED_PARALLEL_MIN 1024
+int fel_certified_codes_threads(const AVDOVIMetadata *metadata, const uint32_t *entries, int count, uint16_t *codes,
+                                int threads);
 /* Diagnostic GPU (FEL_DIAG_WORDS mots par pixel, lignes y % stride == 0) : par composante R̂ et
  * sa borne (doubles en deux mots, poids faible d'abord), puis code | certain << 16. Compare au
  * double-double : *worst = max |R̂ - R| / borne ; renvoie le nombre de codes certains différents

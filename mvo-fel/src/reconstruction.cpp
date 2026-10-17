@@ -10,6 +10,8 @@
 #include <cstring>
 #include <limits>
 #include <map>
+#include <thread>
+#include <vector>
 #include <stdexcept>
 #if (defined(__x86_64__) || defined(__i386__)) && (defined(__GNUC__) || defined(__clang__))
 #include <immintrin.h>
@@ -864,36 +866,68 @@ void convert_rows(const AVFrame &rgb, AVFrame &yuv, const fel_output &output, in
 }
 }
 
+namespace {
+// Entrées [begin, end) de la liste : codes certifiés, nombre de composantes indécises ; -1 si refusé.
+int certified_range(const muxiveo::fel::Mapping &mapping, const uint32_t *entries, int begin, int end, uint16_t *codes) {
+    int undecided = 0;
+    // Entrées identiques (une plage par ligne d'une zone uniforme) : un seul calcul.
+    std::map<std::array<uint32_t, FEL_RESCUE_WORDS - 1>, std::pair<std::array<uint16_t, 3>, int>> known;
+    for (int i = begin; i < end; ++i) {
+        const uint32_t *e = entries + size_t(FEL_RESCUE_WORDS)*i;
+        std::array<uint32_t, FEL_RESCUE_WORDS - 1> key;
+        std::copy(e + 1, e + FEL_RESCUE_WORDS, key.begin());
+        key[0] &= 0x0fffffff;  // masque des composantes indécises exclu : codes des trois calculés
+        if (const auto found = known.find(key); found != known.end()) {
+            for (int c = 0; c < 3; ++c) codes[3*i + c] = found->second.first[c];
+            undecided += found->second.second;
+            continue;
+        }
+        muxiveo::fel::certified::ExactPixel pixel;
+        pixel.luma = static_cast<int>(e[1] & 0xffff);
+        for (int c = 0; c < 3; ++c) pixel.piece[c] = (e[1] >> (16 + 4*c)) & 15;
+        for (int c = 0; c < 2; ++c) { pixel.chroma[c] = int32_t(e[2+c]); pixel.chroma_den[c] = e[4]; }
+        for (int c = 0; c < 3; ++c) { pixel.residual[c] = int32_t(e[5+c]); pixel.residual_den[c] = c ? e[9] : e[8]; }
+        for (int c = 0; c < 3; ++c)
+            if (pixel.piece[c] + 1 >= mapping.curves[c].count || !pixel.chroma_den[0] || !pixel.residual_den[c])
+                return -1;
+        std::array<uint16_t, 3> rgb{};
+        const unsigned mask = muxiveo::fel::certified::classify(mapping, pixel, 7, rgb);
+        const int count_undecided = (mask & 1) + (mask >> 1 & 1) + (mask >> 2 & 1);
+        undecided += count_undecided;
+        for (int c = 0; c < 3; ++c) codes[3*i + c] = rgb[c];
+        known.emplace(key, std::make_pair(rgb, count_undecided));
+    }
+    return undecided;
+}
+}  // namespace
+
 extern "C" int fel_certified_codes(const AVDOVIMetadata *metadata, const uint32_t *entries, int count, uint16_t *codes) {
+    return fel_certified_codes_threads(metadata, entries, count, codes, 1);
+}
+
+extern "C" int fel_certified_codes_threads(const AVDOVIMetadata *metadata, const uint32_t *entries, int count,
+                                           uint16_t *codes, int threads) {
     try {
         const muxiveo::fel::Mapping mapping(*metadata);
+        // Liste courte (cas des films) : un seul fil, aucun démarrage de fil.
+        const int parts = count < FEL_CERTIFIED_PARALLEL_MIN ? 1 : std::clamp(threads, 1, count);
+        if (parts == 1) return certified_range(mapping, entries, 0, count, codes);
+        // Plages contiguës indépendantes : mêmes codes qu'en séquentiel (calcul pur par entrée).
+        std::vector<int> results(parts, 0);
+        std::vector<std::thread> workers;
+        for (int k = 1; k < parts; ++k)
+            workers.emplace_back([&, k] {
+                try { results[k] = certified_range(mapping, entries, int(int64_t(count)*k/parts),
+                                                   int(int64_t(count)*(k + 1)/parts), codes); }
+                catch (...) { results[k] = -1; }
+            });
+        try { results[0] = certified_range(mapping, entries, 0, int(int64_t(count)/parts), codes); }
+        catch (...) { results[0] = -1; }
+        for (auto &worker : workers) worker.join();
         int undecided = 0;
-        // Entrées identiques (une plage par ligne d'une zone uniforme) : un seul calcul.
-        std::map<std::array<uint32_t, FEL_RESCUE_WORDS - 1>, std::pair<std::array<uint16_t, 3>, int>> known;
-        for (int i = 0; i < count; ++i) {
-            const uint32_t *e = entries + size_t(FEL_RESCUE_WORDS)*i;
-            std::array<uint32_t, FEL_RESCUE_WORDS - 1> key;
-            std::copy(e + 1, e + FEL_RESCUE_WORDS, key.begin());
-            key[0] &= 0x0fffffff;  // masque des composantes indécises exclu : codes des trois calculés
-            if (const auto found = known.find(key); found != known.end()) {
-                for (int c = 0; c < 3; ++c) codes[3*i + c] = found->second.first[c];
-                undecided += found->second.second;
-                continue;
-            }
-            muxiveo::fel::certified::ExactPixel pixel;
-            pixel.luma = static_cast<int>(e[1] & 0xffff);
-            for (int c = 0; c < 3; ++c) pixel.piece[c] = (e[1] >> (16 + 4*c)) & 15;
-            for (int c = 0; c < 2; ++c) { pixel.chroma[c] = int32_t(e[2+c]); pixel.chroma_den[c] = e[4]; }
-            for (int c = 0; c < 3; ++c) { pixel.residual[c] = int32_t(e[5+c]); pixel.residual_den[c] = c ? e[9] : e[8]; }
-            for (int c = 0; c < 3; ++c)
-                if (pixel.piece[c] + 1 >= mapping.curves[c].count || !pixel.chroma_den[0] || !pixel.residual_den[c])
-                    return -1;
-            std::array<uint16_t, 3> rgb{};
-            const unsigned mask = muxiveo::fel::certified::classify(mapping, pixel, 7, rgb);
-            const int count_undecided = (mask & 1) + (mask >> 1 & 1) + (mask >> 2 & 1);
-            undecided += count_undecided;
-            for (int c = 0; c < 3; ++c) codes[3*i + c] = rgb[c];
-            known.emplace(key, std::make_pair(rgb, count_undecided));
+        for (const int value : results) {
+            if (value < 0) return -1;
+            undecided += value;
         }
         return undecided;
     } catch (const std::exception &) {
