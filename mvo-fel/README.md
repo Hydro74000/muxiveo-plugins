@@ -4,13 +4,19 @@ Extension facultative de Muxiveo. Le moteur reconstruit l'apport de la couche FE
 dans les pixels avant les filtres, le tone mapping, l'interpolation et l'encodage,
 indépendamment de la conservation du RPU en sortie.
 
-**Préversion `mvo-fel-v0.2.0`.** Trois précisions : Lent (exact certifié, identique au CPU au bit
+**Préversion `mvo-fel-v0.2.1`.** Trois précisions : Lent (exact certifié, identique au CPU au bit
 près), Standard (≤ 1 code 16 bits) et Rapide (float32). Le Lent en virgule fixe utilise une
 [EOTF à deux niveaux](docs/2026-10-16-eotf-deux-niveaux.md) et une sortie Y'CbCr exacte en
 entiers ; deux images sont en vol par défaut. Paquets : Linux x86_64 GPU (Vulkan, transport direct
 NVIDIA), Windows x86_64 GPU (Vulkan), macOS arm64 CPU. Attestations de schéma 5 sur RTX 4070 Ti
 SUPER, iGPU AMD Raphael, GTX 1070 et Intel UHD 630. L'épinglage dans Muxiveo attend l'accord du
 mainteneur. La lecture sur matériel Dolby Vision reste à valider avant une release générale.
+
+Correctifs 0.2.1 : BL et EL appariées par rang de présentation (flux dont l'EL n'a pas la
+structure de GOP de la BL, auparavant refusés) ; access units sans RPU ni EL recomposées sans
+résiduel avec la courbe du RPU précédent ; liste des composantes à reprendre du Lent agrandie à
+la demande sur le GPU (auparavant limitée à 65 536 par image : échec puis repli BL), CPU
+certifié en dernier recours, réparti sur les fils du plugin.
 
 Dans Encodage → HDR → Dolby Vision, la case reste **décochée par défaut pour tous
 les profils, P5/P7 compris**. Seule une activation explicite demande la
