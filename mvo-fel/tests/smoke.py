@@ -152,6 +152,8 @@ def frame_statistics(lib, fixture: Path, device: str) -> None:
                 assert sum(count for _, count in scene["maxrgb_hist"]) == sum(w[2]*w[3] for w in windows)
             for f in frames:
                 assert 0 <= f["y100"] <= 1 and f["avg_nits"] <= max(f["max_nits"]) + 1e-3 and f["y9999_nits"] > 0, f
+                percentiles = f["maxrgb_percentiles"]
+                assert len(percentiles) == 7 and percentiles == sorted(percentiles), f
 
 
 def strip_layers(fixture: Path, output: Path, units: dict[int, set[int]]) -> None:

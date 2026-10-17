@@ -35,7 +35,7 @@ Première ligne :
 Une ligne par image produite, dans l'ordre :
 
 ```json
-{"frame":0,"scene_start":true,"max_nits":[1563.6,1054.1,921.5],"avg_nits":13.0,"y9999_nits":426.5,"y100":0.97,"window":[0,280,3840,1600]}
+{"frame":0,"scene_start":true,"max_nits":[1563.6,1054.1,921.5],"avg_nits":13.0,"y9999_nits":426.5,"y100":0.97,"maxrgb_percentiles":[0,0.05,4,14.4,29.2,42.4,593],"window":[0,280,3840,1600]}
 ```
 
 - `scene_start` : drapeau de changement de plan du RPU Dolby Vision de l'image (faux pour une
@@ -43,6 +43,9 @@ Une ligne par image produite, dans l'ordre :
 - `max_nits` : maxima de R, G, B (nits) ; `avg_nits` : moyenne de maxRGB (nits).
 - `y9999_nits` : borne haute de la case de Y atteinte à 99,99 % des pixels.
 - `y100` : part des pixels de luminance ≤ 100 nits.
+- `maxrgb_percentiles` : percentiles de maxRGB de l'image (nits, centre de la case atteinte)
+  à 1, 25, 50, 75, 90, 95 et 99,98 %. Le HDR10+ en fait par plan la moyenne (1 à 95 %) et
+  le maximum (99,98 %) : règle de l'analyseur de référence, vérifiée sur une source réelle.
 - `window` : fenêtre mesurée (x, y, largeur, hauteur), en pixels de la source.
 
 À la fin de chaque plan (changement de plan suivant ou fin du flux) :

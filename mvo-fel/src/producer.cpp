@@ -850,6 +850,20 @@ struct mvo_fel_context {
             total += s.hist_y[k];
             if (total >= target) { bin = k; break; }
         }
+        // Percentiles de maxRGB de l'image (1, 25, 50, 75, 90, 95, 99,98 %) : centre de la case atteinte.
+        // Agrégés par plan dans Muxiveo (moyenne ; maximum pour 99,98 %), comme l'analyseur de référence.
+        static constexpr double quantiles[] = {0.01, 0.25, 0.50, 0.75, 0.90, 0.95, 0.9998};
+        std::array<float, 7> percentiles{};
+        for (size_t q = 0; q < percentiles.size(); ++q) {
+            const double wanted = quantiles[q]*double(s.pixels);
+            uint64_t cumulative = 0;
+            int index = FEL_STATS_BINS - 1;
+            for (int k = 0; k < FEL_STATS_BINS; ++k) {
+                cumulative += s.hist_maxrgb[k];
+                if (double(cumulative) >= wanted) { index = k; break; }
+            }
+            percentiles[q] = eotf[index*64 + 32];
+        }
         std::ostringstream line;
         line.imbue(std::locale::classic());
         line << std::setprecision(9) << "{\"frame\":" << stats_frame << ",\"scene_start\":" << (item.scene_start ? "true" : "false")
@@ -857,7 +871,9 @@ struct mvo_fel_context {
              << ",\"avg_nits\":" << (s.pixels ? s.sum_maxrgb/double(s.pixels) : 0.0)
              << ",\"y9999_nits\":" << edges[bin + 1]
              << ",\"y100\":" << (s.pixels ? double(s.y_le_100)/double(s.pixels) : 0.0)
-             << ",\"window\":[" << item.window[0] << ',' << item.window[1] << ',' << item.window[2] << ','
+             << ",\"maxrgb_percentiles\":[";
+        for (size_t q = 0; q < percentiles.size(); ++q) line << (q ? "," : "") << percentiles[q];
+        line << "],\"window\":[" << item.window[0] << ',' << item.window[1] << ',' << item.window[2] << ','
              << item.window[3] << "]}\n";
         avio_write(stats_io, reinterpret_cast<const unsigned char *>(line.str().data()), int(line.str().size()));
         ++stats_frame;
