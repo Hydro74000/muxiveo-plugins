@@ -233,5 +233,41 @@ class WindowsPackageTests(unittest.TestCase):
         self.assertFalse(self.output.exists())
 
 
+
+class WindowsImportTests(unittest.TestCase):
+    """Imports PE lus sans objdump (paquet construit sous Windows) : mêmes noms, même refus."""
+
+    def write_pe(self, directory: Path, dlls: list[str]) -> Path:
+        import struct
+        data = bytearray(0x600)
+        struct.pack_into("<I", data, 0x3c, 0x40)
+        data[0x40:0x44] = b"PE\0\0"
+        struct.pack_into("<HHIIIHH", data, 0x44, 0x8664, 1, 0, 0, 0, 240, 0x2022)
+        struct.pack_into("<H", data, 0x58, 0x20b)                       # PE32+
+        struct.pack_into("<II", data, 0x58 + 112 + 8, 0x1000, 20*(len(dlls) + 1))
+        struct.pack_into("<8sIIII", data, 0x58 + 240, b".idata", 0x200, 0x1000, 0x200, 0x400)
+        for index, name in enumerate(dlls):
+            name_rva = 0x1080 + 0x20*index
+            struct.pack_into("<IIIII", data, 0x400 + 20*index, 0x1100, 0, 0, name_rva, 0x1100)
+            data[0x400 + name_rva - 0x1000:0x400 + name_rva - 0x1000 + len(name) + 1] = name.encode() + b"\0"
+        path = directory / "test.dll"
+        path.write_bytes(bytes(data))
+        return path
+
+    def test_imports_are_read_without_objdump(self):
+        with tempfile.TemporaryDirectory() as temp:
+            binary = self.write_pe(Path(temp), ["KERNEL32.dll", "api-ms-win-crt-runtime-l1-1-0.dll"])
+            self.assertEqual(package.pe_imports(binary), {"kernel32.dll", "api-ms-win-crt-runtime-l1-1-0.dll"})
+            with patch.object(package.shutil, "which", return_value=None):
+                package.check_windows_imports(binary)
+
+    def test_foreign_dll_is_rejected_without_objdump(self):
+        with tempfile.TemporaryDirectory() as temp:
+            binary = self.write_pe(Path(temp), ["KERNEL32.dll", "vulkan-1.dll"])
+            with patch.object(package.shutil, "which", return_value=None), \
+                    self.assertRaisesRegex(RuntimeError, "vulkan-1.dll"):
+                package.check_windows_imports(binary)
+
+
 if __name__ == "__main__":
     unittest.main()

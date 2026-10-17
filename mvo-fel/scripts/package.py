@@ -7,6 +7,7 @@ import json
 import math
 import re
 import shutil
+import struct
 import subprocess
 import sys
 import tarfile
@@ -145,10 +146,43 @@ WINDOWS_SYSTEM_DLLS = {"kernel32.dll", "msvcrt.dll", "ucrtbase.dll", "bcrypt.dll
                        "user32.dll", "gdi32.dll", "shell32.dll"}
 
 
+def pe_imports(binary: Path) -> set[str]:
+    """DLL importées par un exécutable PE (table d'import), sans objdump : paquet construit sous Windows."""
+    data = binary.read_bytes()
+    header = struct.unpack_from("<I", data, 0x3c)[0]
+    if data[header:header + 4] != b"PE\0\0":
+        raise RuntimeError(f"{binary.name} n'est pas un exécutable PE")
+    sections, optional_size = struct.unpack_from("<H", data, header + 6)[0], struct.unpack_from("<H", data, header + 20)[0]
+    optional = header + 24
+    magic = struct.unpack_from("<H", data, optional)[0]
+    import_rva = struct.unpack_from("<I", data, optional + (112 if magic == 0x20b else 96) + 8)[0]
+    table = [struct.unpack_from("<8sIIII", data, optional + optional_size + 40*i) for i in range(sections)]
+
+    def offset(rva: int) -> int:
+        for _, size, address, raw_size, raw in table:
+            if address <= rva < address + max(size, raw_size):
+                return raw + rva - address
+        raise RuntimeError(f"{binary.name} : adresse d'import hors des sections")
+    names: set[str] = set()
+    if not import_rva:
+        return names
+    position = offset(import_rva)
+    while True:
+        lookup, _, _, name_rva, thunk = struct.unpack_from("<IIIII", data, position)
+        if not (lookup or name_rva or thunk):
+            return names
+        start = offset(name_rva)
+        names.add(data[start:data.index(b"\0", start)].decode("ascii").lower())
+        position += 20
+
+
 def check_windows_imports(binary: Path) -> None:
     """Refuse une DLL Windows dépendant d'une bibliothèque non système (MinGW, Vulkan...)."""
-    result = subprocess.run(["objdump", "-p", str(binary)], capture_output=True, text=True, check=True)
-    names = {name.lower() for name in re.findall(r"DLL Name: (\S+)", result.stdout)}
+    if shutil.which("objdump"):
+        result = subprocess.run(["objdump", "-p", str(binary)], capture_output=True, text=True, check=True)
+        names = {name.lower() for name in re.findall(r"DLL Name: (\S+)", result.stdout)}
+    else:
+        names = pe_imports(binary)
     foreign = {n for n in names if n not in WINDOWS_SYSTEM_DLLS and not n.startswith("api-ms-win-")}
     if foreign:
         raise RuntimeError(f"Dépendances non embarquées dans {binary.name} : {sorted(foreign)}")

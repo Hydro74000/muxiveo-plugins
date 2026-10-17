@@ -4,15 +4,13 @@ Extension facultative de Muxiveo. Le moteur reconstruit l'apport de la couche FE
 dans les pixels avant les filtres, le tone mapping, l'interpolation et l'encodage,
 indépendamment de la conservation du RPU en sortie.
 
-**Préversion publiée : `mvo-fel-v0.1.0`.** La version 0.2.0 est en cours de
-finalisation dans le dépôt : les lots 1 à 9 du
-[plan de continuation](docs/2026-10-15-plan-continuation.md) sont réalisés et les
-défauts de l'[audit du 15/10/2026](docs/2026-10-15-audit-continuation.md) corrigés
-([réponse](docs/2026-10-15-reponse-audit.md)). Restent l'attestation de la
-bibliothèque définitive (Linux et Windows), les mesures de bout en bout, la
-construction portable et le paquet ; puis la publication et l'épinglage dans
-Muxiveo, qui attendent l'accord du mainteneur. La lecture sur matériel Dolby
-Vision reste à valider avant une release générale.
+**Préversion `mvo-fel-v0.2.0`.** Trois précisions : Lent (exact certifié, identique au CPU au bit
+près), Standard (≤ 1 code 16 bits) et Rapide (float32). Le Lent en virgule fixe utilise une
+[EOTF à deux niveaux](docs/2026-10-16-eotf-deux-niveaux.md) et une sortie Y'CbCr exacte en
+entiers ; deux images sont en vol par défaut. Paquets : Linux x86_64 GPU (Vulkan, transport direct
+NVIDIA), Windows x86_64 GPU (Vulkan), macOS arm64 CPU. Attestations de schéma 5 sur RTX 4070 Ti
+SUPER, iGPU AMD Raphael, GTX 1070 et Intel UHD 630. L'épinglage dans Muxiveo attend l'accord du
+mainteneur. La lecture sur matériel Dolby Vision reste à valider avant une release générale.
 
 Dans Encodage → HDR → Dolby Vision, la case reste **décochée par défaut pour tous
 les profils, P5/P7 compris**. Seule une activation explicite demande la
