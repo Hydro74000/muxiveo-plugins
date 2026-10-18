@@ -324,6 +324,12 @@ struct mvo_fel_context {
     // emitted : images appariées (décodage) ; frames : images écrites ou rendues à l'appelant.
     int64_t frames = 0, emitted = 0, last_pts = AV_NOPTS_VALUE;
     bool output_closed = false, raw = false, started = false;
+    // Mesure seule (mvo_fel_set_measure) : statistiques écrites, aucune image produite.
+    // MEASURE_BASE : couche de base lue comme un signal HDR10 (RPU identité synthétisé) ;
+    // MEASURE_RECONSTRUCTED : image reconstruite par le RPU et l'EL, comme en production.
+    enum { MEASURE_NONE, MEASURE_BASE, MEASURE_RECONSTRUCTED };
+    int measure = MEASURE_NONE;
+    AVBufferRef *identity = nullptr;  // RPU identité partagé par les images (mesure de la BL)
     std::array<double,7> timing{}; // ouverture, lecture, BL, EL, pixels, NUT, pipe.
     // Attentes des files : décodage bloqué, rendu affamé, rendu bloqué, écriture affamée.
     std::array<double,4> waits{};
@@ -360,6 +366,7 @@ struct mvo_fel_context {
         if (io) { av_freep(&io->buffer); avio_context_free(&io); }
         avio_closep(&stats_io);
         av_buffer_pool_uninit(&pool);
+        av_buffer_unref(&identity);
     }
     void check_cancelled() {
         if (cancelled.load()) throw Failure("Reconstruction annulée", MVO_FEL_CANCELLED);
@@ -416,7 +423,8 @@ struct mvo_fel_context {
             static std::mutex cache_mutex;
             static std::map<std::string, std::pair<bool, std::string>> cache;
             // GPU désigné par UUID uniquement : « auto » peut changer de carte d'un appel à l'autre.
-            const std::string key = device + "|" + source + "|" + std::to_string(stream_index);
+            const std::string key = device + "|" + source + "|" + std::to_string(stream_index) + "|"
+                                  + std::to_string(measure == MEASURE_BASE);
             const bool cacheable = device.size() == 32;
             if (cacheable) {
                 std::lock_guard lock(cache_mutex);
@@ -438,8 +446,10 @@ struct mvo_fel_context {
 #ifdef MVO_FEL_VULKAN_PROTOTYPE
         cpu_render = gpu_prototype == nullptr && !pulling;
 #endif
-        const int bl_threads = cpu_render ? std::max(1, threads/4) : std::max(1, threads/3);
-        const int el_threads = cpu_render ? 1 : std::max(1, threads/3);
+        const bool base_only = measure == MEASURE_BASE;
+        const int bl_threads = base_only ? std::max(1, threads/2)
+                             : cpu_render ? std::max(1, threads/4) : std::max(1, threads/3);
+        const int el_threads = base_only ? 0 : cpu_render ? 1 : std::max(1, threads/3);
         render_threads = std::max(1, threads - bl_threads - el_threads);
 #ifdef MVO_FEL_VULKAN_PROTOTYPE
         // Indécises reprises par le CPU certifié : fils de rendu CPU (inactifs en mode GPU) répartis
@@ -451,7 +461,8 @@ struct mvo_fel_context {
         }
 #endif
         bl.init(stream, "bl_rpu", bl_threads, hw_decode ? hw_device : nullptr);
-        el.init(stream, "el", el_threads, hw_decode ? hw_device : nullptr);
+        if (base_only) identity = identity_metadata();
+        else el.init(stream, "el", el_threads, hw_decode ? hw_device : nullptr);
     }
 #ifdef MVO_FEL_VULKAN_PROTOTYPE
     // Choix automatique selon la précision. Rapide : premier GPU dédié, sinon le premier.
@@ -535,12 +546,14 @@ struct mvo_fel_context {
         if (avformat_find_stream_info(probe, nullptr) < 0) return false;
         AVStream *track = probe->streams[stream_index];
         if (target != AV_NOPTS_VALUE) av_seek_frame(probe, stream_index, target, AVSEEK_FLAG_BACKWARD);
-        // Par couche : logiciel, Vulkan, Vulkan (second décodage indépendant).
+        // Par couche : logiciel, Vulkan, Vulkan (second décodage indépendant). Mesure de la BL :
+        // couche de base seule (flux sans EL : P8, HDR10).
+        const int layer_count = measure == MEASURE_BASE ? 1 : 2;
         std::array<Layer, 6> layers;
         int compared[2] = {0, 0};
         bool same = true, available = true;
         try {
-            for (int layer = 0; layer < 2; ++layer) {
+            for (int layer = 0; layer < layer_count; ++layer) {
                 const char *mode = layer ? "el" : "bl_rpu";
                 layers[3*layer].init(track, mode, std::max(1, threads/3));
                 layers[3*layer + 1].init(track, mode, 1, hw_device);
@@ -548,7 +561,7 @@ struct mvo_fel_context {
             }
             auto p = packet();
             auto drain = [&] {
-                for (int layer = 0; layer < 2 && same; ++layer) {
+                for (int layer = 0; layer < layer_count && same; ++layer) {
                     auto &sw = layers[3*layer], &first = layers[3*layer + 1], &second = layers[3*layer + 2];
                     while (same && !sw.ready.empty() && !first.ready.empty() && !second.ready.empty()) {
                         same = same_frame(*sw.ready.front(), *first.ready.front(), layer == 0) &&
@@ -559,16 +572,16 @@ struct mvo_fel_context {
                 }
             };
             bool eof = false;
-            while (same && (compared[0] < needed || compared[1] < needed) && !eof) {
+            while (same && (compared[0] < needed || (layer_count > 1 && compared[1] < needed)) && !eof) {
                 check_cancelled();
                 const int ret = av_read_frame(probe, p.get());
                 if (ret == AVERROR_EOF) {
-                    for (auto &layer : layers) layer.send(nullptr);
+                    for (int i = 0; i < 3*layer_count; ++i) layers[i].send(nullptr);
                     eof = true;
                 } else if (ret < 0) {
                     return false;
                 } else if (p->stream_index == stream_index) {
-                    for (auto &layer : layers) layer.send(p.get());
+                    for (int i = 0; i < 3*layer_count; ++i) layers[i].send(p.get());
                 }
                 av_packet_unref(p.get());
                 drain();
@@ -579,7 +592,7 @@ struct mvo_fel_context {
             same = false;
             available = compared[0] > 0;
         }
-        const bool ok = same && compared[0] > 0 && compared[0] == compared[1];
+        const bool ok = same && compared[0] > 0 && (layer_count == 1 || compared[0] == compared[1]);
         decode_note = ok ? "décodage Vulkan Video vérifié (2 × " + std::to_string(compared[0]) + " images)"
                     : available && compared[0] > 0 ? "décodage CPU (Vulkan Video différent du logiciel)"
                     : "décodage CPU (Vulkan Video indisponible)";
@@ -714,6 +727,7 @@ struct mvo_fel_context {
     // que soit la structure de GOP de chaque couche ; false si emit demande l'arrêt. Une EL manquante
     // ou en trop décale les rangs suivants : couche orpheline en fin de flux, refusée.
     bool pair(const Emit &emit) {
+        if (measure == MEASURE_BASE) return pair_base(emit);
         drop_leading();
         if (!leading_done || el_leading < leading) return true;
         while (!bl.ready.empty()) {
@@ -746,27 +760,108 @@ struct mvo_fel_context {
             if (!base_only && !mapping.residual) throw Failure("Résiduel désactivé pendant la reconstruction FEL");
             if (skipped < skip) { ++skipped; continue; }
             if (base_only) ++bl_only_frames;
-            if (base->width <= 0 || base->height <= 0 || base->width > 8192 || base->height > 8192)
-                throw Failure("Dimensions source invalides");
-            const auto timebase = raw ? av_inv_q(fps) : stream->time_base;
-            auto pts = output_pts(*base);
-            if (rebase_first) {
-                if (first_pts == AV_NOPTS_VALUE) first_pts = pts;
-                pts -= first_pts;
-            }
-            if (last_pts != AV_NOPTS_VALUE && pts <= last_pts)
-                throw Failure("Horodatages de présentation non croissants");
-            last_pts = pts;
-            const int64_t duration = raw ? 1 : base->duration;
-            ++emitted;
             // Changement de plan : RPU propre seulement (une courbe héritée ne commence pas de plan).
             const bool scene_start = !base_only && av_dovi_get_color(metadata)->scene_refresh_flag;
-            // Zone active (L5) : bandes noires exclues des statistiques de l'image.
+            if (!emit_job(std::move(base), std::move(enhancement), metadata, std::move(mapping), scene_start,
+                          active_area(metadata), emit))
+                return false;
+        }
+        return true;
+    }
+    // Zone active (L5) : bandes noires exclues des statistiques de l'image.
+    static std::array<int, 4> active_area(const AVDOVIMetadata *metadata) {
+        if (const AVDOVIDmData *l5 = metadata ? av_dovi_find_level(metadata, 5) : nullptr)
+            return {l5->l5.left_offset, l5->l5.top_offset, l5->l5.right_offset, l5->l5.bottom_offset};
+        return {};
+    }
+    // Horodatage, contrôles et transmission d'une image appariée ; false si emit demande l'arrêt.
+    bool emit_job(Frame base, Frame enhancement, const AVDOVIMetadata *metadata, muxiveo::fel::Mapping mapping,
+                  bool scene_start, std::array<int, 4> active, const Emit &emit) {
+        if (base->width <= 0 || base->height <= 0 || base->width > 8192 || base->height > 8192)
+            throw Failure("Dimensions source invalides");
+        const auto timebase = raw ? av_inv_q(fps) : stream->time_base;
+        auto pts = output_pts(*base);
+        if (rebase_first) {
+            if (first_pts == AV_NOPTS_VALUE) first_pts = pts;
+            pts -= first_pts;
+        }
+        if (last_pts != AV_NOPTS_VALUE && pts <= last_pts)
+            throw Failure("Horodatages de présentation non croissants");
+        last_pts = pts;
+        const int64_t duration = raw ? 1 : base->duration;
+        ++emitted;
+        return emit(std::unique_ptr<Job>(new Job{std::move(base), std::move(enhancement), metadata,
+                                                 std::move(mapping), pts, duration, timebase, scene_start, active}));
+    }
+    // RPU identité : courbes polynomiales d'ordre 1 (pente 1), sans résiduel, matrices Y'CbCr → RGB
+    // BT.2020 plage limitée et RGB → LMS des RPU de profil 8.1 : conversion HDR10 standard de la BL,
+    // calculée par les mêmes chemins que la reconstruction (CPU certifié, GPU, statistiques).
+    AVBufferRef *identity_metadata() const {
+        const auto *desc = av_pix_fmt_desc_get(static_cast<AVPixelFormat>(stream->codecpar->format));
+        const int depth = desc ? desc->comp[0].depth : 10;
+        if (depth < 8 || depth > 16) throw Failure("Profondeur de la couche de base non prise en charge");
+        size_t size = 0;
+        AVDOVIMetadata *metadata = av_dovi_metadata_alloc(&size);
+        if (!metadata) throw std::bad_alloc();
+        AVBufferRef *buffer = av_buffer_create(reinterpret_cast<uint8_t *>(metadata), size, av_buffer_default_free,
+                                               nullptr, 0);
+        if (!buffer) { av_free(metadata); throw std::bad_alloc(); }
+        auto *h = av_dovi_get_header(metadata);
+        auto *m = av_dovi_get_mapping(metadata);
+        auto *c = av_dovi_get_color(metadata);
+        h->rpu_type = 2; h->rpu_format = 18; h->vdr_rpu_profile = 1; h->vdr_rpu_normalized_idc = 1;
+        h->coef_data_type = 0; h->coef_log2_denom = 23;
+        h->bl_bit_depth = h->el_bit_depth = depth; h->vdr_bit_depth = 12;
+        h->disable_residual_flag = 1;
+        m->nlq_method_idc = AV_DOVI_NLQ_NONE;
+        m->num_x_partitions = m->num_y_partitions = 1;
+        for (int i = 0; i < 3; ++i) {
+            auto &curve = m->curves[i];
+            curve.num_pivots = 2; curve.pivots[0] = 0; curve.pivots[1] = (1 << depth) - 1;
+            curve.mapping_idc[0] = AV_DOVI_MAPPING_POLYNOMIAL;
+            curve.poly_order[0] = 1; curve.poly_coef[0][1] = int64_t(1) << 23;
+        }
+        static constexpr int ycc[9] = {9574, 0, 13802, 9574, -1540, -5348, 9574, 17610, 0};
+        static constexpr int lms[9] = {7222, 8771, 390, 2654, 12430, 1300, 0, 422, 15962};
+        static constexpr int offsets[3] = {16777216, 134217728, 134217728};
+        for (int i = 0; i < 9; ++i) {
+            c->ycc_to_rgb_matrix[i] = av_make_q(ycc[i], 1 << 13);
+            c->rgb_to_lms_matrix[i] = av_make_q(lms[i], 1 << 14);
+        }
+        for (int i = 0; i < 3; ++i) c->ycc_to_rgb_offset[i] = av_make_q(offsets[i], 1 << 28);
+        c->signal_eotf = 65535; c->signal_bit_depth = 12; c->signal_full_range_flag = 1;
+        c->source_min_pq = 62; c->source_max_pq = 3696; c->source_diagonal = 42;
+        return buffer;
+    }
+    // Mesure de la BL : chaque image lue comme un signal HDR10 (RPU identité). Le RPU éventuel ne
+    // sert qu'à la zone active L5 et aux changements de plan ; l'EL n'est ni décodée ni lue (plan
+    // neutre : l'image de base elle-même, résiduel désactivé).
+    bool pair_base(const Emit &emit) {
+        drop_leading();
+        if (!leading_done) return true;
+        while (!bl.ready.empty()) {
+            check_cancelled();
+            auto base = std::move(bl.ready.front()); bl.ready.pop_front();
+            if (!raw && base->pts == AV_NOPTS_VALUE) throw Failure("Horodatage absent");
+            bool scene_start = false;
             std::array<int, 4> active{};
-            if (const AVDOVIDmData *l5 = av_dovi_find_level(metadata, 5))
-                active = {l5->l5.left_offset, l5->l5.top_offset, l5->l5.right_offset, l5->l5.bottom_offset};
-            if (!emit(std::unique_ptr<Job>(new Job{std::move(base), std::move(enhancement), metadata,
-                                                    std::move(mapping), pts, duration, timebase, scene_start, active})))
+            if (const auto *sd = av_frame_get_side_data(base.get(), AV_FRAME_DATA_DOVI_METADATA)) {
+                const auto *source = reinterpret_cast<const AVDOVIMetadata *>(sd->data);
+                scene_start = own_rpu(*base) && av_dovi_get_color(source)->scene_refresh_flag;
+                active = active_area(source);
+            }
+            av_frame_remove_side_data(base.get(), AV_FRAME_DATA_DOVI_METADATA);
+            AVBufferRef *shared = av_buffer_ref(identity);
+            if (!shared) throw std::bad_alloc();
+            AVFrameSideData *sd = av_frame_new_side_data_from_buf(base.get(), AV_FRAME_DATA_DOVI_METADATA, shared);
+            if (!sd) { av_buffer_unref(&shared); throw std::bad_alloc(); }
+            const auto *metadata = reinterpret_cast<const AVDOVIMetadata *>(sd->data);
+            if (skipped < skip) { ++skipped; continue; }
+            Frame enhancement(av_frame_clone(base.get()));
+            if (!enhancement) throw std::bad_alloc();
+            muxiveo::fel::Mapping mapping(*metadata);
+            if (!emit_job(std::move(base), std::move(enhancement), metadata, std::move(mapping), scene_start, active,
+                          emit))
                 return false;
         }
         return true;
@@ -782,13 +877,13 @@ struct mvo_fel_context {
             check(ret, "Lecture source", MVO_FEL_INPUT_ERROR);
             if (p->stream_index == stream_index) {
                 { Timer timer(timing[2]); bl.send(p.get()); }
-                { Timer timer(timing[3]); el.send(p.get()); }
+                if (measure != MEASURE_BASE) { Timer timer(timing[3]); el.send(p.get()); }
                 if (!pair(emit)) return;
             }
             av_packet_unref(p.get());
         }
         { Timer timer(timing[2]); bl.send(nullptr); }
-        { Timer timer(timing[3]); el.send(nullptr); }
+        if (measure != MEASURE_BASE) { Timer timer(timing[3]); el.send(nullptr); }
         if (!pair(emit)) return;
         if (!leading_done) el.ready.clear();  // cible au-delà de la dernière image
         if (!bl.ready.empty() || !el.ready.empty())
@@ -1036,10 +1131,12 @@ struct mvo_fel_context {
         return out;
     }
     void write_rendered(Rendered &item) {
-        if (!output) open_output(item.width, item.height);
-        Timer nut(timing[5]);
-        av_packet_rescale_ts(item.packet.get(), item.timebase, out_stream->time_base);
-        check(av_interleaved_write_frame(output, item.packet.get()), "Écriture NUT");
+        if (measure == MEASURE_NONE) {
+            if (!output) open_output(item.width, item.height);
+            Timer nut(timing[5]);
+            av_packet_rescale_ts(item.packet.get(), item.timebase, out_stream->time_base);
+            check(av_interleaved_write_frame(output, item.packet.get()), "Écriture NUT");
+        }
         if (item.stats) write_statistics(item);
         ++frames;
         if (progress) progress(opaque, frames);
@@ -1048,6 +1145,7 @@ struct mvo_fel_context {
     // (contrat ABI des callbacks). Une erreur ou l'annulation abandonne les files.
     void run() {
         if (started) throw Failure("Contexte déjà exécuté");
+        if (measure != MEASURE_NONE && stats_path.empty()) throw Failure("Mesure sans fichier de statistiques");
         started = true;
         began = Clock::now();
         { Timer timer(timing[0]); open(); }
@@ -1119,9 +1217,11 @@ struct mvo_fel_context {
         rows.reset();
         if (failure) std::rethrow_exception(failure);
         check_cancelled();
-        if (!frames) throw Failure("Aucune image FEL reconstruite");
-        check(av_write_trailer(output), "Fin NUT");
-        avio_flush(io); check(io->error, "Vidange NUT");
+        if (!frames) throw Failure(measure == MEASURE_BASE ? "Aucune image mesurée" : "Aucune image FEL reconstruite");
+        if (measure == MEASURE_NONE) {
+            check(av_write_trailer(output), "Fin NUT");
+            avio_flush(io); check(io->error, "Vidange NUT");
+        }
         if (stats_io) {
             flush_scene();
             avio_flush(stats_io); check(stats_io->error, "Écriture des statistiques");
@@ -1136,6 +1236,7 @@ struct mvo_fel_context {
     int next() {
         if (!started) {
             if (!stats_path.empty()) throw Failure("Statistiques de l'image indisponibles en transport direct");
+            if (measure != MEASURE_NONE) throw Failure("Mesure indisponible en transport direct");
             started = true; pulling = true; began = Clock::now();
             { Timer timer(timing[0]); open(); }
             // Décodage de l'image suivante pendant le rendu de la précédente par l'appelant.
@@ -1174,9 +1275,9 @@ struct mvo_fel_context {
 uint32_t mvo_fel_abi_version() { return MVO_FEL_ABI; }
 const char *mvo_fel_capabilities() {
 #ifdef MVO_FEL_VULKAN_PROTOTYPE
-    return "{\"abi\":1,\"version\":\"" MVO_FEL_VERSION "\",\"transport\":\"nut\",\"pixel_format\":\"gbrp16le\",\"cpu\":true,\"backend\":\"vulkan-prototype\",\"statistics\":1,\"device_selection\":1,\"seek\":1,\"fd_output\":1,\"timestamps\":[\"source\",\"zero\"],\"crop\":1,\"output_formats\":[\"gbrp16le\",\"yuv420p16le\",\"yuv420p10le\",\"yuv420p\"],\"dithers\":[\"none\",\"ordered\",\"blue\"],\"direct_formats\":[\"p010\"],\"precision\":[\"exact\",\"standard\",\"fast\"],\"device_features\":[\"float64\"],\"render_workers\":[1,4],\"frame_statistics\":1,\"experimental\":true}";
+    return "{\"abi\":1,\"version\":\"" MVO_FEL_VERSION "\",\"transport\":\"nut\",\"pixel_format\":\"gbrp16le\",\"cpu\":true,\"backend\":\"vulkan-prototype\",\"statistics\":1,\"device_selection\":1,\"seek\":1,\"fd_output\":1,\"timestamps\":[\"source\",\"zero\"],\"crop\":1,\"output_formats\":[\"gbrp16le\",\"yuv420p16le\",\"yuv420p10le\",\"yuv420p\"],\"dithers\":[\"none\",\"ordered\",\"blue\"],\"direct_formats\":[\"p010\"],\"precision\":[\"exact\",\"standard\",\"fast\"],\"device_features\":[\"float64\"],\"render_workers\":[1,4],\"frame_statistics\":1,\"measure\":[\"base\",\"reconstructed\"],\"experimental\":true}";
 #else
-    return "{\"abi\":1,\"version\":\"" MVO_FEL_VERSION "\",\"transport\":\"nut\",\"pixel_format\":\"gbrp16le\",\"cpu\":true,\"statistics\":1,\"device_selection\":1,\"seek\":1,\"fd_output\":1,\"timestamps\":[\"source\",\"zero\"],\"crop\":1,\"output_formats\":[\"gbrp16le\",\"yuv420p16le\",\"yuv420p10le\",\"yuv420p\"],\"dithers\":[\"none\",\"ordered\",\"blue\"],\"precision\":[\"exact\",\"standard\",\"fast\"],\"device_features\":[\"float64\"],\"frame_statistics\":1}";
+    return "{\"abi\":1,\"version\":\"" MVO_FEL_VERSION "\",\"transport\":\"nut\",\"pixel_format\":\"gbrp16le\",\"cpu\":true,\"statistics\":1,\"device_selection\":1,\"seek\":1,\"fd_output\":1,\"timestamps\":[\"source\",\"zero\"],\"crop\":1,\"output_formats\":[\"gbrp16le\",\"yuv420p16le\",\"yuv420p10le\",\"yuv420p\"],\"dithers\":[\"none\",\"ordered\",\"blue\"],\"precision\":[\"exact\",\"standard\",\"fast\"],\"device_features\":[\"float64\"],\"frame_statistics\":1,\"measure\":[\"base\",\"reconstructed\"]}";
 #endif
 }
 int mvo_fel_classify(const uint8_t *nal, size_t size) {
@@ -1248,6 +1349,7 @@ int mvo_fel_set_output(mvo_fel_context *p, const char *format, const char *chrom
                     : name == "yuv420p10le" ? FEL_OUT_YUV420P10 : name == "yuv420p" ? FEL_OUT_YUV420P8 : -1;
     const int location = chroma_from_name(chroma), mode = dither_from_name(dither);
     if (value < 0 || location < 0 || mode < 0) return -1;
+    if (p->measure != mvo_fel_context::MEASURE_NONE && value != FEL_OUT_GBRP16) return -1;
     p->output_format.format = value; p->output_format.chroma = location; p->output_format.dither = mode;
     return 0;
 }
@@ -1262,6 +1364,7 @@ int mvo_fel_set_decoder_device(mvo_fel_context *p, const void *device) {
 int mvo_fel_set_crop(mvo_fel_context *p, int left, int top, int right, int bottom) {
     if (!p || p->started || left < 0 || top < 0 || right < 0 || bottom < 0 ||
         (left | top | right | bottom) & 1 || std::max({left, top, right, bottom}) > 8192) return -1;
+    if (p->measure != mvo_fel_context::MEASURE_NONE && (left | top | right | bottom)) return -1;
     p->crop = {left, top, right, bottom};
     return 0;
 }
@@ -1277,6 +1380,15 @@ int mvo_fel_set_frame_statistics(mvo_fel_context *p, const char *path) {
     if (!p || p->started || !path || !*path) return -1;
     fel_stats_eotf();  // tables communes initialisées avant tout fil de rendu
     p->stats_path = path;
+    return 0;
+}
+int mvo_fel_set_measure(mvo_fel_context *p, const char *layer) {
+    if (!p || p->started || !layer) return -1;
+    const std::string value(layer);
+    if (value != "base" && value != "reconstructed") return -1;
+    // Statistiques sur le RGB PQ pleine image : sortie Y'CbCr et recadrage sans objet.
+    if (p->output_format.format != FEL_OUT_GBRP16 || (p->crop[0] | p->crop[1] | p->crop[2] | p->crop[3])) return -1;
+    p->measure = value == "base" ? mvo_fel_context::MEASURE_BASE : mvo_fel_context::MEASURE_RECONSTRUCTED;
     return 0;
 }
 int mvo_fel_set_render_workers(mvo_fel_context *p, int count) {
@@ -1393,7 +1505,7 @@ int mvo_fel_run_fd(mvo_fel_context *p, intptr_t fd, mvo_fel_progress progress, v
     return run_context(p);
 }
 int mvo_fel_run(mvo_fel_context *p, mvo_fel_write write, mvo_fel_progress progress, void *opaque) {
-    if (!p || !write) return MVO_FEL_ERROR;
+    if (!p || (!write && p->measure == mvo_fel_context::MEASURE_NONE)) return MVO_FEL_ERROR;
     p->write = write; p->progress = progress; p->opaque = opaque;
     return run_context(p);
 }

@@ -103,7 +103,8 @@ def smoke(library: Path, fixture: Path, output: Path | None = None, device: str 
     precision_modes(lib, fixture, device)
     missing_layers(lib, fixture, device)
     frame_statistics(lib, fixture, device)
-    print("ABI, NUT, 12 images/B-frames, seek, descripteur, Y'CbCr, précisions, AU sans RPU ni EL, statistiques, "
+    measure(lib, fixture, device)
+    print("ABI, NUT, 12 images/B-frames, seek, descripteur, Y'CbCr, précisions, AU sans RPU ni EL, statistiques, mesure, "
           "fermeture aval, annulation, piste invalide et erreur de lecture : OK")
 
 
@@ -154,6 +155,86 @@ def frame_statistics(lib, fixture: Path, device: str) -> None:
                 assert 0 <= f["y100"] <= 1 and f["avg_nits"] <= max(f["max_nits"]) + 1e-3 and f["y9999_nits"] > 0, f
                 percentiles = f["maxrgb_percentiles"]
                 assert len(percentiles) == 7 and percentiles == sorted(percentiles), f
+
+
+def measure(lib, fixture: Path, device: str) -> None:
+    """Mesure seule : aucune image produite, statistiques identiques au CPU et au GPU.
+
+    « reconstructed » : mêmes statistiques que la production ; « base » : BL lue comme un signal HDR10,
+    RPU et EL ignorés pour les pixels (flux sans RPU ni EL : mêmes mesures, sans plans).
+    """
+    assert json.loads(lib.mvo_fel_capabilities()).get("measure") == ["base", "reconstructed"]
+    lib.mvo_fel_set_measure.argtypes = [c.c_void_p, c.c_char_p]
+    lib.mvo_fel_set_measure.restype = c.c_int
+    lib.mvo_fel_set_frame_statistics.argtypes = [c.c_void_p, c.c_char_p]
+    lib.mvo_fel_set_frame_statistics.restype = c.c_int
+    run_measure = lib.mvo_fel_run
+    no_write = c.cast(None, WRITE)
+
+    def measured(path: Path, layer: str | None, engine: str, stats: Path | None, produce: bool = False):
+        handle = lib.mvo_fel_create(str(path).encode(), 0, 2, 24000, 1001)
+        assert handle
+        try:
+            assert lib.mvo_fel_set_device(handle, engine.encode("ascii")) == 0
+            if stats is not None:
+                assert lib.mvo_fel_set_frame_statistics(handle, str(stats).encode()) == 0
+            if layer:
+                assert lib.mvo_fel_set_measure(handle, layer.encode()) == 0
+            written = []
+            sink = WRITE(lambda _o, _p, n: written.append(n) or 0) if produce else no_write
+            result = run_measure(handle, sink, PROGRESS(lambda *_: None), None)
+            return result, sum(written), (lib.mvo_fel_error(handle) or b"").decode()
+        finally:
+            lib.mvo_fel_destroy(handle)
+
+    handle = lib.mvo_fel_create(str(fixture.resolve()).encode(), 0, 2, 24000, 1001)
+    try:
+        assert lib.mvo_fel_set_measure(handle, b"bl") == -1 and lib.mvo_fel_set_measure(handle, None) == -1
+        assert lib.mvo_fel_set_measure(handle, b"base") == 0
+        # Mesure : RGB pleine image imposé.
+        assert lib.mvo_fel_set_output(handle, b"yuv420p10le", b"topleft", b"none") == -1
+        assert lib.mvo_fel_set_crop(handle, 0, 8, 0, 8) == -1
+        assert lib.mvo_fel_set_output(handle, b"gbrp16le", b"left", b"none") == 0
+    finally:
+        lib.mvo_fel_destroy(handle)
+    with tempfile.TemporaryDirectory(prefix="fel-measure-") as temporary:
+        folder = Path(temporary)
+        # Sans fichier de statistiques : refusé ; callback nul sans mesure : refusé.
+        assert measured(fixture.resolve(), "base", "cpu", None)[0] == 1
+        assert measured(fixture.resolve(), None, "cpu", folder / "none.jsonl")[0] == 1
+        # Reconstruite : mêmes statistiques que la production, rien d'écrit.
+        produced = folder / "produced.jsonl"
+        result, size, error = measured(fixture.resolve(), None, "cpu", produced, produce=True)
+        assert result == 0 and size > 0, error
+        for engine in ("cpu", device):
+            path = folder / f"reconstructed-{engine}.jsonl"
+            result, size, error = measured(fixture.resolve(), "reconstructed", engine, path)
+            assert result == 0 and size == 0, (engine, error)
+            assert path.read_bytes() == produced.read_bytes(), engine
+        base = {}
+        for engine in ("cpu", device):
+            path = folder / f"base-{engine}.jsonl"
+            result, _, error = measured(fixture.resolve(), "base", engine, path)
+            assert result == 0, (engine, error)
+            base[engine] = path.read_bytes()
+        assert base["cpu"] == base[device]
+        assert base["cpu"] != produced.read_bytes()  # le résiduel FEL change l'image
+        lines = [json.loads(line) for line in base["cpu"].decode().splitlines()]
+        frames = [line for line in lines if "frame" in line]
+        assert len(frames) == 12 and frames[0]["window"] == [0, 0, 256, 144]
+        # Flux sans RPU ni EL (HDR10 simple) : mêmes pixels mesurés, aucun plan signalé.
+        plain = folder / "plain.hevc"
+        strip_layers(fixture, plain, {unit: {62, 63} for unit in range(12)})
+        path = folder / "plain.jsonl"
+        result, _, error = measured(plain, "base", device, path)
+        assert result == 0, error
+        plain_lines = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+        plain_frames = [line for line in plain_lines if "frame" in line]
+        assert [line for line in plain_lines if "scene_first" in line][0]["frames"] == 12
+        strip = lambda f: {k: v for k, v in f.items() if k != "scene_start"}  # noqa: E731
+        assert [strip(f) for f in plain_frames] == [strip(f) for f in frames]
+        # Reconstruite sur un flux sans EL : refusée (aucune couche à reconstruire).
+        assert measured(plain, "reconstructed", "cpu", folder / "refused.jsonl")[0] != 0
 
 
 def strip_layers(fixture: Path, output: Path, units: dict[int, set[int]]) -> None:

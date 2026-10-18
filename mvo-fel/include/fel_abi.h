@@ -68,6 +68,13 @@ MVO_FEL_EXPORT int mvo_fel_set_render_workers(mvo_fel_context *, int count);
  * de chaque plan Dolby Vision, en JSON Lines UTF-8 dans path. Avant mvo_fel_run / mvo_fel_run_fd ;
  * refusé en transport direct (mvo_fel_next_layers). Format : docs/statistiques-image.md. */
 MVO_FEL_EXPORT int mvo_fel_set_frame_statistics(mvo_fel_context *, const char *path);
+/* Extension additive ABI 1 (capacité measure : ["base", "reconstructed"]) : mesure seule, aucune
+ * image produite ; mvo_fel_run accepte alors un callback d'écriture nul. Avant run, après ou avec
+ * mvo_fel_set_frame_statistics (obligatoire). "base" : couche de base lue comme un signal HDR10
+ * BT.2020 PQ (RPU identité ; le RPU éventuel ne fournit que la zone active L5 et les plans), toute
+ * piste HEVC ; "reconstructed" : image reconstruite (RPU + EL), comme en production. Sortie RGB
+ * pleine image imposée : set_output Y'CbCr et set_crop refusés. Refusée en transport direct. */
+MVO_FEL_EXPORT int mvo_fel_set_measure(mvo_fel_context *, const char *layer);
 MVO_FEL_EXPORT int mvo_fel_set_output(mvo_fel_context *, const char *pixel_format,
     const char *chroma_location, const char *dither);
 /* Mesures locales après run ; pipe_s est inclus dans nut_s. */

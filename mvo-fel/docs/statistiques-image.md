@@ -56,3 +56,25 @@ Une ligne par image produite, dans l'ordre :
 
 `maxrgb_hist` liste les cases non vides `[case, nombre de pixels]` de l'histogramme de maxRGB
 cumulé sur le plan. Le premier plan commence à la première image produite, même sans drapeau.
+
+## Mesure seule (0.4.0)
+
+Capacité `measure` (`["base", "reconstructed"]`), fonction `mvo_fel_set_measure(contexte, couche)`,
+avant `mvo_fel_run`, avec `mvo_fel_set_frame_statistics` (obligatoire). Aucune image n'est produite :
+`mvo_fel_run` accepte un callback d'écriture nul et seules les statistiques sont écrites, au même
+format. Sortie RGB pleine image imposée (`set_output` Y'CbCr et `set_crop` refusés) ; refusée en
+transport direct.
+
+- `base` : couche de base lue comme un signal HDR10 BT.2020 PQ, ce que voit une TV HDR10. Toute
+  piste HEVC, Dolby Vision ou non. Chaque image reçoit un RPU identité (courbes polynomiales de
+  pente 1, sans résiduel, matrices Y'CbCr → RGB BT.2020 plage limitée et RGB → LMS des RPU de
+  profil 8.1) : conversion HDR10 standard calculée par les chemins de la reconstruction (CPU
+  certifié, GPU selon la précision demandée). Le RPU éventuel ne fournit que la zone active L5
+  (fenêtre mesurée) et les changements de plan ; l'EL n'est pas décodée. Sans RPU : image
+  entière, un seul plan.
+- `reconstructed` : image reconstruite (RPU + EL), statistiques identiques à celles de la
+  production au bit près.
+
+Contrôle sur source propre (Tenzing, WEB DV + HDR10+, une minute, 10 plans) : MaxScl mesuré par
+plan / MaxScl du HDR10+ = 1,023 en médiane (p10 0,93, p90 1,05), AverageRGB 0,993 ; maxima à ±3 %
+d'une conversion numpy indépendante (écart du filtre chroma Spline16).
