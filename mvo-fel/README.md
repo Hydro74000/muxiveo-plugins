@@ -4,7 +4,7 @@ Extension facultative de Muxiveo. Le moteur reconstruit l'apport de la couche FE
 dans les pixels avant les filtres, le tone mapping, l'interpolation et l'encodage,
 indépendamment de la conservation du RPU en sortie.
 
-**Préversion `mvo-fel-v0.3.0`.** Trois précisions : Lent (exact certifié, identique au CPU au bit
+**Préversion `mvo-fel-v0.4.0`.** Trois précisions : Lent (exact certifié, identique au CPU au bit
 près), Standard (≤ 1 code 16 bits) et Rapide (float32). Le Lent en virgule fixe utilise une
 [EOTF à deux niveaux](docs/2026-10-16-eotf-deux-niveaux.md) et une sortie Y'CbCr exacte en
 entiers ; deux images sont en vol par défaut. Paquets : Linux x86_64 GPU (Vulkan, transport direct
@@ -12,7 +12,7 @@ NVIDIA), Windows x86_64 GPU (Vulkan), macOS arm64 CPU. Attestations de schéma 5
 SUPER, iGPU AMD Raphael, GTX 1070 et Intel UHD 630. L'épinglage dans Muxiveo attend l'accord du
 mainteneur. La lecture sur matériel Dolby Vision reste à valider avant une release générale.
 
-Nouveau en 0.4.0 (en développement) : mesure seule (capacité `measure`, aucune image produite)
+Nouveau en 0.4.0 : mesure seule (capacité `measure`, aucune image produite)
 de la couche de base lue comme un signal HDR10 (`base`, toute piste HEVC, Dolby Vision ou non) ou
 de l'image reconstruite (`reconstructed`), avec les mêmes chemins de rendu et de statistiques :
 MaxCLL/MaxFALL réels et courbes de luminance du HDR Studio de Muxiveo.
