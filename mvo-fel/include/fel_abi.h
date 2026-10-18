@@ -80,6 +80,12 @@ MVO_FEL_EXPORT int mvo_fel_set_layer(mvo_fel_context *, const char *layer);
  * mvo_fel_set_frame_statistics (obligatoire). Sortie RGB pleine image imposée : set_output Y'CbCr
  * et set_crop refusés. Refusée en transport direct. */
 MVO_FEL_EXPORT int mvo_fel_set_measure(mvo_fel_context *, const char *layer);
+/* Extension additive ABI 1 (capacité measure_sampling : ["all", "keyframes"]) : échantillonnage de la
+ * mesure, avant run. "keyframes" : seules les images clés (IRAP) sont décodées et mesurées (mesure rapide,
+ * environ une image par seconde) ; mesure seule de la couche base ou mapped, source en conteneur
+ * (horodatages) ; chaque ligne de statistiques porte son horodatage (time_s) et le callback de progression
+ * reçoit la position dans le flux (images) au lieu du nombre d'images mesurées. */
+MVO_FEL_EXPORT int mvo_fel_set_measure_sampling(mvo_fel_context *, const char *mode);
 MVO_FEL_EXPORT int mvo_fel_set_output(mvo_fel_context *, const char *pixel_format,
     const char *chroma_location, const char *dither);
 /* Mesures locales après run ; pipe_s est inclus dans nut_s. */

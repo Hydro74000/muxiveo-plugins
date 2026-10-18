@@ -47,6 +47,8 @@ Une ligne par image produite, dans l'ordre :
   à 1, 25, 50, 75, 90, 95 et 99,98 %. Le HDR10+ en fait par plan la moyenne (1 à 95 %) et
   le maximum (99,98 %) : règle de l'analyseur de référence, vérifiée sur une source réelle.
 - `window` : fenêtre mesurée (x, y, largeur, hauteur), en pixels de la source.
+- `time_s` (0.5.0) : horodatage de présentation de l'image (secondes, base de temps de la source ;
+  relatif au début demandé pour une lecture décalée).
 
 À la fin de chaque plan (changement de plan suivant ou fin du flux) :
 
@@ -76,6 +78,13 @@ transport direct.
   production au bit près.
 - `mapped` : couche de base passée par les courbes du RPU de chaque image, résiduel désactivé
   (lecture Dolby Vision sans EL : P8.1, MEL) ; sources Dolby Vision seulement, l'EL n'est pas décodée.
+
+Échantillonnage (0.5.0, capacité `measure_sampling` : `["all", "keyframes"]`, fonction
+`mvo_fel_set_measure_sampling(contexte, mode)`, avant `mvo_fel_run`) : `keyframes` ne décode et ne
+mesure que les images clés (IRAP, environ une par seconde sur les films) — mesure rapide, sans
+décodage inter-images. Réservé à la mesure seule des couches `base` et `mapped`, source en conteneur
+(horodatages exigés) ; l'en-tête porte `"sampling":"keyframes"`, chaque image son `time_s`, les plans
+regroupent les images mesurées et le callback de progression reçoit la position dans le flux (images).
 
 Les mêmes couches sont produites en rendu normal (images écrites) par `mvo_fel_set_layer` (capacité
 `layers`), sans transport direct.

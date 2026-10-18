@@ -165,7 +165,8 @@ def measure(lib, fixture: Path, device: str) -> None:
     """
     capabilities = json.loads(lib.mvo_fel_capabilities())
     assert capabilities.get("measure") == capabilities.get("layers") == ["base", "mapped", "reconstructed"]
-    for name in ("mvo_fel_set_measure", "mvo_fel_set_layer"):
+    assert capabilities.get("measure_sampling") == ["all", "keyframes"]
+    for name in ("mvo_fel_set_measure", "mvo_fel_set_layer", "mvo_fel_set_measure_sampling"):
         getattr(lib, name).argtypes = [c.c_void_p, c.c_char_p]
         getattr(lib, name).restype = c.c_int
     lib.mvo_fel_set_frame_statistics.argtypes = [c.c_void_p, c.c_char_p]
@@ -173,11 +174,14 @@ def measure(lib, fixture: Path, device: str) -> None:
     run_measure = lib.mvo_fel_run
     no_write = c.cast(None, WRITE)
 
-    def measured(path: Path, layer: str | None, engine: str, stats: Path | None, produce: bool = False):
+    def measured(path: Path, layer: str | None, engine: str, stats: Path | None, produce: bool = False,
+                 sampling: str | None = None):
         handle = lib.mvo_fel_create(str(path).encode(), 0, 2, 24000, 1001)
         assert handle
         try:
             assert lib.mvo_fel_set_device(handle, engine.encode("ascii")) == 0
+            if sampling is not None:
+                assert lib.mvo_fel_set_measure_sampling(handle, sampling.encode()) == 0
             if stats is not None:
                 assert lib.mvo_fel_set_frame_statistics(handle, str(stats).encode()) == 0
             if layer and produce:
@@ -194,6 +198,7 @@ def measure(lib, fixture: Path, device: str) -> None:
     handle = lib.mvo_fel_create(str(fixture.resolve()).encode(), 0, 2, 24000, 1001)
     try:
         assert lib.mvo_fel_set_measure(handle, b"bl") == -1 and lib.mvo_fel_set_measure(handle, None) == -1
+        assert lib.mvo_fel_set_measure_sampling(handle, b"rapide") == -1
         assert lib.mvo_fel_set_layer(handle, b"el") == -1
         assert lib.mvo_fel_set_measure(handle, b"base") == 0
         # Mesure : RGB pleine image imposé.
@@ -255,6 +260,31 @@ def measure(lib, fixture: Path, device: str) -> None:
             result, size, error = measured(fixture.resolve(), layer, "cpu", path, produce=True)
             assert result == 0 and size > 12 * 256 * 144 * 6, (layer, error)
             assert path.read_bytes() == reference, layer
+        # Mesure par images clés (0.5.0) : flux brut refusé (horodatages), reconstruite refusée.
+        assert measured(fixture.resolve(), "base", "cpu", folder / "kf-raw.jsonl", sampling="keyframes")[0] != 0
+        # Source en conteneur (clip réel, comme les tests natifs GPU) : MVO_FEL_TEST_CLIP.
+        clip = os.environ.get("MVO_FEL_TEST_CLIP")
+        if clip:
+            container = Path(clip)
+            assert measured(container, "reconstructed", "cpu", folder / "kf-rec.jsonl", sampling="keyframes")[0] != 0
+            full_path, sampled_path = folder / "kf-all.jsonl", folder / "kf.jsonl"
+            assert measured(container, "base", "cpu", full_path, sampling="all")[0] == 0
+            result, _, error = measured(container, "base", device, sampled_path, sampling="keyframes")
+            assert result == 0, error
+            full = [json.loads(line) for line in full_path.read_text(encoding="utf-8").splitlines()]
+            sampled = [json.loads(line) for line in sampled_path.read_text(encoding="utf-8").splitlines()]
+            assert sampled[0].get("sampling") == "keyframes" and "sampling" not in full[0]
+            full_frames = [line for line in full if "frame" in line]
+            sampled_frames = [line for line in sampled if "frame" in line]
+            assert 1 <= len(sampled_frames) < len(full_frames)
+            times = [line["time_s"] for line in sampled_frames]
+            assert times == sorted(times) and times[0] == full_frames[0]["time_s"]
+            # Image clé : mêmes statistiques que dans la mesure complète (même image ; GPU rapide ≈ CPU).
+            same = {line["time_s"]: line for line in full_frames}
+            assert all(f["time_s"] in same for f in sampled_frames)
+            for frame in sampled_frames:
+                reference = same[frame["time_s"]]
+                assert abs(frame["avg_nits"] - reference["avg_nits"]) <= 0.01 * max(1.0, reference["avg_nits"])
 
 
 def strip_layers(fixture: Path, output: Path, units: dict[int, set[int]]) -> None:

@@ -12,6 +12,12 @@ NVIDIA), Windows x86_64 GPU (Vulkan), macOS arm64 CPU. Attestations de schéma 5
 SUPER, iGPU AMD Raphael, GTX 1070 et Intel UHD 630. L'épinglage dans Muxiveo attend l'accord du
 mainteneur. La lecture sur matériel Dolby Vision reste à valider avant une release générale.
 
+Nouveau en 0.5.0 : mesure rapide (capacité `measure_sampling`, `mvo_fel_set_measure_sampling`) :
+seules les images clés sont décodées et mesurées, environ une image toutes les deux à trois secondes
+sur un film (quelques dizaines de secondes au lieu d'un quart d'heure). Estimation : MaxCLL et pics
+par plan fidèles, MaxFALL souvent sous-estimée (moments lumineux brefs) ; horodatage `time_s` dans
+chaque ligne de statistiques ([format](docs/statistiques-image.md)).
+
 Nouveau en 0.4.0 : mesure seule (capacité `measure`, aucune image produite)
 de la couche de base lue comme un signal HDR10 (`base`, toute piste HEVC, Dolby Vision ou non) ou
 de l'image reconstruite (`reconstructed`), avec les mêmes chemins de rendu et de statistiques :

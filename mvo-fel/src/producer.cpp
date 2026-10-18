@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <atomic>
 #include <array>
+#include <cmath>
 #include <chrono>
 #include <condition_variable>
 #include <functional>
@@ -267,6 +268,7 @@ struct Rendered {
     std::unique_ptr<fel_frame_stats> stats;  // statistiques de l'image (mvo_fel_set_frame_statistics)
     bool scene_start = false;
     std::array<int, 4> window{};  // fenêtre mesurée (x, y, largeur, hauteur), coordonnées de la source
+    double time_s = 0;  // horodatage de présentation de l'image (secondes)
 };
 }
 
@@ -331,6 +333,8 @@ struct mvo_fel_context {
     enum { LAYER_RECONSTRUCTED, LAYER_BASE, LAYER_MAPPED };
     int layer = LAYER_RECONSTRUCTED;
     bool measure_only = false;
+    // Mesure par images clés (mvo_fel_set_measure_sampling) : seules les images IRAP sont décodées.
+    bool keyframes_only = false;
     AVBufferRef *identity = nullptr;  // RPU identité partagé par les images (couche de base)
     std::array<double,7> timing{}; // ouverture, lecture, BL, EL, pixels, NUT, pipe.
     // Attentes des files : décodage bloqué, rendu affamé, rendu bloqué, écriture affamée.
@@ -414,6 +418,7 @@ struct mvo_fel_context {
         stream = input->streams[stream_index];
         if (stream->codecpar->codec_id != AV_CODEC_ID_HEVC) throw Failure("La source FEL doit être HEVC");
         raw = std::string(input->iformat->name) == "hevc";
+        if (keyframes_only && raw) throw Failure("Échantillonnage par images clés : conteneur requis (horodatages)");
         if (fps.num <= 0 || fps.den <= 0) fps = av_guess_frame_rate(input, stream, nullptr);
         if (raw && (fps.num <= 0 || fps.den <= 0)) throw Failure("Cadence du flux brut inconnue");
         if (start_us > 0) seek();
@@ -463,6 +468,8 @@ struct mvo_fel_context {
         }
 #endif
         bl.init(stream, "bl_rpu", bl_threads, hw_decode ? hw_device : nullptr);
+        // Mesure rapide : images non clés ignorées par le décodeur (aucun décodage inter-images).
+        if (keyframes_only) bl.decoder->skip_frame = AVDISCARD_NONKEY;
         if (layer == LAYER_BASE) identity = identity_metadata();
         if (!base_only) el.init(stream, "el", el_threads, hw_decode ? hw_device : nullptr);
     }
@@ -939,7 +946,8 @@ struct mvo_fel_context {
             std::ostringstream head;
             head.imbue(std::locale::classic());
             head << "{\"format\":\"mvo-fel-frame-statistics\",\"version\":1,\"bins\":" << FEL_STATS_BINS
-                 << ",\"width\":" << item.width << ",\"height\":" << item.height << "}\n";
+                 << ",\"width\":" << item.width << ",\"height\":" << item.height
+                 << (keyframes_only ? ",\"sampling\":\"keyframes\"" : "") << "}\n";
             avio_write(stats_io, reinterpret_cast<const unsigned char *>(head.str().data()), int(head.str().size()));
         }
         const fel_frame_stats &s = *item.stats;
@@ -980,7 +988,7 @@ struct mvo_fel_context {
              << ",\"maxrgb_percentiles\":[";
         for (size_t q = 0; q < percentiles.size(); ++q) line << (q ? "," : "") << percentiles[q];
         line << "],\"window\":[" << item.window[0] << ',' << item.window[1] << ',' << item.window[2] << ','
-             << item.window[3] << "]}\n";
+             << item.window[3] << "],\"time_s\":" << item.time_s << "}\n";
         avio_write(stats_io, reinterpret_cast<const unsigned char *>(line.str().data()), int(line.str().size()));
         ++stats_frame;
     }
@@ -1050,6 +1058,7 @@ struct mvo_fel_context {
         AVFrame *rgb = w.frame.get();
         auto out = std::unique_ptr<Rendered>(new Rendered{packet(), output_format.width, output_format.height,
                                                           job.timebase, nullptr, job.scene_start});
+        out->time_s = double(job.pts) * av_q2d(job.timebase);
         if (!stats_path.empty()) out->stats = std::make_unique<fel_frame_stats>();
         out->packet->buf = av_buffer_pool_get(pool);
         if (!out->packet->buf) throw std::bad_alloc();
@@ -1150,13 +1159,16 @@ struct mvo_fel_context {
         }
         if (item.stats) write_statistics(item);
         ++frames;
-        if (progress) progress(opaque, frames);
+        // Images clés : position dans le flux (images) ; sinon nombre d'images produites.
+        if (progress) progress(opaque, keyframes_only ? int64_t(std::llround(item.time_s * av_q2d(fps))) : frames);
     }
     // Trois étages bornés : décodage/appariement, rendu, écriture sur le thread appelant
     // (contrat ABI des callbacks). Une erreur ou l'annulation abandonne les files.
     void run() {
         if (started) throw Failure("Contexte déjà exécuté");
         if (measure_only && stats_path.empty()) throw Failure("Mesure sans fichier de statistiques");
+        if (keyframes_only && (!measure_only || layer == LAYER_RECONSTRUCTED))
+            throw Failure("Échantillonnage par images clés réservé à la mesure de la couche de base");
         started = true;
         began = Clock::now();
         { Timer timer(timing[0]); open(); }
@@ -1287,9 +1299,9 @@ struct mvo_fel_context {
 uint32_t mvo_fel_abi_version() { return MVO_FEL_ABI; }
 const char *mvo_fel_capabilities() {
 #ifdef MVO_FEL_VULKAN_PROTOTYPE
-    return "{\"abi\":1,\"version\":\"" MVO_FEL_VERSION "\",\"transport\":\"nut\",\"pixel_format\":\"gbrp16le\",\"cpu\":true,\"backend\":\"vulkan-prototype\",\"statistics\":1,\"device_selection\":1,\"seek\":1,\"fd_output\":1,\"timestamps\":[\"source\",\"zero\"],\"crop\":1,\"output_formats\":[\"gbrp16le\",\"yuv420p16le\",\"yuv420p10le\",\"yuv420p\"],\"dithers\":[\"none\",\"ordered\",\"blue\"],\"direct_formats\":[\"p010\"],\"precision\":[\"exact\",\"standard\",\"fast\"],\"device_features\":[\"float64\"],\"render_workers\":[1,4],\"frame_statistics\":1,\"measure\":[\"base\",\"mapped\",\"reconstructed\"],\"layers\":[\"base\",\"mapped\",\"reconstructed\"],\"experimental\":true}";
+    return "{\"abi\":1,\"version\":\"" MVO_FEL_VERSION "\",\"transport\":\"nut\",\"pixel_format\":\"gbrp16le\",\"cpu\":true,\"backend\":\"vulkan-prototype\",\"statistics\":1,\"device_selection\":1,\"seek\":1,\"fd_output\":1,\"timestamps\":[\"source\",\"zero\"],\"crop\":1,\"output_formats\":[\"gbrp16le\",\"yuv420p16le\",\"yuv420p10le\",\"yuv420p\"],\"dithers\":[\"none\",\"ordered\",\"blue\"],\"direct_formats\":[\"p010\"],\"precision\":[\"exact\",\"standard\",\"fast\"],\"device_features\":[\"float64\"],\"render_workers\":[1,4],\"frame_statistics\":1,\"measure\":[\"base\",\"mapped\",\"reconstructed\"],\"layers\":[\"base\",\"mapped\",\"reconstructed\"],\"measure_sampling\":[\"all\",\"keyframes\"],\"experimental\":true}";
 #else
-    return "{\"abi\":1,\"version\":\"" MVO_FEL_VERSION "\",\"transport\":\"nut\",\"pixel_format\":\"gbrp16le\",\"cpu\":true,\"statistics\":1,\"device_selection\":1,\"seek\":1,\"fd_output\":1,\"timestamps\":[\"source\",\"zero\"],\"crop\":1,\"output_formats\":[\"gbrp16le\",\"yuv420p16le\",\"yuv420p10le\",\"yuv420p\"],\"dithers\":[\"none\",\"ordered\",\"blue\"],\"precision\":[\"exact\",\"standard\",\"fast\"],\"device_features\":[\"float64\"],\"frame_statistics\":1,\"measure\":[\"base\",\"mapped\",\"reconstructed\"],\"layers\":[\"base\",\"mapped\",\"reconstructed\"]}";
+    return "{\"abi\":1,\"version\":\"" MVO_FEL_VERSION "\",\"transport\":\"nut\",\"pixel_format\":\"gbrp16le\",\"cpu\":true,\"statistics\":1,\"device_selection\":1,\"seek\":1,\"fd_output\":1,\"timestamps\":[\"source\",\"zero\"],\"crop\":1,\"output_formats\":[\"gbrp16le\",\"yuv420p16le\",\"yuv420p10le\",\"yuv420p\"],\"dithers\":[\"none\",\"ordered\",\"blue\"],\"precision\":[\"exact\",\"standard\",\"fast\"],\"device_features\":[\"float64\"],\"frame_statistics\":1,\"measure\":[\"base\",\"mapped\",\"reconstructed\"],\"layers\":[\"base\",\"mapped\",\"reconstructed\"],\"measure_sampling\":[\"all\",\"keyframes\"]}";
 #endif
 }
 int mvo_fel_classify(const uint8_t *nal, size_t size) {
@@ -1405,6 +1417,12 @@ int mvo_fel_set_layer(mvo_fel_context *p, const char *layer) {
     const int value = layer_from_name(layer);
     if (!p || p->started || value < 0) return -1;
     p->layer = value;
+    return 0;
+}
+int mvo_fel_set_measure_sampling(mvo_fel_context *p, const char *mode) {
+    const std::string value(mode ? mode : "");
+    if (!p || p->started || (value != "all" && value != "keyframes")) return -1;
+    p->keyframes_only = value == "keyframes";
     return 0;
 }
 int mvo_fel_set_measure(mvo_fel_context *p, const char *layer) {
