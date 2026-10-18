@@ -68,12 +68,17 @@ MVO_FEL_EXPORT int mvo_fel_set_render_workers(mvo_fel_context *, int count);
  * de chaque plan Dolby Vision, en JSON Lines UTF-8 dans path. Avant mvo_fel_run / mvo_fel_run_fd ;
  * refusé en transport direct (mvo_fel_next_layers). Format : docs/statistiques-image.md. */
 MVO_FEL_EXPORT int mvo_fel_set_frame_statistics(mvo_fel_context *, const char *path);
-/* Extension additive ABI 1 (capacité measure : ["base", "reconstructed"]) : mesure seule, aucune
- * image produite ; mvo_fel_run accepte alors un callback d'écriture nul. Avant run, après ou avec
- * mvo_fel_set_frame_statistics (obligatoire). "base" : couche de base lue comme un signal HDR10
- * BT.2020 PQ (RPU identité ; le RPU éventuel ne fournit que la zone active L5 et les plans), toute
- * piste HEVC ; "reconstructed" : image reconstruite (RPU + EL), comme en production. Sortie RGB
- * pleine image imposée : set_output Y'CbCr et set_crop refusés. Refusée en transport direct. */
+/* Extension additive ABI 1 (capacité layers : ["base", "mapped", "reconstructed"]) : couche
+ * produite, avant run. "reconstructed" (défaut) : image reconstruite (RPU + EL) ; "base" : couche
+ * de base lue comme un signal HDR10 BT.2020 PQ (RPU identité ; le RPU éventuel ne fournit que la
+ * zone active L5 et les plans), toute piste HEVC ; "mapped" : couche de base passée par les courbes
+ * du RPU de chaque image, résiduel désactivé (lecture Dolby Vision sans EL), sources Dolby Vision.
+ * L'EL n'est décodée que pour "reconstructed". Refusées (base, mapped) en transport direct. */
+MVO_FEL_EXPORT int mvo_fel_set_layer(mvo_fel_context *, const char *layer);
+/* Extension additive ABI 1 (capacité measure : mêmes couches) : couche choisie et mesure seule,
+ * aucune image produite ; mvo_fel_run accepte alors un callback d'écriture nul. Avant run, avec
+ * mvo_fel_set_frame_statistics (obligatoire). Sortie RGB pleine image imposée : set_output Y'CbCr
+ * et set_crop refusés. Refusée en transport direct. */
 MVO_FEL_EXPORT int mvo_fel_set_measure(mvo_fel_context *, const char *layer);
 MVO_FEL_EXPORT int mvo_fel_set_output(mvo_fel_context *, const char *pixel_format,
     const char *chroma_location, const char *dither);

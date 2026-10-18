@@ -324,12 +324,14 @@ struct mvo_fel_context {
     // emitted : images appariées (décodage) ; frames : images écrites ou rendues à l'appelant.
     int64_t frames = 0, emitted = 0, last_pts = AV_NOPTS_VALUE;
     bool output_closed = false, raw = false, started = false;
-    // Mesure seule (mvo_fel_set_measure) : statistiques écrites, aucune image produite.
-    // MEASURE_BASE : couche de base lue comme un signal HDR10 (RPU identité synthétisé) ;
-    // MEASURE_RECONSTRUCTED : image reconstruite par le RPU et l'EL, comme en production.
-    enum { MEASURE_NONE, MEASURE_BASE, MEASURE_RECONSTRUCTED };
-    int measure = MEASURE_NONE;
-    AVBufferRef *identity = nullptr;  // RPU identité partagé par les images (mesure de la BL)
+    // Couche produite (mvo_fel_set_layer) : LAYER_RECONSTRUCTED, image reconstruite par le RPU et l'EL
+    // (défaut) ; LAYER_BASE, couche de base lue comme un signal HDR10 (RPU identité synthétisé) ;
+    // LAYER_MAPPED, couche de base passée par les courbes du RPU sans résiduel (lecture Dolby Vision
+    // sans EL : P8.1, MEL). measure_only (mvo_fel_set_measure) : statistiques seules, aucune image.
+    enum { LAYER_RECONSTRUCTED, LAYER_BASE, LAYER_MAPPED };
+    int layer = LAYER_RECONSTRUCTED;
+    bool measure_only = false;
+    AVBufferRef *identity = nullptr;  // RPU identité partagé par les images (couche de base)
     std::array<double,7> timing{}; // ouverture, lecture, BL, EL, pixels, NUT, pipe.
     // Attentes des files : décodage bloqué, rendu affamé, rendu bloqué, écriture affamée.
     std::array<double,4> waits{};
@@ -424,7 +426,7 @@ struct mvo_fel_context {
             static std::map<std::string, std::pair<bool, std::string>> cache;
             // GPU désigné par UUID uniquement : « auto » peut changer de carte d'un appel à l'autre.
             const std::string key = device + "|" + source + "|" + std::to_string(stream_index) + "|"
-                                  + std::to_string(measure == MEASURE_BASE);
+                                  + std::to_string(layer != LAYER_RECONSTRUCTED);
             const bool cacheable = device.size() == 32;
             if (cacheable) {
                 std::lock_guard lock(cache_mutex);
@@ -446,7 +448,7 @@ struct mvo_fel_context {
 #ifdef MVO_FEL_VULKAN_PROTOTYPE
         cpu_render = gpu_prototype == nullptr && !pulling;
 #endif
-        const bool base_only = measure == MEASURE_BASE;
+        const bool base_only = layer != LAYER_RECONSTRUCTED;
         const int bl_threads = base_only ? std::max(1, threads/2)
                              : cpu_render ? std::max(1, threads/4) : std::max(1, threads/3);
         const int el_threads = base_only ? 0 : cpu_render ? 1 : std::max(1, threads/3);
@@ -461,8 +463,8 @@ struct mvo_fel_context {
         }
 #endif
         bl.init(stream, "bl_rpu", bl_threads, hw_decode ? hw_device : nullptr);
-        if (base_only) identity = identity_metadata();
-        else el.init(stream, "el", el_threads, hw_decode ? hw_device : nullptr);
+        if (layer == LAYER_BASE) identity = identity_metadata();
+        if (!base_only) el.init(stream, "el", el_threads, hw_decode ? hw_device : nullptr);
     }
 #ifdef MVO_FEL_VULKAN_PROTOTYPE
     // Choix automatique selon la précision. Rapide : premier GPU dédié, sinon le premier.
@@ -548,7 +550,7 @@ struct mvo_fel_context {
         if (target != AV_NOPTS_VALUE) av_seek_frame(probe, stream_index, target, AVSEEK_FLAG_BACKWARD);
         // Par couche : logiciel, Vulkan, Vulkan (second décodage indépendant). Mesure de la BL :
         // couche de base seule (flux sans EL : P8, HDR10).
-        const int layer_count = measure == MEASURE_BASE ? 1 : 2;
+        const int layer_count = layer != LAYER_RECONSTRUCTED ? 1 : 2;
         std::array<Layer, 6> layers;
         int compared[2] = {0, 0};
         bool same = true, available = true;
@@ -727,7 +729,7 @@ struct mvo_fel_context {
     // que soit la structure de GOP de chaque couche ; false si emit demande l'arrêt. Une EL manquante
     // ou en trop décale les rangs suivants : couche orpheline en fin de flux, refusée.
     bool pair(const Emit &emit) {
-        if (measure == MEASURE_BASE) return pair_base(emit);
+        if (layer != LAYER_RECONSTRUCTED) return pair_base(emit);
         drop_leading();
         if (!leading_done || el_leading < leading) return true;
         while (!bl.ready.empty()) {
@@ -833,9 +835,9 @@ struct mvo_fel_context {
         c->source_min_pq = 62; c->source_max_pq = 3696; c->source_diagonal = 42;
         return buffer;
     }
-    // Mesure de la BL : chaque image lue comme un signal HDR10 (RPU identité). Le RPU éventuel ne
-    // sert qu'à la zone active L5 et aux changements de plan ; l'EL n'est ni décodée ni lue (plan
-    // neutre : l'image de base elle-même, résiduel désactivé).
+    // Couches sans EL : base (RPU identité ; le RPU éventuel ne sert qu'à la zone active L5 et aux
+    // changements de plan) ou mapped (courbes du RPU de l'image, résiduel désactivé). L'EL n'est ni
+    // décodée ni lue (plan neutre : l'image de base elle-même).
     bool pair_base(const Emit &emit) {
         drop_leading();
         if (!leading_done) return true;
@@ -849,12 +851,21 @@ struct mvo_fel_context {
                 const auto *source = reinterpret_cast<const AVDOVIMetadata *>(sd->data);
                 scene_start = own_rpu(*base) && av_dovi_get_color(source)->scene_refresh_flag;
                 active = active_area(source);
+            } else if (layer == LAYER_MAPPED) {
+                throw Failure("RPU absent : couche « mapped » réservée aux sources Dolby Vision");
             }
-            av_frame_remove_side_data(base.get(), AV_FRAME_DATA_DOVI_METADATA);
-            AVBufferRef *shared = av_buffer_ref(identity);
-            if (!shared) throw std::bad_alloc();
-            AVFrameSideData *sd = av_frame_new_side_data_from_buf(base.get(), AV_FRAME_DATA_DOVI_METADATA, shared);
-            if (!sd) { av_buffer_unref(&shared); throw std::bad_alloc(); }
+            if (layer == LAYER_MAPPED) {
+                disable_residual(*base);  // copie du RPU de l'image, résiduel désactivé
+            } else {
+                av_frame_remove_side_data(base.get(), AV_FRAME_DATA_DOVI_METADATA);
+                AVBufferRef *shared = av_buffer_ref(identity);
+                if (!shared) throw std::bad_alloc();
+                if (!av_frame_new_side_data_from_buf(base.get(), AV_FRAME_DATA_DOVI_METADATA, shared)) {
+                    av_buffer_unref(&shared);
+                    throw std::bad_alloc();
+                }
+            }
+            const auto *sd = av_frame_get_side_data(base.get(), AV_FRAME_DATA_DOVI_METADATA);
             const auto *metadata = reinterpret_cast<const AVDOVIMetadata *>(sd->data);
             if (skipped < skip) { ++skipped; continue; }
             Frame enhancement(av_frame_clone(base.get()));
@@ -877,13 +888,13 @@ struct mvo_fel_context {
             check(ret, "Lecture source", MVO_FEL_INPUT_ERROR);
             if (p->stream_index == stream_index) {
                 { Timer timer(timing[2]); bl.send(p.get()); }
-                if (measure != MEASURE_BASE) { Timer timer(timing[3]); el.send(p.get()); }
+                if (layer == LAYER_RECONSTRUCTED) { Timer timer(timing[3]); el.send(p.get()); }
                 if (!pair(emit)) return;
             }
             av_packet_unref(p.get());
         }
         { Timer timer(timing[2]); bl.send(nullptr); }
-        if (measure != MEASURE_BASE) { Timer timer(timing[3]); el.send(nullptr); }
+        if (layer == LAYER_RECONSTRUCTED) { Timer timer(timing[3]); el.send(nullptr); }
         if (!pair(emit)) return;
         if (!leading_done) el.ready.clear();  // cible au-delà de la dernière image
         if (!bl.ready.empty() || !el.ready.empty())
@@ -1131,7 +1142,7 @@ struct mvo_fel_context {
         return out;
     }
     void write_rendered(Rendered &item) {
-        if (measure == MEASURE_NONE) {
+        if (!measure_only) {
             if (!output) open_output(item.width, item.height);
             Timer nut(timing[5]);
             av_packet_rescale_ts(item.packet.get(), item.timebase, out_stream->time_base);
@@ -1145,7 +1156,7 @@ struct mvo_fel_context {
     // (contrat ABI des callbacks). Une erreur ou l'annulation abandonne les files.
     void run() {
         if (started) throw Failure("Contexte déjà exécuté");
-        if (measure != MEASURE_NONE && stats_path.empty()) throw Failure("Mesure sans fichier de statistiques");
+        if (measure_only && stats_path.empty()) throw Failure("Mesure sans fichier de statistiques");
         started = true;
         began = Clock::now();
         { Timer timer(timing[0]); open(); }
@@ -1217,8 +1228,8 @@ struct mvo_fel_context {
         rows.reset();
         if (failure) std::rethrow_exception(failure);
         check_cancelled();
-        if (!frames) throw Failure(measure == MEASURE_BASE ? "Aucune image mesurée" : "Aucune image FEL reconstruite");
-        if (measure == MEASURE_NONE) {
+        if (!frames) throw Failure(layer == LAYER_RECONSTRUCTED ? "Aucune image FEL reconstruite" : "Aucune image produite");
+        if (!measure_only) {
             check(av_write_trailer(output), "Fin NUT");
             avio_flush(io); check(io->error, "Vidange NUT");
         }
@@ -1236,7 +1247,8 @@ struct mvo_fel_context {
     int next() {
         if (!started) {
             if (!stats_path.empty()) throw Failure("Statistiques de l'image indisponibles en transport direct");
-            if (measure != MEASURE_NONE) throw Failure("Mesure indisponible en transport direct");
+            if (measure_only || layer != LAYER_RECONSTRUCTED)
+                throw Failure("Mesure et couches base/mapped indisponibles en transport direct");
             started = true; pulling = true; began = Clock::now();
             { Timer timer(timing[0]); open(); }
             // Décodage de l'image suivante pendant le rendu de la précédente par l'appelant.
@@ -1275,9 +1287,9 @@ struct mvo_fel_context {
 uint32_t mvo_fel_abi_version() { return MVO_FEL_ABI; }
 const char *mvo_fel_capabilities() {
 #ifdef MVO_FEL_VULKAN_PROTOTYPE
-    return "{\"abi\":1,\"version\":\"" MVO_FEL_VERSION "\",\"transport\":\"nut\",\"pixel_format\":\"gbrp16le\",\"cpu\":true,\"backend\":\"vulkan-prototype\",\"statistics\":1,\"device_selection\":1,\"seek\":1,\"fd_output\":1,\"timestamps\":[\"source\",\"zero\"],\"crop\":1,\"output_formats\":[\"gbrp16le\",\"yuv420p16le\",\"yuv420p10le\",\"yuv420p\"],\"dithers\":[\"none\",\"ordered\",\"blue\"],\"direct_formats\":[\"p010\"],\"precision\":[\"exact\",\"standard\",\"fast\"],\"device_features\":[\"float64\"],\"render_workers\":[1,4],\"frame_statistics\":1,\"measure\":[\"base\",\"reconstructed\"],\"experimental\":true}";
+    return "{\"abi\":1,\"version\":\"" MVO_FEL_VERSION "\",\"transport\":\"nut\",\"pixel_format\":\"gbrp16le\",\"cpu\":true,\"backend\":\"vulkan-prototype\",\"statistics\":1,\"device_selection\":1,\"seek\":1,\"fd_output\":1,\"timestamps\":[\"source\",\"zero\"],\"crop\":1,\"output_formats\":[\"gbrp16le\",\"yuv420p16le\",\"yuv420p10le\",\"yuv420p\"],\"dithers\":[\"none\",\"ordered\",\"blue\"],\"direct_formats\":[\"p010\"],\"precision\":[\"exact\",\"standard\",\"fast\"],\"device_features\":[\"float64\"],\"render_workers\":[1,4],\"frame_statistics\":1,\"measure\":[\"base\",\"mapped\",\"reconstructed\"],\"layers\":[\"base\",\"mapped\",\"reconstructed\"],\"experimental\":true}";
 #else
-    return "{\"abi\":1,\"version\":\"" MVO_FEL_VERSION "\",\"transport\":\"nut\",\"pixel_format\":\"gbrp16le\",\"cpu\":true,\"statistics\":1,\"device_selection\":1,\"seek\":1,\"fd_output\":1,\"timestamps\":[\"source\",\"zero\"],\"crop\":1,\"output_formats\":[\"gbrp16le\",\"yuv420p16le\",\"yuv420p10le\",\"yuv420p\"],\"dithers\":[\"none\",\"ordered\",\"blue\"],\"precision\":[\"exact\",\"standard\",\"fast\"],\"device_features\":[\"float64\"],\"frame_statistics\":1,\"measure\":[\"base\",\"reconstructed\"]}";
+    return "{\"abi\":1,\"version\":\"" MVO_FEL_VERSION "\",\"transport\":\"nut\",\"pixel_format\":\"gbrp16le\",\"cpu\":true,\"statistics\":1,\"device_selection\":1,\"seek\":1,\"fd_output\":1,\"timestamps\":[\"source\",\"zero\"],\"crop\":1,\"output_formats\":[\"gbrp16le\",\"yuv420p16le\",\"yuv420p10le\",\"yuv420p\"],\"dithers\":[\"none\",\"ordered\",\"blue\"],\"precision\":[\"exact\",\"standard\",\"fast\"],\"device_features\":[\"float64\"],\"frame_statistics\":1,\"measure\":[\"base\",\"mapped\",\"reconstructed\"],\"layers\":[\"base\",\"mapped\",\"reconstructed\"]}";
 #endif
 }
 int mvo_fel_classify(const uint8_t *nal, size_t size) {
@@ -1349,7 +1361,7 @@ int mvo_fel_set_output(mvo_fel_context *p, const char *format, const char *chrom
                     : name == "yuv420p10le" ? FEL_OUT_YUV420P10 : name == "yuv420p" ? FEL_OUT_YUV420P8 : -1;
     const int location = chroma_from_name(chroma), mode = dither_from_name(dither);
     if (value < 0 || location < 0 || mode < 0) return -1;
-    if (p->measure != mvo_fel_context::MEASURE_NONE && value != FEL_OUT_GBRP16) return -1;
+    if (p->measure_only && value != FEL_OUT_GBRP16) return -1;
     p->output_format.format = value; p->output_format.chroma = location; p->output_format.dither = mode;
     return 0;
 }
@@ -1364,7 +1376,7 @@ int mvo_fel_set_decoder_device(mvo_fel_context *p, const void *device) {
 int mvo_fel_set_crop(mvo_fel_context *p, int left, int top, int right, int bottom) {
     if (!p || p->started || left < 0 || top < 0 || right < 0 || bottom < 0 ||
         (left | top | right | bottom) & 1 || std::max({left, top, right, bottom}) > 8192) return -1;
-    if (p->measure != mvo_fel_context::MEASURE_NONE && (left | top | right | bottom)) return -1;
+    if (p->measure_only && (left | top | right | bottom)) return -1;
     p->crop = {left, top, right, bottom};
     return 0;
 }
@@ -1382,13 +1394,26 @@ int mvo_fel_set_frame_statistics(mvo_fel_context *p, const char *path) {
     p->stats_path = path;
     return 0;
 }
+namespace {
+int layer_from_name(const char *name) {
+    const std::string value(name ? name : "");
+    return value == "base" ? mvo_fel_context::LAYER_BASE : value == "mapped" ? mvo_fel_context::LAYER_MAPPED
+         : value == "reconstructed" ? mvo_fel_context::LAYER_RECONSTRUCTED : -1;
+}
+}
+int mvo_fel_set_layer(mvo_fel_context *p, const char *layer) {
+    const int value = layer_from_name(layer);
+    if (!p || p->started || value < 0) return -1;
+    p->layer = value;
+    return 0;
+}
 int mvo_fel_set_measure(mvo_fel_context *p, const char *layer) {
-    if (!p || p->started || !layer) return -1;
-    const std::string value(layer);
-    if (value != "base" && value != "reconstructed") return -1;
+    const int value = layer_from_name(layer);
+    if (!p || p->started || value < 0) return -1;
     // Statistiques sur le RGB PQ pleine image : sortie Y'CbCr et recadrage sans objet.
     if (p->output_format.format != FEL_OUT_GBRP16 || (p->crop[0] | p->crop[1] | p->crop[2] | p->crop[3])) return -1;
-    p->measure = value == "base" ? mvo_fel_context::MEASURE_BASE : mvo_fel_context::MEASURE_RECONSTRUCTED;
+    p->layer = value;
+    p->measure_only = true;
     return 0;
 }
 int mvo_fel_set_render_workers(mvo_fel_context *p, int count) {
@@ -1505,7 +1530,7 @@ int mvo_fel_run_fd(mvo_fel_context *p, intptr_t fd, mvo_fel_progress progress, v
     return run_context(p);
 }
 int mvo_fel_run(mvo_fel_context *p, mvo_fel_write write, mvo_fel_progress progress, void *opaque) {
-    if (!p || (!write && p->measure == mvo_fel_context::MEASURE_NONE)) return MVO_FEL_ERROR;
+    if (!p || (!write && !p->measure_only)) return MVO_FEL_ERROR;
     p->write = write; p->progress = progress; p->opaque = opaque;
     return run_context(p);
 }

@@ -59,7 +59,7 @@ cumulé sur le plan. Le premier plan commence à la première image produite, m�
 
 ## Mesure seule (0.4.0)
 
-Capacité `measure` (`["base", "reconstructed"]`), fonction `mvo_fel_set_measure(contexte, couche)`,
+Capacité `measure` (`["base", "mapped", "reconstructed"]`), fonction `mvo_fel_set_measure(contexte, couche)`,
 avant `mvo_fel_run`, avec `mvo_fel_set_frame_statistics` (obligatoire). Aucune image n'est produite :
 `mvo_fel_run` accepte un callback d'écriture nul et seules les statistiques sont écrites, au même
 format. Sortie RGB pleine image imposée (`set_output` Y'CbCr et `set_crop` refusés) ; refusée en
@@ -74,6 +74,11 @@ transport direct.
   entière, un seul plan.
 - `reconstructed` : image reconstruite (RPU + EL), statistiques identiques à celles de la
   production au bit près.
+- `mapped` : couche de base passée par les courbes du RPU de chaque image, résiduel désactivé
+  (lecture Dolby Vision sans EL : P8.1, MEL) ; sources Dolby Vision seulement, l'EL n'est pas décodée.
+
+Les mêmes couches sont produites en rendu normal (images écrites) par `mvo_fel_set_layer` (capacité
+`layers`), sans transport direct.
 
 Contrôle sur source propre (Tenzing, WEB DV + HDR10+, une minute, 10 plans) : MaxScl mesuré par
 plan / MaxScl du HDR10+ = 1,023 en médiane (p10 0,93, p90 1,05), AverageRGB 0,993 ; maxima à ±3 %

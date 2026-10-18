@@ -163,9 +163,11 @@ def measure(lib, fixture: Path, device: str) -> None:
     « reconstructed » : mêmes statistiques que la production ; « base » : BL lue comme un signal HDR10,
     RPU et EL ignorés pour les pixels (flux sans RPU ni EL : mêmes mesures, sans plans).
     """
-    assert json.loads(lib.mvo_fel_capabilities()).get("measure") == ["base", "reconstructed"]
-    lib.mvo_fel_set_measure.argtypes = [c.c_void_p, c.c_char_p]
-    lib.mvo_fel_set_measure.restype = c.c_int
+    capabilities = json.loads(lib.mvo_fel_capabilities())
+    assert capabilities.get("measure") == capabilities.get("layers") == ["base", "mapped", "reconstructed"]
+    for name in ("mvo_fel_set_measure", "mvo_fel_set_layer"):
+        getattr(lib, name).argtypes = [c.c_void_p, c.c_char_p]
+        getattr(lib, name).restype = c.c_int
     lib.mvo_fel_set_frame_statistics.argtypes = [c.c_void_p, c.c_char_p]
     lib.mvo_fel_set_frame_statistics.restype = c.c_int
     run_measure = lib.mvo_fel_run
@@ -178,7 +180,9 @@ def measure(lib, fixture: Path, device: str) -> None:
             assert lib.mvo_fel_set_device(handle, engine.encode("ascii")) == 0
             if stats is not None:
                 assert lib.mvo_fel_set_frame_statistics(handle, str(stats).encode()) == 0
-            if layer:
+            if layer and produce:
+                assert lib.mvo_fel_set_layer(handle, layer.encode()) == 0
+            elif layer:
                 assert lib.mvo_fel_set_measure(handle, layer.encode()) == 0
             written = []
             sink = WRITE(lambda _o, _p, n: written.append(n) or 0) if produce else no_write
@@ -190,6 +194,7 @@ def measure(lib, fixture: Path, device: str) -> None:
     handle = lib.mvo_fel_create(str(fixture.resolve()).encode(), 0, 2, 24000, 1001)
     try:
         assert lib.mvo_fel_set_measure(handle, b"bl") == -1 and lib.mvo_fel_set_measure(handle, None) == -1
+        assert lib.mvo_fel_set_layer(handle, b"el") == -1
         assert lib.mvo_fel_set_measure(handle, b"base") == 0
         # Mesure : RGB pleine image imposé.
         assert lib.mvo_fel_set_output(handle, b"yuv420p10le", b"topleft", b"none") == -1
@@ -233,8 +238,23 @@ def measure(lib, fixture: Path, device: str) -> None:
         assert [line for line in plain_lines if "scene_first" in line][0]["frames"] == 12
         strip = lambda f: {k: v for k, v in f.items() if k != "scene_start"}  # noqa: E731
         assert [strip(f) for f in plain_frames] == [strip(f) for f in frames]
-        # Reconstruite sur un flux sans EL : refusée (aucune couche à reconstruire).
+        # Reconstruite ou mapped sur un flux sans EL ni RPU : refusées.
         assert measured(plain, "reconstructed", "cpu", folder / "refused.jsonl")[0] != 0
+        assert measured(plain, "mapped", "cpu", folder / "refused-mapped.jsonl")[0] != 0
+        # Mapped : courbes du RPU sans résiduel, CPU = GPU, différente de l'image reconstruite (FEL).
+        mapped = {}
+        for engine in ("cpu", device):
+            path = folder / f"mapped-{engine}.jsonl"
+            result, _, error = measured(fixture.resolve(), "mapped", engine, path)
+            assert result == 0, (engine, error)
+            mapped[engine] = path.read_bytes()
+        assert mapped["cpu"] == mapped[device] and mapped["cpu"] != produced.read_bytes()
+        # Couches produites (pas de mesure seule) : images écrites, mêmes statistiques que la mesure.
+        for layer, reference in (("base", base["cpu"]), ("mapped", mapped["cpu"])):
+            path = folder / f"produced-{layer}.jsonl"
+            result, size, error = measured(fixture.resolve(), layer, "cpu", path, produce=True)
+            assert result == 0 and size > 12 * 256 * 144 * 6, (layer, error)
+            assert path.read_bytes() == reference, layer
 
 
 def strip_layers(fixture: Path, output: Path, units: dict[int, set[int]]) -> None:

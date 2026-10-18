@@ -16,6 +16,10 @@ Nouveau en 0.4.0 (en développement) : mesure seule (capacité `measure`, aucune
 de la couche de base lue comme un signal HDR10 (`base`, toute piste HEVC, Dolby Vision ou non) ou
 de l'image reconstruite (`reconstructed`), avec les mêmes chemins de rendu et de statistiques :
 MaxCLL/MaxFALL réels et courbes de luminance du HDR Studio de Muxiveo.
+Couches produites (capacité `layers`, `mvo_fel_set_layer`, aussi en rendu normal) :
+`reconstructed` (BL + RPU + EL, défaut), `base` (BL lue comme HDR10) et `mapped` (BL passée par
+les courbes du RPU sans résiduel, soit l'image d'une lecture P8.1) : le FEL Analyzer de Muxiveo
+compare `reconstructed` et `mapped` pour mesurer l'apport réel du FEL.
 
 Nouveau en 0.3.0 : statistiques de l'image produite (capacité `frame_statistics`,
 [format](docs/statistiques-image.md)) mesurées sur GPU ou CPU dans la zone active Dolby Vision,
