@@ -905,6 +905,87 @@ static struct pl_buffer_var float_array(const char *name, int count)
     return var;
 }
 
+/* Passe unique (un fil par ligne) : repli quand le tampon des valeurs par pixel de la version en deux
+ * passes dépasse la taille maximale d'un tampon de stockage du GPU (images au-delà de l'UHD). */
+static int frame_statistics_single_pass(struct fel_gpu *p, int x, int y, int w, int h,
+                                        struct fel_frame_stats *out)
+{
+    if (!p || !p->vk->gpu->glsl.compute || w <= 0 || h <= 0 || x < 0 || y < 0 || x + w > p->width ||
+        y + h > p->height) return 0;
+    pl_gpu gpu = p->vk->gpu;
+    if (!p->stats_eotf) {
+        p->stats_eotf = pl_buf_create(gpu, pl_buf_params(.size = 65536*sizeof(float), .storable = true,
+                                                           .initial_data = fel_stats_eotf()));
+        p->stats_edges = pl_buf_create(gpu, pl_buf_params(.size = (FEL_STATS_BINS + 1)*sizeof(float), .storable = true,
+                                                            .initial_data = fel_stats_edges()));
+        p->stats_hist = pl_buf_create(gpu, pl_buf_params(.size = 2*FEL_STATS_BINS*sizeof(uint32_t), .storable = true,
+                                                           .host_readable = true, .host_writable = true));
+        if (!p->stats_eotf || !p->stats_edges || !p->stats_hist) return 0;
+    }
+    if (p->stats_rows_cap < h) {
+        pl_buf_destroy(gpu, &p->stats_rows);
+        p->stats_rows = pl_buf_create(gpu, pl_buf_params(.size = (size_t)FEL_STATS_ROW_WORDS*h*sizeof(uint32_t),
+                                                           .storable = true, .host_readable = true));
+        if (!p->stats_rows) { p->stats_rows_cap = 0; return 0; }
+        p->stats_rows_cap = h;
+    }
+    static const uint32_t zeros[2*FEL_STATS_BINS];
+    pl_buf_write(gpu, p->stats_hist, 0, zeros, sizeof(zeros));
+    struct pl_buffer_var eotf = float_array("fel_eotf", 65536), edges = float_array("fel_edges", FEL_STATS_BINS + 1),
+                         hist = uint_array("fel_hist", 2*FEL_STATS_BINS, 0),
+                         rows = uint_array("fel_rows", FEL_STATS_ROW_WORDS*p->stats_rows_cap, 0);
+    const struct pl_shader_desc desc[5] = {
+        {.desc = {.name = "fel_rgb", .type = PL_DESC_SAMPLED_TEX}, .binding = {.object = p->target}},
+        {.desc = {.name = "fel_eotf_buf", .type = PL_DESC_BUF_STORAGE, .access = PL_DESC_ACCESS_READONLY},
+         .binding = {.object = p->stats_eotf}, .buffer_vars = &eotf, .num_buffer_vars = 1},
+        {.desc = {.name = "fel_edges_buf", .type = PL_DESC_BUF_STORAGE, .access = PL_DESC_ACCESS_READONLY},
+         .binding = {.object = p->stats_edges}, .buffer_vars = &edges, .num_buffer_vars = 1},
+        {.desc = {.name = "fel_hist_buf", .type = PL_DESC_BUF_STORAGE, .access = PL_DESC_ACCESS_READWRITE},
+         .binding = {.object = p->stats_hist}, .buffer_vars = &hist, .num_buffer_vars = 1},
+        {.desc = {.name = "fel_rows_buf", .type = PL_DESC_BUF_STORAGE, .access = PL_DESC_ACCESS_WRITEONLY},
+         .binding = {.object = p->stats_rows}, .buffer_vars = &rows, .num_buffer_vars = 1},
+    };
+    char body[2048];
+    snprintf(body, sizeof(body),
+        "uint t=gl_LocalInvocationIndex;"
+        "for(uint k=t;k<%du;k+=64u){fel_sh_m[k]=0u;fel_sh_y[k]=0u;}"
+        "barrier();"
+        "uint row=gl_GlobalInvocationID.x;"
+        "if(row<%du){uint mr=0u,mg=0u,mb=0u,le=0u;float sum=0.0;"
+        "for(int col=0;col<%d;++col){"
+        "uvec3 c=uvec3(round(texelFetch(fel_rgb,ivec2(%d+col,%d+int(row)),0).rgb*65535.0));"
+        "uint m=max(c.r,max(c.g,c.b));mr=max(mr,c.r);mg=max(mg,c.g);mb=max(mb,c.b);"
+        "atomicAdd(fel_sh_m[m>>6u],1u);sum+=fel_eotf[m];"
+        "precise float l=0.2627*fel_eotf[c.r]+0.678*fel_eotf[c.g]+0.0593*fel_eotf[c.b];"
+        "if(l<=100.0)le++;"
+        "uint lo=0u,hi=%du;while(hi-lo>1u){uint mid=(lo+hi)>>1u;if(fel_edges[mid]<=l)lo=mid;else hi=mid;}"
+        "atomicAdd(fel_sh_y[lo],1u);}"
+        "uint b=%du*row;fel_rows[b]=mr;fel_rows[b+1u]=mg;fel_rows[b+2u]=mb;"
+        "fel_rows[b+3u]=floatBitsToUint(sum);fel_rows[b+4u]=le;}"
+        "barrier();"
+        "for(uint k=t;k<%du;k+=64u){if(fel_sh_m[k]!=0u)atomicAdd(fel_hist[k],fel_sh_m[k]);"
+        "if(fel_sh_y[k]!=0u)atomicAdd(fel_hist[%du+k],fel_sh_y[k]);}",
+        FEL_STATS_BINS, h, w, x, y, FEL_STATS_BINS, FEL_STATS_ROW_WORDS, FEL_STATS_BINS, FEL_STATS_BINS);
+    char header[128];
+    snprintf(header, sizeof(header), "shared uint fel_sh_m[%d];shared uint fel_sh_y[%d];\n", FEL_STATS_BINS, FEL_STATS_BINS);
+    pl_shader sh = pl_dispatch_begin(p->dispatch);
+    int ok = pl_shader_custom(sh, &(struct pl_custom_shader){.header = header, .body = body,
+        .input = PL_SHADER_SIG_NONE, .output = PL_SHADER_SIG_NONE, .descriptors = desc, .num_descriptors = 5,
+        .compute = true, .compute_group_size = {64, 1}});
+    ok = ok && pl_dispatch_compute(p->dispatch, pl_dispatch_compute_params(.shader = &sh,
+                                   .dispatch_size = {(h + 63) / 64, 1, 1}));
+    pl_dispatch_abort(p->dispatch, &sh);
+    uint32_t *row_words = ok ? malloc((size_t)FEL_STATS_ROW_WORDS*h*sizeof(uint32_t)) : NULL;
+    fel_stats_reset(out);
+    ok = ok && row_words &&
+         pl_buf_read(gpu, p->stats_hist, 0, out->hist_maxrgb, sizeof(out->hist_maxrgb)) &&
+         pl_buf_read(gpu, p->stats_hist, sizeof(out->hist_maxrgb), out->hist_y, sizeof(out->hist_y)) &&
+         pl_buf_read(gpu, p->stats_rows, 0, row_words, (size_t)FEL_STATS_ROW_WORDS*h*sizeof(uint32_t));
+    if (ok) fel_stats_add_rows(out, row_words, h, w);
+    free(row_words);
+    return ok;
+}
+
 /* Statistiques de l'image finale (frame_stats.h) sur la fenêtre (x, y, w, h) de la cible RGB PQ, en deux
  * passes. A : un groupe de 64 fils par ligne ; histogrammes en mémoire partagée cumulés en mémoire
  * globale, maxima et pixels Y ≤ 100 nits de la ligne (entiers : ordre indifférent), maxRGB linéaire de
@@ -932,11 +1013,16 @@ int fel_gpu_frame_statistics(void *context, int x, int y, int w, int h, struct f
         if (!p->stats_rows) { p->stats_rows_cap = 0; return 0; }
         p->stats_rows_cap = h;
     }
+    /* MVO_FEL_STATS_SINGLE_PASS : passe unique imposée (comparaison des deux chemins en validation). */
+    static int forced = -1;
+    if (forced < 0) forced = getenv("MVO_FEL_STATS_SINGLE_PASS") != NULL;
+    if (forced || (size_t)w*h*sizeof(float) > gpu->limits.max_ssbo_size)
+        return frame_statistics_single_pass(p, x, y, w, h, out);
     if (p->stats_vals_cap < (size_t)w*h) {
         pl_buf_destroy(gpu, &p->stats_vals);
         p->stats_vals = pl_buf_create(gpu, pl_buf_params(.size = (size_t)w*h*sizeof(float), .storable = true));
-        if (!p->stats_vals) { p->stats_vals_cap = 0; return 0; }
-        p->stats_vals_cap = (size_t)w*h;
+        p->stats_vals_cap = p->stats_vals ? (size_t)w*h : 0;
+        if (!p->stats_vals) return frame_statistics_single_pass(p, x, y, w, h, out);
     }
     static const uint32_t zeros[2*FEL_STATS_BINS];
     pl_buf_write(gpu, p->stats_hist, 0, zeros, sizeof(zeros));

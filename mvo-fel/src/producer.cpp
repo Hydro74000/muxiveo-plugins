@@ -1169,19 +1169,27 @@ struct mvo_fel_context {
     // Session de capture (mvo_fel_capture_pair, FEL Analyzer) : source, décodeurs et contexte GPU ouverts
     // une fois ; chaque appel se repositionne et livre les deux couches d'un seul décodage.
     bool capturing = false;
+    std::string capture_failure;  // échec d'ouverture, renvoyé aux appels suivants
     Worker capture_worker;
     void capture_open() {
         if (capturing) return;
+        if (!capture_failure.empty()) throw Failure(capture_failure);
         if (started) throw Failure("Contexte déjà exécuté");
         if (layer != LAYER_RECONSTRUCTED || measure_only || !stats_path.empty())
             throw Failure("Capture : couche reconstruite, sans mesure ni statistiques");
         if (output_format.format == FEL_OUT_GBRP16) throw Failure("Capture : sortie Y'CbCr requise");
-        started = true; capturing = true; began = Clock::now();
-        { Timer timer(timing[0]); open(); }
-        if (raw) throw Failure("Capture : conteneur requis (positionnement)");
+        started = true; began = Clock::now();
+        try {
+            { Timer timer(timing[0]); open(); }
+            if (raw) throw Failure("Capture : conteneur requis (positionnement)");
+        } catch (const std::exception &failure) {
+            capture_failure = failure.what();
+            throw;
+        }
 #ifdef MVO_FEL_VULKAN_PROTOTYPE
         capture_worker.gpu = gpu_prototype;
 #endif
+        capturing = true;
     }
     size_t capture_frame_size() {
         capture_open();
@@ -1629,6 +1637,7 @@ size_t mvo_fel_capture_frame_size(mvo_fel_context *p) {
     try { return p->capture_frame_size(); }
     catch (const Failure &failure) { p->error = failure.what(); }
     catch (const std::exception &failure) { p->error = failure.what(); }
+    catch (...) { p->error = "Erreur native inconnue"; }
     return 0;
 }
 int mvo_fel_capture_pair(mvo_fel_context *p, int64_t start_us, int count, uint8_t *buffer, size_t capacity) {
