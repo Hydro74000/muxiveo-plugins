@@ -30,3 +30,5 @@ _mvo_fel_set_frame_statistics
 _mvo_fel_set_measure
 _mvo_fel_set_measure_sampling
 _mvo_fel_set_layer
+_mvo_fel_capture_frame_size
+_mvo_fel_capture_pair

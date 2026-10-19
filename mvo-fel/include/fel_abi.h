@@ -86,6 +86,17 @@ MVO_FEL_EXPORT int mvo_fel_set_measure(mvo_fel_context *, const char *layer);
  * (horodatages) ; chaque ligne de statistiques porte son horodatage (time_s) et le callback de progression
  * reçoit la position dans le flux (images) au lieu du nombre d'images mesurées. */
 MVO_FEL_EXPORT int mvo_fel_set_measure_sampling(mvo_fel_context *, const char *mode);
+/* Extension additive ABI 1 (capacité capture : ["pair"]) : session de capture (FEL Analyzer). Après
+ * mvo_fel_create et les réglages (set_output Y'CbCr obligatoire, set_device, set_precision, set_crop),
+ * sans run : le premier appel ouvre la source, les décodeurs et le GPU, conservés jusqu'à destroy.
+ * capture_frame_size : octets d'une image produite (0 en cas d'erreur, voir mvo_fel_error).
+ * capture_pair : positionnement à start_us (sémantique set_start), décodage unique BL/EL/RPU puis, pour
+ * chacune des count images suivantes, l'image reconstruite puis la couche mapped (même image, résiduel
+ * désactivé : mêmes octets que set_layer("mapped")), plans contigus, dans buffer (au moins
+ * 2 × count × capture_frame_size octets). Appels successifs sur un seul thread ; cancel est définitif. */
+MVO_FEL_EXPORT size_t mvo_fel_capture_frame_size(mvo_fel_context *);
+MVO_FEL_EXPORT int mvo_fel_capture_pair(mvo_fel_context *, int64_t start_us, int count, uint8_t *buffer,
+    size_t capacity);
 MVO_FEL_EXPORT int mvo_fel_set_output(mvo_fel_context *, const char *pixel_format,
     const char *chroma_location, const char *dither);
 /* Mesures locales après run ; pipe_s est inclus dans nut_s. */

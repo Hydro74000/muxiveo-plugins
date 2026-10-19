@@ -53,6 +53,7 @@ size_t fel_gpu_devices(char *, size_t, int);
 int fel_gpu_device_name(void *, char *, size_t);
 int fel_gpu_render(void *, const AVDOVIMetadata *, const AVFrame *, const AVFrame *, uint16_t *);
 int fel_gpu_render_planar(void *, const AVDOVIMetadata *, const AVFrame *, const AVFrame *, AVFrame *);
+int fel_gpu_render_target_only(void *, const AVDOVIMetadata *, const AVFrame *, const AVFrame *);
 void *fel_gpu_import(const void *, int, int);
 int fel_gpu_render_vulkan(void *, const AVDOVIMetadata *, const AVFrame *, const AVFrame *, AVFrame *);
 int fel_gpu_render_yuv(void *, const AVDOVIMetadata *, const AVFrame *, const AVFrame *, const fel_output *, AVFrame *);
@@ -1073,7 +1074,10 @@ struct mvo_fel_context {
             Frame held_base, held_el;  // images GPU d'origine : job.metadata pointe dans leurs données
 #ifdef MVO_FEL_VULKAN_PROTOTYPE
             if (w.gpu) {
-                const bool ok = yuv
+                // Mesure seule : statistiques lues sur la cible du GPU, aucune image rapatriée.
+                const bool ok = measure_only
+                    ? fel_gpu_render_target_only(w.gpu, job.metadata, job.base.get(), job.enhancement.get())
+                    : yuv
                     ? fel_gpu_render_yuv(w.gpu, job.metadata, job.base.get(), job.enhancement.get(),
                                          &output_format, rgb)
                     : fel_gpu_render_planar(w.gpu, job.metadata, job.base.get(), job.enhancement.get(), rgb);
@@ -1161,6 +1165,74 @@ struct mvo_fel_context {
         ++frames;
         // Images clés : position dans le flux (images) ; sinon nombre d'images produites.
         if (progress) progress(opaque, keyframes_only ? int64_t(std::llround(item.time_s * av_q2d(fps))) : frames);
+    }
+    // Session de capture (mvo_fel_capture_pair, FEL Analyzer) : source, décodeurs et contexte GPU ouverts
+    // une fois ; chaque appel se repositionne et livre les deux couches d'un seul décodage.
+    bool capturing = false;
+    Worker capture_worker;
+    void capture_open() {
+        if (capturing) return;
+        if (started) throw Failure("Contexte déjà exécuté");
+        if (layer != LAYER_RECONSTRUCTED || measure_only || !stats_path.empty())
+            throw Failure("Capture : couche reconstruite, sans mesure ni statistiques");
+        if (output_format.format == FEL_OUT_GBRP16) throw Failure("Capture : sortie Y'CbCr requise");
+        started = true; capturing = true; began = Clock::now();
+        { Timer timer(timing[0]); open(); }
+        if (raw) throw Failure("Capture : conteneur requis (positionnement)");
+#ifdef MVO_FEL_VULKAN_PROTOTYPE
+        capture_worker.gpu = gpu_prototype;
+#endif
+    }
+    size_t capture_frame_size() {
+        capture_open();
+        const int w = stream->codecpar->width - crop[0] - crop[2], h = stream->codecpar->height - crop[1] - crop[3];
+        const int size = w > 0 && h > 0 ? av_image_get_buffer_size(pixel_format(), w, h, 1) : -1;
+        if (size <= 0) throw Failure("Capture : dimensions invalides");
+        return size_t(size);
+    }
+    // Couche « mapped » de la même image : RPU de l'image, résiduel désactivé, plan EL neutre (non lu),
+    // comme pair_base en couche mapped.
+    std::unique_ptr<Job> mapped_job(const Job &job) {
+        Frame base(av_frame_clone(job.base.get()));
+        if (!base) throw std::bad_alloc();
+        disable_residual(*base);
+        Frame enhancement(av_frame_clone(base.get()));
+        if (!enhancement) throw std::bad_alloc();
+        const auto *sd = av_frame_get_side_data(base.get(), AV_FRAME_DATA_DOVI_METADATA);
+        const auto *metadata = reinterpret_cast<const AVDOVIMetadata *>(sd->data);
+        muxiveo::fel::Mapping mapping(*metadata);
+        return std::unique_ptr<Job>(new Job{std::move(base), std::move(enhancement), metadata, std::move(mapping),
+                                            job.pts, job.duration, job.timebase, job.scene_start, job.active});
+    }
+    void capture_pair(int64_t at_us, int count, uint8_t *buffer, size_t capacity) {
+        const size_t frame_size = capture_frame_size();
+        if (count <= 0 || !buffer || capacity / 2 / frame_size < size_t(count))
+            throw Failure("Capture : tampon trop petit");
+        check_cancelled();
+        // Repositionnement : files et décodeurs vidés, appariement et horodatages repris à zéro.
+        bl.ready.clear(); el.ready.clear();
+        avcodec_flush_buffers(bl.decoder); av_bsf_flush(bl.split);
+        avcodec_flush_buffers(el.decoder); av_bsf_flush(el.split);
+        leading = el_leading = 0; leading_done = false;
+        last_pts = first_pts = AV_NOPTS_VALUE;
+        start_us = std::max<int64_t>(0, at_us);
+        seek();
+        std::vector<std::unique_ptr<Job>> jobs;
+        decode_all([&](std::unique_ptr<Job> job) {
+            jobs.push_back(std::move(job));
+            return int(jobs.size()) < count;
+        });
+        if (int(jobs.size()) < count) throw Failure("Capture : images manquantes après la position demandée");
+        uint8_t *out = buffer;
+        for (auto &job : jobs) {
+            auto mapped = mapped_job(*job);
+            for (Job *item : {job.get(), mapped.get()}) {
+                const auto rendered = render(*item, capture_worker);
+                std::memcpy(out, rendered->packet->data, frame_size);
+                out += frame_size;
+            }
+            ++frames;
+        }
     }
     // Trois étages bornés : décodage/appariement, rendu, écriture sur le thread appelant
     // (contrat ABI des callbacks). Une erreur ou l'annulation abandonne les files.
@@ -1299,9 +1371,9 @@ struct mvo_fel_context {
 uint32_t mvo_fel_abi_version() { return MVO_FEL_ABI; }
 const char *mvo_fel_capabilities() {
 #ifdef MVO_FEL_VULKAN_PROTOTYPE
-    return "{\"abi\":1,\"version\":\"" MVO_FEL_VERSION "\",\"transport\":\"nut\",\"pixel_format\":\"gbrp16le\",\"cpu\":true,\"backend\":\"vulkan-prototype\",\"statistics\":1,\"device_selection\":1,\"seek\":1,\"fd_output\":1,\"timestamps\":[\"source\",\"zero\"],\"crop\":1,\"output_formats\":[\"gbrp16le\",\"yuv420p16le\",\"yuv420p10le\",\"yuv420p\"],\"dithers\":[\"none\",\"ordered\",\"blue\"],\"direct_formats\":[\"p010\"],\"precision\":[\"exact\",\"standard\",\"fast\"],\"device_features\":[\"float64\"],\"render_workers\":[1,4],\"frame_statistics\":1,\"measure\":[\"base\",\"mapped\",\"reconstructed\"],\"layers\":[\"base\",\"mapped\",\"reconstructed\"],\"measure_sampling\":[\"all\",\"keyframes\"],\"experimental\":true}";
+    return "{\"abi\":1,\"version\":\"" MVO_FEL_VERSION "\",\"transport\":\"nut\",\"pixel_format\":\"gbrp16le\",\"cpu\":true,\"backend\":\"vulkan-prototype\",\"statistics\":1,\"device_selection\":1,\"seek\":1,\"fd_output\":1,\"timestamps\":[\"source\",\"zero\"],\"crop\":1,\"output_formats\":[\"gbrp16le\",\"yuv420p16le\",\"yuv420p10le\",\"yuv420p\"],\"dithers\":[\"none\",\"ordered\",\"blue\"],\"direct_formats\":[\"p010\"],\"precision\":[\"exact\",\"standard\",\"fast\"],\"device_features\":[\"float64\"],\"render_workers\":[1,4],\"frame_statistics\":1,\"measure\":[\"base\",\"mapped\",\"reconstructed\"],\"layers\":[\"base\",\"mapped\",\"reconstructed\"],\"measure_sampling\":[\"all\",\"keyframes\"],\"capture\":[\"pair\"],\"experimental\":true}";
 #else
-    return "{\"abi\":1,\"version\":\"" MVO_FEL_VERSION "\",\"transport\":\"nut\",\"pixel_format\":\"gbrp16le\",\"cpu\":true,\"statistics\":1,\"device_selection\":1,\"seek\":1,\"fd_output\":1,\"timestamps\":[\"source\",\"zero\"],\"crop\":1,\"output_formats\":[\"gbrp16le\",\"yuv420p16le\",\"yuv420p10le\",\"yuv420p\"],\"dithers\":[\"none\",\"ordered\",\"blue\"],\"precision\":[\"exact\",\"standard\",\"fast\"],\"device_features\":[\"float64\"],\"frame_statistics\":1,\"measure\":[\"base\",\"mapped\",\"reconstructed\"],\"layers\":[\"base\",\"mapped\",\"reconstructed\"],\"measure_sampling\":[\"all\",\"keyframes\"]}";
+    return "{\"abi\":1,\"version\":\"" MVO_FEL_VERSION "\",\"transport\":\"nut\",\"pixel_format\":\"gbrp16le\",\"cpu\":true,\"statistics\":1,\"device_selection\":1,\"seek\":1,\"fd_output\":1,\"timestamps\":[\"source\",\"zero\"],\"crop\":1,\"output_formats\":[\"gbrp16le\",\"yuv420p16le\",\"yuv420p10le\",\"yuv420p\"],\"dithers\":[\"none\",\"ordered\",\"blue\"],\"precision\":[\"exact\",\"standard\",\"fast\"],\"device_features\":[\"float64\"],\"frame_statistics\":1,\"measure\":[\"base\",\"mapped\",\"reconstructed\"],\"layers\":[\"base\",\"mapped\",\"reconstructed\"],\"measure_sampling\":[\"all\",\"keyframes\"],\"capture\":[\"pair\"]}";
 #endif
 }
 int mvo_fel_classify(const uint8_t *nal, size_t size) {
@@ -1551,6 +1623,22 @@ int mvo_fel_run(mvo_fel_context *p, mvo_fel_write write, mvo_fel_progress progre
     if (!p || (!write && !p->measure_only)) return MVO_FEL_ERROR;
     p->write = write; p->progress = progress; p->opaque = opaque;
     return run_context(p);
+}
+size_t mvo_fel_capture_frame_size(mvo_fel_context *p) {
+    if (!p) return 0;
+    try { return p->capture_frame_size(); }
+    catch (const Failure &failure) { p->error = failure.what(); }
+    catch (const std::exception &failure) { p->error = failure.what(); }
+    return 0;
+}
+int mvo_fel_capture_pair(mvo_fel_context *p, int64_t start_us, int count, uint8_t *buffer, size_t capacity) {
+    if (!p) return MVO_FEL_ERROR;
+    int result = MVO_FEL_OK;
+    try { p->capture_pair(start_us, count, buffer, capacity); }
+    catch (const Failure &failure) { p->error = failure.what(); result = failure.status; }
+    catch (const std::exception &failure) { p->error = failure.what(); result = MVO_FEL_ERROR; }
+    catch (...) { p->error = "Erreur native inconnue"; result = MVO_FEL_ERROR; }
+    return p->cancelled.load() ? MVO_FEL_CANCELLED : result;
 }
 void mvo_fel_cancel(mvo_fel_context *p) { if (p) p->cancelled.store(true); }
 const char *mvo_fel_error(const mvo_fel_context *p) { return p ? p->error.c_str() : "Contexte absent"; }

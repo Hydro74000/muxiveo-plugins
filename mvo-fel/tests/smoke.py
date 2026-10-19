@@ -104,8 +104,62 @@ def smoke(library: Path, fixture: Path, output: Path | None = None, device: str 
     missing_layers(lib, fixture, device)
     frame_statistics(lib, fixture, device)
     measure(lib, fixture, device)
+    capture(lib, fixture, device)
     print("ABI, NUT, 12 images/B-frames, seek, descripteur, Y'CbCr, précisions, AU sans RPU ni EL, statistiques, mesure, "
-          "fermeture aval, annulation, piste invalide et erreur de lecture : OK")
+          "capture, fermeture aval, annulation, piste invalide et erreur de lecture : OK")
+
+
+def capture(lib, fixture: Path, device: str) -> None:
+    """Session de capture (capacité capture) : refus, CPU = GPU au bit près, positionnements répétés.
+
+    Positionnement : source en conteneur (MVO_FEL_TEST_CLIP) ; le flux brut de test est refusé.
+    """
+    assert json.loads(lib.mvo_fel_capabilities()).get("capture") == ["pair"]
+    lib.mvo_fel_capture_frame_size.argtypes = [c.c_void_p]
+    lib.mvo_fel_capture_frame_size.restype = c.c_size_t
+    lib.mvo_fel_capture_pair.argtypes = [c.c_void_p, c.c_int64, c.c_int, c.c_void_p, c.c_size_t]
+    lib.mvo_fel_capture_pair.restype = c.c_int
+
+    def session(path: Path, engine: str, output: bytes = b"yuv420p10le"):
+        handle = lib.mvo_fel_create(str(path).encode(), 0, 4, 24000, 1001)
+        assert handle
+        assert lib.mvo_fel_set_output(handle, output, b"topleft", b"none") == 0
+        assert lib.mvo_fel_set_device(handle, engine.encode("ascii")) == 0
+        assert lib.mvo_fel_set_precision(handle, b"exact") == 0
+        return handle
+
+    # Sortie RGB ou flux brut (pas de positionnement) : refusés, erreur lisible.
+    for path, output in ((fixture.resolve(), b"gbrp16le"), (fixture.resolve(), b"yuv420p10le")):
+        handle = session(path, "cpu", output)
+        try:
+            assert lib.mvo_fel_capture_frame_size(handle) == 0 and lib.mvo_fel_error(handle)
+        finally:
+            lib.mvo_fel_destroy(handle)
+    clip = os.environ.get("MVO_FEL_TEST_CLIP")
+    if not clip:
+        return
+    container = Path(clip).resolve()
+    captured = {}
+    for engine in ("cpu", device):
+        handle = session(container, engine)
+        try:
+            size = lib.mvo_fel_capture_frame_size(handle)
+            assert size > 0, lib.mvo_fel_error(handle)
+            small = c.create_string_buffer(size)
+            assert lib.mvo_fel_capture_pair(handle, 0, 1, small, size) != 0  # deux couches : 2 × size requis
+            runs = []
+            for start in (200000, 600000, 200000):
+                buffer = c.create_string_buffer(4 * size)
+                result = lib.mvo_fel_capture_pair(handle, start, 2, buffer, 4 * size)
+                assert result == 0, (engine, lib.mvo_fel_error(handle))
+                runs.append(buffer.raw)
+            assert runs[0] == runs[2], engine  # même position : mêmes octets après un autre positionnement
+            frames = [runs[0][k*size:(k + 1)*size] for k in range(4)]
+            assert frames[0] != frames[1]  # reconstruite ≠ mapped (FEL)
+            captured[engine] = runs
+        finally:
+            lib.mvo_fel_destroy(handle)
+    assert captured["cpu"] == captured[device]
 
 
 def frame_statistics(lib, fixture: Path, device: str) -> None:

@@ -70,8 +70,9 @@ struct fel_gpu {
     uint32_t fixed_words[FEL_FIXED_WORDS];
     long long rescued, undecided;
     /* Statistiques de l'image finale (frame_stats.h) : table EOTF, bornes de Y, histogrammes, lignes. */
-    pl_buf stats_eotf, stats_edges, stats_hist, stats_rows;
+    pl_buf stats_eotf, stats_edges, stats_hist, stats_rows, stats_vals;
     int stats_rows_cap;
+    size_t stats_vals_cap;
 };
 
 static void collect_timers(struct fel_gpu *p)
@@ -212,6 +213,7 @@ void fel_gpu_destroy(void *context)
         pl_buf_destroy(p->vk->gpu, &p->stats_edges);
         pl_buf_destroy(p->vk->gpu, &p->stats_hist);
         pl_buf_destroy(p->vk->gpu, &p->stats_rows);
+        pl_buf_destroy(p->vk->gpu, &p->stats_vals);
         for (int k = 0; k < 5; ++k) pl_timer_destroy(p->vk->gpu, &p->timers[k]);
     }
     pl_dispatch_destroy(&p->dispatch);
@@ -903,9 +905,11 @@ static struct pl_buffer_var float_array(const char *name, int count)
     return var;
 }
 
-/* Statistiques de l'image finale (frame_stats.h) sur la fenêtre (x, y, w, h) de la cible RGB PQ :
- * une invocation par ligne (même calcul et même ordre que fel_stats_row), histogrammes en mémoire
- * partagée puis cumulés en mémoire globale, résultats des lignes relus et assemblés par l'hôte. */
+/* Statistiques de l'image finale (frame_stats.h) sur la fenêtre (x, y, w, h) de la cible RGB PQ, en deux
+ * passes. A : un groupe de 64 fils par ligne ; histogrammes en mémoire partagée cumulés en mémoire
+ * globale, maxima et pixels Y ≤ 100 nits de la ligne (entiers : ordre indifférent), maxRGB linéaire de
+ * chaque pixel rangé. B : un fil par ligne somme ces valeurs dans l'ordre des colonnes, comme
+ * fel_stats_row : mêmes résultats au bit près que le CPU et que la passe unique précédente. */
 int fel_gpu_frame_statistics(void *context, int x, int y, int w, int h, struct fel_frame_stats *out)
 {
     struct fel_gpu *p = context;
@@ -928,12 +932,19 @@ int fel_gpu_frame_statistics(void *context, int x, int y, int w, int h, struct f
         if (!p->stats_rows) { p->stats_rows_cap = 0; return 0; }
         p->stats_rows_cap = h;
     }
+    if (p->stats_vals_cap < (size_t)w*h) {
+        pl_buf_destroy(gpu, &p->stats_vals);
+        p->stats_vals = pl_buf_create(gpu, pl_buf_params(.size = (size_t)w*h*sizeof(float), .storable = true));
+        if (!p->stats_vals) { p->stats_vals_cap = 0; return 0; }
+        p->stats_vals_cap = (size_t)w*h;
+    }
     static const uint32_t zeros[2*FEL_STATS_BINS];
     pl_buf_write(gpu, p->stats_hist, 0, zeros, sizeof(zeros));
     struct pl_buffer_var eotf = float_array("fel_eotf", 65536), edges = float_array("fel_edges", FEL_STATS_BINS + 1),
                          hist = uint_array("fel_hist", 2*FEL_STATS_BINS, 0),
-                         rows = uint_array("fel_rows", FEL_STATS_ROW_WORDS*p->stats_rows_cap, 0);
-    const struct pl_shader_desc desc[5] = {
+                         rows = uint_array("fel_rows", FEL_STATS_ROW_WORDS*p->stats_rows_cap, 0),
+                         vals = float_array("fel_vals", (int)p->stats_vals_cap);
+    const struct pl_shader_desc desc_a[6] = {
         {.desc = {.name = "fel_rgb", .type = PL_DESC_SAMPLED_TEX}, .binding = {.object = p->target}},
         {.desc = {.name = "fel_eotf_buf", .type = PL_DESC_BUF_STORAGE, .access = PL_DESC_ACCESS_READONLY},
          .binding = {.object = p->stats_eotf}, .buffer_vars = &eotf, .num_buffer_vars = 1},
@@ -943,37 +954,65 @@ int fel_gpu_frame_statistics(void *context, int x, int y, int w, int h, struct f
          .binding = {.object = p->stats_hist}, .buffer_vars = &hist, .num_buffer_vars = 1},
         {.desc = {.name = "fel_rows_buf", .type = PL_DESC_BUF_STORAGE, .access = PL_DESC_ACCESS_WRITEONLY},
          .binding = {.object = p->stats_rows}, .buffer_vars = &rows, .num_buffer_vars = 1},
+        {.desc = {.name = "fel_vals_buf", .type = PL_DESC_BUF_STORAGE, .access = PL_DESC_ACCESS_WRITEONLY},
+         .binding = {.object = p->stats_vals}, .buffer_vars = &vals, .num_buffer_vars = 1},
     };
-    char body[2048];
+    char body[2560];
     snprintf(body, sizeof(body),
         "uint t=gl_LocalInvocationIndex;"
         "for(uint k=t;k<%du;k+=64u){fel_sh_m[k]=0u;fel_sh_y[k]=0u;}"
+        "if(t<4u)fel_sh_row[t]=0u;"
         "barrier();"
-        "uint row=gl_GlobalInvocationID.x;"
-        "if(row<%du){uint mr=0u,mg=0u,mb=0u,le=0u;float sum=0.0;"
-        "for(int col=0;col<%d;++col){"
+        "uint row=gl_WorkGroupID.x;uint mr=0u,mg=0u,mb=0u,le=0u;"
+        "for(int col=int(t);col<%d;col+=64){"
         "uvec3 c=uvec3(round(texelFetch(fel_rgb,ivec2(%d+col,%d+int(row)),0).rgb*65535.0));"
         "uint m=max(c.r,max(c.g,c.b));mr=max(mr,c.r);mg=max(mg,c.g);mb=max(mb,c.b);"
-        "atomicAdd(fel_sh_m[m>>6u],1u);sum+=fel_eotf[m];"
+        "atomicAdd(fel_sh_m[m>>6u],1u);fel_vals[row*%du+uint(col)]=fel_eotf[m];"
         "precise float l=0.2627*fel_eotf[c.r]+0.678*fel_eotf[c.g]+0.0593*fel_eotf[c.b];"
         "if(l<=100.0)le++;"
         "uint lo=0u,hi=%du;while(hi-lo>1u){uint mid=(lo+hi)>>1u;if(fel_edges[mid]<=l)lo=mid;else hi=mid;}"
         "atomicAdd(fel_sh_y[lo],1u);}"
-        "uint b=%du*row;fel_rows[b]=mr;fel_rows[b+1u]=mg;fel_rows[b+2u]=mb;"
-        "fel_rows[b+3u]=floatBitsToUint(sum);fel_rows[b+4u]=le;}"
+        "atomicMax(fel_sh_row[0],mr);atomicMax(fel_sh_row[1],mg);atomicMax(fel_sh_row[2],mb);"
+        "atomicAdd(fel_sh_row[3],le);"
         "barrier();"
         "for(uint k=t;k<%du;k+=64u){if(fel_sh_m[k]!=0u)atomicAdd(fel_hist[k],fel_sh_m[k]);"
-        "if(fel_sh_y[k]!=0u)atomicAdd(fel_hist[%du+k],fel_sh_y[k]);}",
-        FEL_STATS_BINS, h, w, x, y, FEL_STATS_BINS, FEL_STATS_ROW_WORDS, FEL_STATS_BINS, FEL_STATS_BINS);
-    char header[128];
-    snprintf(header, sizeof(header), "shared uint fel_sh_m[%d];shared uint fel_sh_y[%d];\n", FEL_STATS_BINS, FEL_STATS_BINS);
+        "if(fel_sh_y[k]!=0u)atomicAdd(fel_hist[%du+k],fel_sh_y[k]);}"
+        "if(t==0u){uint b=%du*row;fel_rows[b]=fel_sh_row[0];fel_rows[b+1u]=fel_sh_row[1];"
+        "fel_rows[b+2u]=fel_sh_row[2];fel_rows[b+4u]=fel_sh_row[3];}",
+        FEL_STATS_BINS, w, x, y, w, FEL_STATS_BINS, FEL_STATS_BINS, FEL_STATS_BINS, FEL_STATS_ROW_WORDS);
+    char header[160];
+    snprintf(header, sizeof(header),
+             "shared uint fel_sh_m[%d];shared uint fel_sh_y[%d];shared uint fel_sh_row[4];\n",
+             FEL_STATS_BINS, FEL_STATS_BINS);
     pl_shader sh = pl_dispatch_begin(p->dispatch);
     int ok = pl_shader_custom(sh, &(struct pl_custom_shader){.header = header, .body = body,
-        .input = PL_SHADER_SIG_NONE, .output = PL_SHADER_SIG_NONE, .descriptors = desc, .num_descriptors = 5,
+        .input = PL_SHADER_SIG_NONE, .output = PL_SHADER_SIG_NONE, .descriptors = desc_a, .num_descriptors = 6,
         .compute = true, .compute_group_size = {64, 1}});
-    ok = ok && pl_dispatch_compute(p->dispatch, pl_dispatch_compute_params(.shader = &sh,
-                                   .dispatch_size = {(h + 63) / 64, 1, 1}));
+    ok = ok && pl_dispatch_compute(p->dispatch, pl_dispatch_compute_params(.shader = &sh, .dispatch_size = {h, 1, 1}));
     pl_dispatch_abort(p->dispatch, &sh);
+    /* Passe B : somme des valeurs de chaque ligne, dans l'ordre des colonnes. */
+    const struct pl_shader_desc desc_b[2] = {
+        {.desc = {.name = "fel_vals_buf", .type = PL_DESC_BUF_STORAGE, .access = PL_DESC_ACCESS_READONLY},
+         .binding = {.object = p->stats_vals}, .buffer_vars = &vals, .num_buffer_vars = 1},
+        {.desc = {.name = "fel_rows_buf", .type = PL_DESC_BUF_STORAGE, .access = PL_DESC_ACCESS_READWRITE},
+         .binding = {.object = p->stats_rows}, .buffer_vars = &rows, .num_buffer_vars = 1},
+    };
+    char sum_body[512];
+    snprintf(sum_body, sizeof(sum_body),
+        "uint row=gl_GlobalInvocationID.x;"
+        "if(row<%du){float sum=0.0;uint base=row*%du;"
+        "for(uint col=0u;col<%du;++col)sum+=fel_vals[base+col];"
+        "fel_rows[%du*row+3u]=floatBitsToUint(sum);}",
+        h, w, w, FEL_STATS_ROW_WORDS);
+    if (ok) {
+        sh = pl_dispatch_begin(p->dispatch);
+        ok = pl_shader_custom(sh, &(struct pl_custom_shader){.body = sum_body,
+            .input = PL_SHADER_SIG_NONE, .output = PL_SHADER_SIG_NONE, .descriptors = desc_b, .num_descriptors = 2,
+            .compute = true, .compute_group_size = {64, 1}});
+        ok = ok && pl_dispatch_compute(p->dispatch, pl_dispatch_compute_params(.shader = &sh,
+                                       .dispatch_size = {(h + 63) / 64, 1, 1}));
+        pl_dispatch_abort(p->dispatch, &sh);
+    }
     uint32_t *row_words = ok ? malloc((size_t)FEL_STATS_ROW_WORDS*h*sizeof(uint32_t)) : NULL;
     fel_stats_reset(out);
     ok = ok && row_words &&
@@ -1709,6 +1748,16 @@ static void downloaded(void *unused) { (void)unused; }
 
 // Quantification identique au chemin RGBA16 ; séparation GBR sur GPU et
 // rapatriement direct dans le paquet NUT, sans déinterleave ni copie CPU.
+/* Mesure seule : image rendue dans la cible RGB du GPU (lue ensuite par fel_gpu_frame_statistics),
+ * sans copie vers l'hôte ni attente de fin du GPU : mêmes valeurs que fel_gpu_render_planar. */
+int fel_gpu_render_target_only(void *context, const AVDOVIMetadata *metadata, const AVFrame *bl, const AVFrame *el)
+{
+    struct fel_gpu *p = context;
+    if (!render_target(p, metadata, bl, el)) return 0;
+    collect_timers(p);
+    return 1;
+}
+
 int fel_gpu_render_planar(void *context, const AVDOVIMetadata *metadata,
                          const AVFrame *bl, const AVFrame *el, AVFrame *output)
 {

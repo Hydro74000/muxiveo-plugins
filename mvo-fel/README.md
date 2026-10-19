@@ -4,13 +4,24 @@ Extension facultative de Muxiveo. Le moteur reconstruit l'apport de la couche FE
 dans les pixels avant les filtres, le tone mapping, l'interpolation et l'encodage,
 indépendamment de la conservation du RPU en sortie.
 
-**Préversion `mvo-fel-v0.4.0`.** Trois précisions : Lent (exact certifié, identique au CPU au bit
+**Préversion `mvo-fel-v0.6.0`.** Trois précisions : Lent (exact certifié, identique au CPU au bit
 près), Standard (≤ 1 code 16 bits) et Rapide (float32). Le Lent en virgule fixe utilise une
 [EOTF à deux niveaux](docs/2026-10-16-eotf-deux-niveaux.md) et une sortie Y'CbCr exacte en
 entiers ; deux images sont en vol par défaut. Paquets : Linux x86_64 GPU (Vulkan, transport direct
 NVIDIA), Windows x86_64 GPU (Vulkan), macOS arm64 CPU. Attestations de schéma 5 sur RTX 4070 Ti
 SUPER, iGPU AMD Raphael, GTX 1070 et Intel UHD 630. L'épinglage dans Muxiveo attend l'accord du
 mainteneur. La lecture sur matériel Dolby Vision reste à valider avant une release générale.
+
+Nouveau en 0.6.0 : session de capture (capacité `capture`, `mvo_fel_capture_frame_size` et
+`mvo_fel_capture_pair`) pour le FEL Analyzer de Muxiveo. La source, les décodeurs et le GPU sont
+ouverts une fois ; chaque appel se positionne, décode une seule fois et livre l'image reconstruite
+puis la couche `mapped` de chaque image, avec les mêmes octets qu'une production par couche. En
+précision exacte sur RTX, un instant de l'analyse (deux couches, deux images) passe d'environ 1,2 s
+à 0,1–0,2 s. Mesure seule plus rapide, avec des statistiques identiques au bit près : l'image n'est
+plus rapatriée vers l'hôte (aucune copie de 50 Mo par image UHD), et les statistiques sont calculées
+en deux passes (histogrammes et maxima en parallèle, somme de chaque ligne dans l'ordre des
+colonnes). Mesure complète d'un film UHD : environ 150 → 350 images/s sur RTX en précision rapide,
+désormais limitée par le décodage.
 
 Nouveau en 0.5.0 : mesure rapide (capacité `measure_sampling`, `mvo_fel_set_measure_sampling`) :
 seules les images clés sont décodées et mesurées, environ une image toutes les deux à trois secondes
