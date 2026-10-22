@@ -15,10 +15,13 @@ Muxiveo : l'application retient la version la plus récente dont le contrat (`--
   au lieu d'une approximation prise à la position des sources ; une zone découverte est prise sur la seule source qui
   la voit. Bords d'objets en mouvement, flou rapide, pluie : beaucoup moins de taches (fond voisin ramené dans le
   premier plan).
-- Sommes en virgule fixe (additions atomiques entières) : résultat déterministe, indépendant de l'ordre d'exécution.
+- Sommes en virgule fixe (additions atomiques entières) : projection indépendante de l'ordre d'exécution.
+- Sélecteur, priorité MC sur motif répétitif (bardages nervurés, persiennes, façades quadrillées) : là où la source est
+  périodique, où le champ MC explique bien les deux sources et reste cohérent avec lui-même (prédictions des blocs
+  voisins concordantes) et où l'image de RIFE s'en écarte nettement sur une zone étendue, MC seul. RIFE y ondule ou
+  dédouble les lignes ; MC suit la translation des deux sources.
 - Qualité mesurée sur les bancs de référence (×2 et ×2,5 avec vérité terrain) : en hausse ou inchangée pour Qualité,
-  Équilibré et Ultra, sans régression ; sans flux NVIDIA, sortie identique à la 1.10.0 ; coût de calcul : environ
-  +5 % en Vulkan (Qualité 4K ×2,5).
+  Équilibré et Ultra, sans régression ; coût de calcul : environ +3 % en Vulkan (Qualité 4K ×2,5).
 
 ## Nouveautés 1.10.0
 

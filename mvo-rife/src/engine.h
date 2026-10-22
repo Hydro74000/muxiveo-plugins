@@ -194,7 +194,7 @@ private:
                               const std::function<void()>& before_mc);
     bool record_nv(ncnn::VkCompute& cmd, const GpuFrame& a, const GpuFrame& b, float t, ncnn::VkMat& nv,
                    ncnn::VkMat& maps, std::string& error);
-    bool record_selector(ncnn::VkCompute& cmd, const GpuFrame& a, const GpuFrame& b, const ncnn::VkMat* cand[5],
+    bool record_selector(ncnn::VkCompute& cmd, const GpuFrame& a, const GpuFrame& b, float t, const ncnn::VkMat* cand[5],
                          const ncnn::VkMat& maps, ncnn::VkMat& out, std::string& error);
     bool upload_selector_models(std::string& error);
     // Les cartes denses ne restent en cache que si le budget réel laisse une réserve.
@@ -301,6 +301,15 @@ private:
     float r05_guard_mc_max_slow = 12.f / 1023.f;
     float r05_guard_slow_tex = 0.015f;
     float r05_guard_slow_ratio = 40.f;
+    // Priorité MC sur motif répétitif (bardage, façade quadrillée) : source périodique (périodicité < -1), champ MC
+    // bien expliqué (erreur bilatérale < 10 codes) et RIFE nettement différent (|MC - R1| > 6 codes) sur une zone
+    // étendue (au moins 3 blocs du voisinage 3 × 3), MC cohérent avec lui-même (prédictions OBMC des blocs voisins à
+    // moins de 2 codes) : RIFE y ondule, MC suit la translation des deux sources.
+    float mc_prio_perio = -1.f;
+    float mc_prio_q = 10.f;
+    float mc_prio_dis = 6.f / 1023.f;
+    int mc_prio_nmin = 3;
+    float mc_prio_obmc = 2.f;
     // Surcoût des vecteurs NVOF dans la recherche MC pleine résolution (écart bilatéral moyen, codes de luminance) :
     // retenus seulement s'ils battent les candidats hiérarchiques de plus qu'un pixel mal expliqué (MC_Q_THRESHOLD).
     // Sinon, sur un motif périodique, MC reprend l'appariement à la période voisine de NVOF et le confirme.

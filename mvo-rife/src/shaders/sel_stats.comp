@@ -1,7 +1,13 @@
 // Muxiveo — sélecteur : statistiques par bloc (une invocation par bloc de B px, pixels utiles seulement).
 // Luminance du domaine d'apprentissage : y = y_a + y_b · (kr R + kg G + kb B) (codes 10 bits limités / 1023).
-// Sorties (9 par bloc) : |y(R05) - y(R1)|, |y(MC) - y(R1)|, |y(Rbwd) - y(R1)|, |y(NV) - y(R1)|, texture
-// (|dx| + |dy| moyen des deux sources), |y(A) - y(B)|, y(R1), incohérence NVOF / 64, amplitude NVOF / 64.
+// Sorties (13 par bloc) : |y(R05) - y(R1)|, |y(MC) - y(R1)|, |y(Rbwd) - y(R1)|, |y(NV) - y(R1)|, texture
+// (|dx| + |dy| moyen des deux sources), |y(A) - y(B)|, y(R1), incohérence NVOF / 64, amplitude NVOF / 64 ; erreur
+// bilatérale du champ MC à l'instant t (|y(A)(x - t v) - y(B)(x + (1 - t) v)|, meilleur des 4 blocs voisins, codes) ;
+// périodicité de la source A, horizontale puis verticale : log((min D(s) + 1) / (D(r) + 1)), D(s) = |L(x) - L(x + s)|
+// moyen sur la fenêtre du bloc élargie d'un demi-bloc, au niveau de la pyramide MC où le bloc mesure 8 px (L en codes),
+// s = 2k à 16k, r = k ; désaccord des prédictions des 4 blocs voisins de l'OBMC (écart absolu moyen pondéré à leur
+// mélange, codes : MC « en conflit avec lui-même », vecteurs voisins décalés d'une période sur un motif irrégulier).
+// Erreur bilatérale, périodicité et désaccord OBMC : garde-fou « priorité MC » de sel_weights.comp.
 
 #version 450
 
@@ -17,8 +23,10 @@ layout (binding = 4) readonly buffer nv_blob { sfp nv[]; };
 layout (binding = 5) readonly buffer a_blob { sfp a_data[]; };
 layout (binding = 6) readonly buffer b_blob { sfp b_data[]; };
 layout (binding = 7) readonly buffer map_blob { float maps[]; };      // nvinc, nvmag (w × h), si NV
-layout (binding = 8) writeonly buffer stat_blob { float stats[]; };   // (nby, nbx, 9)
+layout (binding = 8) writeonly buffer stat_blob { float stats[]; };   // (nby, nbx, 13)
 layout (binding = 9) readonly buffer source_stat_blob { float source_stats[]; };
+layout (binding = 10) readonly buffer plum_blob { float plum[]; };     // pyramide MC de la source A, niveau plevel
+layout (binding = 11) readonly buffer field_blob { vec2 field[]; };   // champ MC pleine résolution (blocs de 16 px)
 
 layout (push_constant) uniform parameter
 {
@@ -39,8 +47,36 @@ layout (push_constant) uniform parameter
     float kb;
     float ya;
     float yb;
-    int reuse_sources; // texture, différence A/B et cartes NVOF inchangées pour une même paire
+    int reuse_sources; // texture, différence A/B, cartes NVOF et périodicité inchangées pour une même paire
+    int lum_on;        // niveau de pyramide fourni (sinon périodicité nulle)
+    int plevel;
+    int lw;            // largeur de ligne du niveau
+    int liw;           // dimensions utiles du niveau
+    int lih;
+    float t;           // instant interpolé
+    int mc_bw;         // dimensions du champ MC (0 : erreur bilatérale nulle)
+    int mc_bh;
+    float mcp_perio;   // seuils du garde-fou « priorité MC » (sel_weights.comp) : périodicité...
+    float mcp_dis;     // ...et |MC - R1| minimal ; ailleurs, erreur bilatérale et désaccord OBMC non calculés
 } p;
+
+// D(s) moyen sur la fenêtre [wx0, wx1) × [wy0, wy1) du niveau, direction horizontale (dir 0) ou verticale (dir 1)
+float shift_diff(int wx0, int wx1, int wy0, int wy1, int s, int dir)
+{
+    float acc = 0.f;
+    float cnt = 0.f;
+    for (int y = wy0; y < wy1; y++)
+        for (int x = wx0; x < wx1; x++)
+        {
+            int x2 = dir == 0 ? x + s : x;
+            int y2 = dir == 0 ? y : y + s;
+            if (x2 >= p.liw || y2 >= p.lih)
+                continue;
+            acc += abs(plum[y * p.lw + x] - plum[y2 * p.lw + x2]);
+            cnt += 1.f;
+        }
+    return cnt > 0.f ? acc / cnt : 0.f;
+}
 
 float lum(float r, float g, float b)
 {
@@ -48,6 +84,31 @@ float lum(float r, float g, float b)
 }
 
 #define LUM(buf, cs, i) lum(float(buf[i]), float(buf[(cs) + (i)]), float(buf[2 * (cs) + (i)]))
+
+// luminance d'une source au point (x, y), bilinéaire, bornée au cadre
+float lum_at(int which, float x, float y)
+{
+    x = clamp(x, 0.f, float(p.w - 1));
+    y = clamp(y, 0.f, float(p.h - 1));
+    int x0 = int(floor(x));
+    int y0 = int(floor(y));
+    int x1 = min(x0 + 1, p.w - 1);
+    int y1 = min(y0 + 1, p.h - 1);
+    float fx = x - float(x0);
+    float fy = y - float(y0);
+    float v00, v01, v10, v11;
+    if (which == 0)
+    {
+        v00 = LUM(a_data, p.cs_src, y0 * p.pw + x0); v01 = LUM(a_data, p.cs_src, y0 * p.pw + x1);
+        v10 = LUM(a_data, p.cs_src, y1 * p.pw + x0); v11 = LUM(a_data, p.cs_src, y1 * p.pw + x1);
+    }
+    else
+    {
+        v00 = LUM(b_data, p.cs_src, y0 * p.pw + x0); v01 = LUM(b_data, p.cs_src, y0 * p.pw + x1);
+        v10 = LUM(b_data, p.cs_src, y1 * p.pw + x0); v11 = LUM(b_data, p.cs_src, y1 * p.pw + x1);
+    }
+    return mix(mix(v00, v01, fx), mix(v10, v11, fx), fy);
+}
 
 void main()
 {
@@ -62,8 +123,8 @@ void main()
     bool has_r05 = (p.cands & 2) != 0;
     bool has_rb = (p.cands & 8) != 0;
     bool has_nv = (p.cands & 16) != 0;
-    float s[9];
-    for (int k = 0; k < 9; k++)
+    float s[13];
+    for (int k = 0; k < 13; k++)
         s[k] = 0.f;
     for (int y = y0; y < y1; y++)
     {
@@ -104,11 +165,77 @@ void main()
                 }
             }
             s[6] += yr;
+
         }
     }
     float n = float(max((x1 - x0) * (y1 - y0), 1));
-    int o = (by * p.nbx + bx) * 9;
-    for (int k = 0; k < 9; k++)
-        stats[o + k] = p.reuse_sources != 0 && (k == 4 || k == 5 || k == 7 || k == 8)
+    // périodicité de la source A (statistique de sources : calculée une fois par paire)
+    if (p.reuse_sources == 0 && p.lum_on != 0)
+    {
+        int bl = p.block >> p.plevel;
+        float k = float(bl) / 8.f;
+        int wx0 = max((x0 >> p.plevel) - bl / 2, 0);
+        int wx1 = min(((bx + 1) * p.block >> p.plevel) + bl / 2, p.liw);
+        int wy0 = max((y0 >> p.plevel) - bl / 2, 0);
+        int wy1 = min(((by + 1) * p.block >> p.plevel) + bl / 2, p.lih);
+        int r = max(1, int(floor(k + 0.5f)));
+        for (int dir = 0; dir < 2; dir++)
+        {
+            float dmin = 3.4e38f;
+            for (int j = 2; j <= 16; j++)
+                dmin = min(dmin, shift_diff(wx0, wx1, wy0, wy1, max(1, int(floor(float(j) * k + 0.5f))), dir));
+            s[10 + dir] = log((dmin + 1.f) / (shift_diff(wx0, wx1, wy0, wy1, r, dir) + 1.f)) * n;
+        }
+    }
+    // erreur bilatérale et désaccord OBMC : seulement sur les blocs candidats à la priorité MC (source périodique, MC
+    // nettement différent de R1), les autres reçoivent des valeurs qui l'excluent
+    float per = p.reuse_sources != 0 ? min(source_stats[(by * p.nbx + bx) * 13 + 10], source_stats[(by * p.nbx + bx) * 13 + 11])
+                                     : min(s[10], s[11]) / n;
+    if (p.mc_bw > 0 && per < p.mcp_perio && s[1] / n > p.mcp_dis)
+    {
+        for (int y = y0; y < y1; y++)
+        {
+            for (int x = x0; x < x1; x++)
+            {
+                // erreur bilatérale du champ MC (même voisinage que mc_recon.comp), codes 10 bits
+                float cy = (float(y) - 7.5f) / 16.f;
+                float cx = (float(x) - 7.5f) / 16.f;
+                int my = clamp(int(floor(cy)), 0, p.mc_bh - 1);
+                int mx = clamp(int(floor(cx)), 0, p.mc_bw - 1);
+                float ay = clamp(cy - float(my), 0.f, 1.f);
+                float ax = clamp(cx - float(mx), 0.f, 1.f);
+                float qb = 3.4e38f;
+                float pk[4];
+                float wk[4];
+                float pm = 0.f;
+                float ws = 0.f;
+                for (int k = 0; k < 4; k++)
+                {
+                    vec2 v = field[clamp(my + (k >> 1), 0, p.mc_bh - 1) * p.mc_bw + clamp(mx + (k & 1), 0, p.mc_bw - 1)];
+                    float la = lum_at(0, float(x) - p.t * v.x, float(y) - p.t * v.y);
+                    float lb = lum_at(1, float(x) + (1.f - p.t) * v.x, float(y) + (1.f - p.t) * v.y);
+                    qb = min(qb, abs(la - lb));
+                    pk[k] = (1.f - p.t) * la + p.t * lb;
+                    wk[k] = ((k >> 1) != 0 ? ay : 1.f - ay) * ((k & 1) != 0 ? ax : 1.f - ax);
+                    pm += wk[k] * pk[k];
+                    ws += wk[k];
+                }
+                pm /= max(ws, 1e-6f);
+                float dev = 0.f;
+                for (int k = 0; k < 4; k++)
+                    dev += wk[k] * abs(pk[k] - pm);
+                s[9] += qb * 1023.f;
+                s[12] += dev / max(ws, 1e-6f) * 1023.f;
+            }
+        }
+    }
+    else
+    {
+        s[9] = 1e9f * n;
+        s[12] = 1e9f * n;
+    }
+    int o = (by * p.nbx + bx) * 13;
+    for (int k = 0; k < 13; k++)
+        stats[o + k] = p.reuse_sources != 0 && (k == 4 || k == 5 || k == 7 || k == 8 || k == 10 || k == 11)
                        ? source_stats[o + k] : s[k] / n;
 }

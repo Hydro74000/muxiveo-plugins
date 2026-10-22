@@ -37,11 +37,23 @@ layout (push_constant) uniform parameter
     float r05_slow_px;    // ...amplitude MC maximale (bloc et voisins de 16 px) sous ce seuil (px)...
     float r05_slow_tex;   // ...sur structure contrastée (texture des sources au moins égale : seul cas d'appariement de période)
     float r05_slow_ratio; // ...ou R05 extrêmement isolé (|R05 - R1| au moins ce multiple de |MC - R1|)
+    float mcp_perio;      // priorité MC (0 : désactivée) : périodicité de la source sous ce seuil (log, < 0)...
+    float mcp_q;          // ...champ MC bien expliqué : erreur bilatérale sous ce seuil (codes)...
+    float mcp_dis;        // ...MC nettement différent de R1 (|MC - R1| au-delà de ce seuil)...
+    int mcp_nmin;         // ...sur au moins ce nombre de blocs du voisinage 3 × 3, bloc compris (étendue du défaut de RIFE)...
+    float mcp_obmc;       // ...et MC cohérent avec lui-même : désaccord des prédictions OBMC sous ce seuil (codes)
 } p;
 
 float stat(int bx, int by, int k)
 {
-    return stats[(clamp(by, 0, p.nby - 1) * p.nbx + clamp(bx, 0, p.nbx - 1)) * 9 + k];
+    return stats[(clamp(by, 0, p.nby - 1) * p.nbx + clamp(bx, 0, p.nbx - 1)) * 13 + k];
+}
+
+// condition « priorité MC » d'un bloc (statistiques du bloc seul)
+bool mc_prio_at(int bx, int by)
+{
+    return min(stat(bx, by, 10), stat(bx, by, 11)) < p.mcp_perio && stat(bx, by, 9) < p.mcp_q && stat(bx, by, 1) > p.mcp_dis
+           && stat(bx, by, 12) < p.mcp_obmc;
 }
 
 void main()
@@ -156,6 +168,28 @@ void main()
     int o = (by * p.nbx + bx) * 5;
     for (int s = 0; s < 5; s++)
         weights[o + s] = 0.f;
+    // priorité MC : motif répétitif (bardage, façade quadrillée) où le champ MC explique bien les deux sources et où
+    // l'image de RIFE s'en écarte nettement sur une zone étendue (RIFE ondule) ; pas là où MC se contredit (blocs
+    // voisins sur des périodes différentes d'un motif irrégulier : l'OBMC y dédouble)
+    bool mc_prio = false;
+    if (p.mcp_perio < 0.f && p.mc_bw > 0 && mc_prio_at(bx, by))
+    {
+        int cnt = 0;
+        for (int dy = -1; dy <= 1; dy++)
+            for (int dx = -1; dx <= 1; dx++)
+            {
+                int xx = bx + dx;
+                int yy = by + dy;
+                if (xx >= 0 && yy >= 0 && xx < p.nbx && yy < p.nby && mc_prio_at(xx, yy))
+                    cnt++;
+            }
+        mc_prio = cnt >= p.mcp_nmin;
+    }
+    if (mc_prio)
+    {
+        weights[o + 2] = 1.f;
+        return;
+    }
     for (int c = 0; c < k; c++)
         weights[o + slot[c]] = logit[c] / sum;
 }

@@ -1641,7 +1641,7 @@ bool RifeEngine::record_nv(ncnn::VkCompute& cmd, const GpuFrame& a, const GpuFra
     return true;
 }
 
-bool RifeEngine::record_selector(ncnn::VkCompute& cmd, const GpuFrame& a, const GpuFrame& b, const ncnn::VkMat* cand[5],
+bool RifeEngine::record_selector(ncnn::VkCompute& cmd, const GpuFrame& a, const GpuFrame& b, float t, const ncnn::VkMat* cand[5],
                                  const ncnn::VkMat& maps, ncnn::VkMat& out, std::string& error)
 {
     const int w = fmt.width;
@@ -1678,7 +1678,11 @@ bool RifeEngine::record_selector(ncnn::VkCompute& cmd, const GpuFrame& a, const 
         error = "poids du sélecteur incohérents avec les candidats";
         return false;
     }
-    ncnn::VkMat stats = float_mat(nbx * nby * 9);
+    // périodicité des sources (garde-fou « priorité MC ») : niveau de la pyramide MC où le bloc mesure 8 px (au plus 1/4)
+    int plevel = 0;
+    while (plevel < 2 && (block >> (plevel + 1)) >= 8)
+        plevel++;
+    ncnn::VkMat stats = float_mat(nbx * nby * 13);
     ncnn::VkMat weights = float_mat(nbx * nby * 5);
     out.create(w_padded, h_padded, 3, cand[0]->elemsize, 1, blob_vkallocator);
     if (stats.empty() || weights.empty() || out.empty())
@@ -1689,7 +1693,7 @@ bool RifeEngine::record_selector(ncnn::VkCompute& cmd, const GpuFrame& a, const 
     auto cs = [](const ncnn::VkMat* m) { return m ? (int)m->cstep : 0; };
     auto bind = [this](const ncnn::VkMat* m) { return m ? *m : dummy; };
     {
-        std::vector<ncnn::VkMat> bindings(10);
+        std::vector<ncnn::VkMat> bindings(12);
         bindings[0] = *cand[0];
         bindings[1] = bind(cand[1]);
         bindings[2] = *cand[2];
@@ -1700,7 +1704,9 @@ bool RifeEngine::record_selector(ncnn::VkCompute& cmd, const GpuFrame& a, const 
         bindings[7] = cand[4] ? maps : dummy;
         bindings[8] = stats;
         bindings[9] = reuse_sources ? sel_source_stats : dummy;
-        std::vector<ncnn::vk_constant_type> constants(18);
+        bindings[10] = a.lum[plevel].empty() ? dummy : a.lum[plevel];
+        bindings[11] = cached_field.empty() ? dummy : cached_field;
+        std::vector<ncnn::vk_constant_type> constants(28);
         constants[0].i = w;
         constants[1].i = h;
         constants[2].i = w_padded;
@@ -1719,6 +1725,16 @@ bool RifeEngine::record_selector(ncnn::VkCompute& cmd, const GpuFrame& a, const 
         constants[15].f = color.full_range ? 0.f : 64.f / 1023.f;   // luminance d'apprentissage : codes 10 bits / 1023
         constants[16].f = color.full_range ? 1.f : 876.f / 1023.f;
         constants[17].i = reuse_sources ? 1 : 0;
+        constants[18].i = a.lum[plevel].empty() ? 0 : 1;
+        constants[19].i = plevel;
+        constants[20].i = lw[plevel];
+        constants[21].i = (w + (1 << plevel) - 1) >> plevel;
+        constants[22].i = (h + (1 << plevel) - 1) >> plevel;
+        constants[23].f = t;
+        constants[24].i = cached_field.empty() ? 0 : (lw[0] + 15) / 16;
+        constants[25].i = cached_field.empty() ? 0 : (lh[0] + 15) / 16;
+        constants[26].f = mc_prio_perio;
+        constants[27].f = mc_prio_dis;
         ncnn::VkMat dispatcher;
         dispatcher.w = nbx;
         dispatcher.h = nby;
@@ -1735,7 +1751,7 @@ bool RifeEngine::record_selector(ncnn::VkCompute& cmd, const GpuFrame& a, const 
         bindings[1] = sel_models;
         bindings[2] = weights;
         bindings[3] = cached_field.empty() ? dummy : cached_field;
-        std::vector<ncnn::vk_constant_type> constants(24);
+        std::vector<ncnn::vk_constant_type> constants(29);
         constants[0].i = nbx;
         constants[1].i = nby;
         constants[2].i = mi * 128;
@@ -1761,6 +1777,11 @@ bool RifeEngine::record_selector(ncnn::VkCompute& cmd, const GpuFrame& a, const 
         constants[21].f = lm_lo * (float)w / 3840.f;
         constants[22].f = r05_guard_slow_tex;
         constants[23].f = r05_guard_slow_ratio;
+        constants[24].f = cached_field.empty() || a.lum[plevel].empty() ? 0.f : mc_prio_perio;
+        constants[25].f = mc_prio_q;
+        constants[26].f = mc_prio_dis;
+        constants[27].i = mc_prio_nmin;
+        constants[28].f = mc_prio_obmc;
         ncnn::VkMat dispatcher;
         dispatcher.w = nbx;
         dispatcher.h = nby;
@@ -1852,7 +1873,7 @@ bool RifeEngine::interpolate_selector(const GpuFrame& a, const GpuFrame& b, floa
     }
     const ncnn::VkMat* cand[5] = {&r1, r05.empty() ? nullptr : &r05, &mc, rb.empty() ? nullptr : &rb, use_nv ? &nv : nullptr};
     ncnn::VkMat out;
-    const bool ok = record_selector(cmd, a, b, cand, maps, out, error) && convert_and_download(cmd, out, dst, error);
+    const bool ok = record_selector(cmd, a, b, t, cand, maps, out, error) && convert_and_download(cmd, out, dst, error);
     if (use_nv && !cache_headroom())
     {
         // Sans mesure fiable ou sans réserve, conserver le chemin de recalcul initial.
