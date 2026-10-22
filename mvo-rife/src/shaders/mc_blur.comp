@@ -1,0 +1,37 @@
+// Muxiveo — MC : lissage binomial séparable (une direction par passe) du niveau 1/8 de la pyramide de luminance,
+// bords répliqués sur l'image utile. La recherche exhaustive entière du niveau 1/8 compare sinon des motifs fins
+// (grilles de fenêtres, barreaux) mal échantillonnés : le vrai déplacement, entre deux entiers, y coûte plus cher que
+// le déplacement d'une période qui tombe sur un entier, et tout le raffinement part de cette mauvaise période.
+
+#version 450
+
+layout (binding = 0) readonly buffer src_blob { float src_data[]; };
+layout (binding = 1) writeonly buffer dst_blob { float dst_data[]; };
+
+layout (push_constant) uniform parameter
+{
+    int w;      // largeur de ligne du tampon
+    int iw;     // dimensions utiles de l'image au niveau
+    int ih;
+    int dir;    // 0 : horizontal, 1 : vertical
+    int taps;   // 5 (σ = 1) ou 7 (σ ≈ 1,2)
+} p;
+
+void main()
+{
+    int gx = int(gl_GlobalInvocationID.x);
+    int gy = int(gl_GlobalInvocationID.y);
+    if (gx >= p.iw || gy >= p.ih)
+        return;
+    const float k5[5] = float[5](1.f, 4.f, 6.f, 4.f, 1.f);
+    const float k7[7] = float[7](1.f, 6.f, 15.f, 20.f, 15.f, 6.f, 1.f);
+    int r = p.taps / 2;
+    float sum = 0.f;
+    for (int j = -r; j <= r; j++)
+    {
+        int x = p.dir == 0 ? clamp(gx + j, 0, p.iw - 1) : gx;
+        int y = p.dir == 0 ? gy : clamp(gy + j, 0, p.ih - 1);
+        sum += (p.taps == 7 ? k7[j + r] : k5[j + r]) * src_data[y * p.w + x];
+    }
+    dst_data[gy * p.w + gx] = sum / (p.taps == 7 ? 64.f : 16.f);
+}

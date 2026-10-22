@@ -6,7 +6,7 @@ cmake_policy(SET CMP0091 NEW)
 set(CMAKE_POLICY_DEFAULT_CMP0091 NEW)
 set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 
-project(muxiveo-rife VERSION 1.9.0 LANGUAGES C CXX)
+project(muxiveo-rife VERSION 1.10.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -89,7 +89,7 @@ endif()
 set(MUXIVEO_RIFE_SHADERS
     yuv_to_rgb rgb_to_yuv pack_samples rife_v4_timestep warp warp_pack4 warp_rgb3
     tta_flip tta_accumulate tta_resolve
-    mc_luma mc_down mc_search mc_median mc_recon mc_filter mc_region mc_blend mc_motion
+    mc_luma mc_down mc_blur mc_search mc_median mc_recon mc_filter mc_region mc_blend mc_motion
     nv_flow nv_warp sel_stats sel_weights sel_blend
     trt_pack residual_add
 )

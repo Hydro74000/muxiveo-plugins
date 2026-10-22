@@ -223,6 +223,7 @@ private:
     ncnn::Pipeline* pipeline_tta_resolve;
     ncnn::Pipeline* pipeline_mc_luma;
     ncnn::Pipeline* pipeline_mc_down;
+    ncnn::Pipeline* pipeline_mc_blur = nullptr;
     ncnn::Pipeline* pipeline_mc_search;
     ncnn::Pipeline* pipeline_mc_median;
     ncnn::Pipeline* pipeline_mc_recon;
@@ -293,6 +294,12 @@ private:
     float r05_guard_abs = 4.f / 1023.f;
     float r05_guard_ratio = 3.f;
     float r05_guard_mc_max = 3.f / 1023.f;
+    // R05 ne sert qu'aux grands mouvements : là où le champ MC (bloc et voisins) reste sous lm_lo × largeur / 3840,
+    // sur structure contrastée (texture des sources) ou face à un R05 extrêmement isolé (|R05 - R1| / |MC - R1|),
+    // consensus élargi à 12 codes (flux demi-résolution apparié à la période voisine d'un motif répétitif)
+    float r05_guard_mc_max_slow = 12.f / 1023.f;
+    float r05_guard_slow_tex = 0.015f;
+    float r05_guard_slow_ratio = 40.f;
     // Surcoût des vecteurs NVOF dans la recherche MC pleine résolution (écart bilatéral moyen, codes de luminance) :
     // retenus seulement s'ils battent les candidats hiérarchiques de plus qu'un pixel mal expliqué (MC_Q_THRESHOLD).
     // Sinon, sur un motif périodique, MC reprend l'appariement à la période voisine de NVOF et le confirme.

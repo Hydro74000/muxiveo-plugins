@@ -31,6 +31,7 @@
 #include "trt_backend.h"
 #include "mc_blend.comp.hex.h"
 #include "mc_down.comp.hex.h"
+#include "mc_blur.comp.hex.h"
 #include "mc_filter.comp.hex.h"
 #include "mc_luma.comp.hex.h"
 #include "mc_median.comp.hex.h"
@@ -57,6 +58,17 @@ static const int MC_MARGIN_FINE = 8;           // fenêtre 32×32 aux niveaux 1/
 static const int MC_MARGIN_COARSE = 16;        // fenêtre 48×48 aux niveaux 1/4 et 1/8
 static const int MC_COARSE_RADIUS = 8;         // recherche exhaustive ±8 px au niveau 1/8
 static const float MC_Q_THRESHOLD = 20.f;      // erreur bilatérale d'un pixel mal expliqué
+// Motifs répétitifs (grilles de fenêtres, barreaux) : un vecteur décalé d'une période y coûte autant que le vrai.
+static const int MC_COARSE_BLUR_TAPS = 7;       // lissage binomial du niveau 1/8 avant la recherche exhaustive (σ ≈ 1,2)
+static const float MC_COARSE_STEP = 0.5f;       // niveau 1/8 : demi-pixel (4 px) autour des 3 meilleurs minima entiers
+static const int MC_SMALL_RADIUS = 1;           // hypothèse « petit mouvement » : ±1 px au niveau 1/8 (±8 px)...
+static const float MC_SMALL_REL = 0.3f;         // ...retenue si son coût ne dépasse le principal que de 30 %...
+static const float MC_SMALL_ABS = 1.f;          // ...et 1 code...
+static const float MC_SMALL_TEX = 15.f;         // ...sur structure contrastée (|dx| + |dy| moyen, codes)
+static const float MC_SMALL_SKIP = 8.f;         // blocs dont le champ principal reste sous 8 px : hypothèse inutile
+static const float MC_FINE_REL = 0.05f;         // cohérence pleine résolution : médiane 3×3 si coût +5 %...
+static const float MC_FINE_ABS = 0.5f;          // ...et +0,5 code au plus
+static const float MC_OUTSIDE_COST = MC_Q_THRESHOLD;   // échantillon hors de l'image : pixel mal expliqué
 static const float MC_DENSITY = 0.25f;         // densité au-delà de laquelle RIFE prend la main
 static const float MC_AGREE = 20.f;            // écart MC / RIFE sous lequel les deux sont moyennés
 // Grands mouvements : RIFE à flux demi-résolution remplace l'hybride entre le seuil (lm_lo, px entre
@@ -90,6 +102,7 @@ RifeEngine::RifeEngine()
       engine_mode(InterpEngine::Rife), lw{0, 0, 0, 0}, lh{0, 0, 0, 0},
       padding(32), w_padded(0), h_padded(0), words(0), pack_dispatch_w(0), tta(1)
 {
+
 }
 
 RifeEngine::~RifeEngine()
@@ -103,6 +116,7 @@ RifeEngine::~RifeEngine()
     delete pipeline_tta_resolve;
     delete pipeline_mc_luma;
     delete pipeline_mc_down;
+    delete pipeline_mc_blur;
     delete pipeline_mc_search;
     delete pipeline_mc_median;
     delete pipeline_mc_recon;
@@ -461,6 +475,7 @@ bool RifeEngine::configure(const FrameFormat& _fmt, const ColorParams& _color, s
     {
         pipeline_mc_luma = make_pipeline(mc_luma_comp_data, sizeof(mc_luma_comp_data), 8, 8, 1);
         pipeline_mc_down = make_pipeline(mc_down_comp_data, sizeof(mc_down_comp_data), 8, 8, 1);
+        pipeline_mc_blur = make_pipeline(mc_blur_comp_data, sizeof(mc_blur_comp_data), 8, 8, 1);
         pipeline_mc_search = make_pipeline(mc_search_comp_data, sizeof(mc_search_comp_data), 16, 16, 1);
         pipeline_mc_median = make_pipeline(mc_median_comp_data, sizeof(mc_median_comp_data), 8, 8, 1);
         pipeline_mc_recon = make_pipeline(mc_recon_comp_data, sizeof(mc_recon_comp_data), 8, 8, 1);
@@ -473,7 +488,7 @@ bool RifeEngine::configure(const FrameFormat& _fmt, const ColorParams& _color, s
         pipeline_sel_stats = make_pipeline(sel_stats_comp_data, sizeof(sel_stats_comp_data), 8, 8, 1);
         pipeline_sel_weights = make_pipeline(sel_weights_comp_data, sizeof(sel_weights_comp_data), 8, 8, 1);
         pipeline_sel_blend = make_pipeline(sel_blend_comp_data, sizeof(sel_blend_comp_data), 8, 8, 1);
-        if (!pipeline_mc_luma || !pipeline_mc_down || !pipeline_mc_search || !pipeline_mc_median
+        if (!pipeline_mc_luma || !pipeline_mc_down || !pipeline_mc_blur || !pipeline_mc_search || !pipeline_mc_median
                 || !pipeline_mc_recon || !pipeline_mc_filter || !pipeline_mc_region || !pipeline_mc_blend
                 || !pipeline_mc_motion || !pipeline_nv_flow || !pipeline_nv_warp || !pipeline_sel_stats
                 || !pipeline_sel_weights || !pipeline_sel_blend)
@@ -591,9 +606,21 @@ bool RifeEngine::record_mc(ncnn::VkCompute& cmd, const GpuFrame& a, const GpuFra
     // les positions t (un tiers des recherches évité en 24 → 60, qualité égale aux bancs).
     const bool reuse = !cached_field.empty() && a.id == cache_a && b.id == cache_b;
     ncnn::VkMat field[4];
+    ncnn::VkMat main_field;
+    ncnn::VkMat main_fields[4];   // champ principal de chaque niveau (passe 1 : blocs déjà en petit mouvement recopiés)
+    // constantes communes des passes de recherche : erreur d'un échantillon hors image, texture minimale de l'autre
+    // hypothèse (arbitrage)
+    auto set_search_constants = [&](std::vector<ncnn::vk_constant_type>& c, float alt_tex) {
+        c[17].f = MC_OUTSIDE_COST;
+        c[18].f = alt_tex;
+        c[19].f = 0.f;
+    };
     if (reuse)
         field[0] = cached_field;
-    for (int l = 3; l >= 0 && !reuse; l--)
+    // passe 0 : champ principal (recherche ±MC_COARSE_RADIUS, vecteurs NVOF) ; passe 1 : hypothèse « petit
+    // mouvement » (±MC_SMALL_RADIUS au niveau 1/8), arbitrée bloc par bloc plus bas
+    for (int pass = 0; pass < 2 && !reuse; pass++)
+    for (int l = 3; l >= 0; l--)
     {
         const int bw = (lw[l] + 15) / 16;
         const int bh = (lh[l] + 15) / 16;
@@ -611,7 +638,7 @@ bool RifeEngine::record_mc(ncnn::VkCompute& cmd, const GpuFrame& a, const GpuFra
         bindings[1] = b.lum[l];
         bindings[2] = coarse ? dummy : field[l + 1];
         bindings[3] = raw;
-        const bool hinted = l == 0 && !hints_host.empty() && (int)hints_host.size() == bw * bh * 4;
+        const bool hinted = pass == 0 && l == 0 && !hints_host.empty() && (int)hints_host.size() == bw * bh * 4;
         if (hinted && hints_dirty)
         {
             ncnn::Option o = opt;
@@ -622,8 +649,8 @@ bool RifeEngine::record_mc(ncnn::VkCompute& cmd, const GpuFrame& a, const GpuFra
             cmd.record_clone(host, hints_gpu, o);
             hints_dirty = false;
         }
-        bindings[4] = hinted ? hints_gpu : dummy;
-        std::vector<ncnn::vk_constant_type> constants(16);
+        bindings[4] = hinted ? hints_gpu : (pass == 1 ? main_fields[l] : dummy);
+        std::vector<ncnn::vk_constant_type> constants(20);
         constants[0].i = lw[l];
         constants[1].i = lh[l];
         constants[2].i = iw;
@@ -633,13 +660,17 @@ bool RifeEngine::record_mc(ncnn::VkCompute& cmd, const GpuFrame& a, const GpuFra
         constants[6].i = coarse ? 1 : (lw[l + 1] + 15) / 16;
         constants[7].i = coarse ? 1 : (lh[l + 1] + 15) / 16;
         constants[8].i = coarse ? 0 : 1;
-        constants[9].i = MC_COARSE_RADIUS;
+        constants[9].i = pass == 0 ? MC_COARSE_RADIUS : MC_SMALL_RADIUS;
         constants[10].i = l == 0 ? 1 : 0;
         constants[11].i = hinted ? 2 : 0;
         constants[12].f = coarse ? MC_LAMBDA_COARSE : MC_LAMBDA;
         constants[13].f = 0.5f;
         constants[14].i = l <= 1 ? MC_MARGIN_FINE : MC_MARGIN_COARSE;
         constants[15].f = mc_hint_penalty;
+        constants[16].f = MC_COARSE_STEP;
+        set_search_constants(constants, 0.f);
+        if (pass == 1)
+            constants[19].f = MC_SMALL_SKIP / (float)(1 << l);
         ncnn::VkMat dispatcher;
         dispatcher.w = bw * 16;
         dispatcher.h = bh * 16;
@@ -649,6 +680,11 @@ bool RifeEngine::record_mc(ncnn::VkCompute& cmd, const GpuFrame& a, const GpuFra
         if (l == 0)
         {
             field[l] = raw;
+            if (pass == 0)
+            {
+                main_field = raw;
+                main_fields[l] = raw;
+            }
             continue;
         }
         // niveaux grossiers : médiane 3×3, puis passes de propagation (voisins du même niveau,
@@ -681,7 +717,7 @@ bool RifeEngine::record_mc(ncnn::VkCompute& cmd, const GpuFrame& a, const GpuFra
             pb[1] = b.lum[l];
             pb[2] = field[l];
             pb[3] = next;
-            pb[4] = dummy;
+            pb[4] = pass == 1 ? main_fields[l] : dummy;
             std::vector<ncnn::vk_constant_type> pc = constants;
             pc[6].i = bw;
             pc[7].i = bh;
@@ -691,8 +727,113 @@ bool RifeEngine::record_mc(ncnn::VkCompute& cmd, const GpuFrame& a, const GpuFra
             cmd.record_pipeline(pipeline_mc_search, pb, pc, dispatcher);
             field[l] = next;
         }
+        if (pass == 0)
+            main_fields[l] = field[l];
     }
 
+    if (!reuse)
+    {
+        // Motif répétitif : un vecteur décalé d'une période coûte autant que le vrai. Hypothèse « petit mouvement »
+        // retenue si son coût bilatéral ne dépasse celui du champ principal que de MC_SMALL_REL (relatif) et
+        // MC_SMALL_ABS (codes) ; sinon champ principal.
+        const int bw = (lw[0] + 15) / 16;
+        const int bh = (lh[0] + 15) / 16;
+        ncnn::VkMat chosen = float_mat(bw * bh * 2);
+        if (chosen.empty())
+        {
+            error = "allocation mémoire GPU impossible (vecteurs)";
+            return false;
+        }
+        std::vector<ncnn::VkMat> ab(5);
+        ab[0] = a.lum[0];
+        ab[1] = b.lum[0];
+        ab[2] = main_field;
+        ab[3] = chosen;
+        ab[4] = field[0];
+        std::vector<ncnn::vk_constant_type> ac(20);
+        ac[0].i = lw[0];
+        ac[1].i = lh[0];
+        ac[2].i = fmt.width;
+        ac[3].i = fmt.height;
+        ac[4].i = bw;
+        ac[5].i = bh;
+        ac[6].i = bw;
+        ac[7].i = bh;
+        ac[8].i = 3;
+        ac[9].i = 0;
+        ac[10].i = 1;
+        ac[11].i = 1;
+        ac[12].f = MC_SMALL_REL;
+        ac[13].f = 0.5f;
+        ac[14].i = MC_MARGIN_FINE;
+        ac[15].f = MC_SMALL_ABS;
+        ac[16].f = MC_COARSE_STEP;
+        set_search_constants(ac, MC_SMALL_TEX);
+        ncnn::VkMat ad;
+        ad.w = bw * 16;
+        ad.h = bh * 16;
+        ad.c = 1;
+        cmd.record_pipeline(pipeline_mc_search, ab, ac, ad);
+        field[0] = chosen;
+    }
+    if (!reuse)
+    {
+        // pleine résolution : bloc isolé resté sur une autre période que ses voisins, à coût quasi égal, ramené à la
+        // médiane 3×3 (retenue seulement si son coût ne dépasse le sien que de MC_FINE_REL et MC_FINE_ABS)
+        const int bw = (lw[0] + 15) / 16;
+        const int bh = (lh[0] + 15) / 16;
+        ncnn::VkMat med = float_mat(bw * bh * 2);
+        ncnn::VkMat next = float_mat(bw * bh * 2);
+        if (med.empty() || next.empty())
+        {
+            error = "allocation mémoire GPU impossible (vecteurs)";
+            return false;
+        }
+        {
+            std::vector<ncnn::VkMat> mb(2);
+            mb[0] = field[0];
+            mb[1] = med;
+            std::vector<ncnn::vk_constant_type> mc(2);
+            mc[0].i = bw;
+            mc[1].i = bh;
+            ncnn::VkMat md;
+            md.w = bw;
+            md.h = bh;
+            md.c = 1;
+            cmd.record_pipeline(pipeline_mc_median, mb, mc, md);
+        }
+        std::vector<ncnn::VkMat> fb(5);
+        fb[0] = a.lum[0];
+        fb[1] = b.lum[0];
+        fb[2] = field[0];
+        fb[3] = next;
+        fb[4] = med;
+        std::vector<ncnn::vk_constant_type> fc(20);
+        fc[0].i = lw[0];
+        fc[1].i = lh[0];
+        fc[2].i = fmt.width;
+        fc[3].i = fmt.height;
+        fc[4].i = bw;
+        fc[5].i = bh;
+        fc[6].i = bw;
+        fc[7].i = bh;
+        fc[8].i = 3;
+        fc[9].i = 0;
+        fc[10].i = 1;
+        fc[11].i = 1;
+        fc[12].f = MC_FINE_REL;
+        fc[13].f = 0.5f;
+        fc[14].i = MC_MARGIN_FINE;
+        fc[15].f = MC_FINE_ABS;
+        fc[16].f = MC_COARSE_STEP;
+        set_search_constants(fc, 0.f);
+        ncnn::VkMat fd;
+        fd.w = bw * 16;
+        fd.h = bh * 16;
+        fd.c = 1;
+        cmd.record_pipeline(pipeline_mc_search, fb, fc, fd);
+        field[0] = next;
+    }
     if (!reuse)
     {
         cached_field = field[0];
@@ -963,6 +1104,32 @@ bool RifeEngine::upload(const uint8_t* frame, GpuFrame& out, std::string& error)
             dd.h = lh[l];
             dd.c = 1;
             cmd.record_pipeline(pipeline_mc_down, db, dc, dd);
+        }
+        {
+            // niveau 1/8 lissé sur place (seule la recherche MC le lit)
+            ncnn::VkMat tmp = float_mat(lw[3] * lh[3]);
+            if (tmp.empty())
+            {
+                error = "allocation mémoire GPU impossible (pyramide)";
+                return false;
+            }
+            for (int dir = 0; dir < 2; dir++)
+            {
+                std::vector<ncnn::VkMat> bb(2);
+                bb[0] = dir == 0 ? out.lum[3] : tmp;
+                bb[1] = dir == 0 ? tmp : out.lum[3];
+                std::vector<ncnn::vk_constant_type> bc(5);
+                bc[0].i = lw[3];
+                bc[1].i = (fmt.width + 7) >> 3;
+                bc[2].i = (fmt.height + 7) >> 3;
+                bc[3].i = dir;
+                bc[4].i = MC_COARSE_BLUR_TAPS;
+                ncnn::VkMat bd;
+                bd.w = lw[3];
+                bd.h = lh[3];
+                bd.c = 1;
+                cmd.record_pipeline(pipeline_mc_blur, bb, bc, bd);
+            }
         }
     }
 
@@ -1532,11 +1699,12 @@ bool RifeEngine::record_selector(ncnn::VkCompute& cmd, const GpuFrame& a, const 
     sel_stats_b = b.id;
     sel_stats_nv = use_nv;
     {
-        std::vector<ncnn::VkMat> bindings(3);
+        std::vector<ncnn::VkMat> bindings(4);
         bindings[0] = stats;
         bindings[1] = sel_models;
         bindings[2] = weights;
-        std::vector<ncnn::vk_constant_type> constants(18);
+        bindings[3] = cached_field.empty() ? dummy : cached_field;
+        std::vector<ncnn::vk_constant_type> constants(24);
         constants[0].i = nbx;
         constants[1].i = nby;
         constants[2].i = mi * 128;
@@ -1555,6 +1723,13 @@ bool RifeEngine::record_selector(ncnn::VkCompute& cmd, const GpuFrame& a, const 
         constants[15].f = r05_guard_mc_max;
         constants[16].f = nv_guard_mc_max_slow;
         constants[17].f = nv_guard_slow_blocks * (float)block / 64.f;
+        constants[18].i = cached_field.empty() ? 0 : (lw[0] + 15) / 16;
+        constants[19].i = cached_field.empty() ? 0 : (lh[0] + 15) / 16;
+        constants[20].f = r05_guard_mc_max_slow;
+        // seuil des grands mouvements ramené à la largeur de l'image (défini pour la 4K)
+        constants[21].f = lm_lo * (float)w / 3840.f;
+        constants[22].f = r05_guard_slow_tex;
+        constants[23].f = r05_guard_slow_ratio;
         ncnn::VkMat dispatcher;
         dispatcher.w = nbx;
         dispatcher.h = nby;

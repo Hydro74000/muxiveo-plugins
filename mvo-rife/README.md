@@ -8,6 +8,21 @@ Extension de Muxiveo : installée, mise à jour et supprimée par l'application 
 utilisateur. Le moteur, ses modèles, les poids de son sélecteur et ses préréglages évoluent sans release de
 Muxiveo : l'application retient la version la plus récente dont le contrat (`--capabilities`) lui est connu.
 
+## Nouveautés 1.10.0
+
+- Moteur hybride, motifs répétitifs (façades à grilles de fenêtres, barreaux, rambardes) : la compensation de
+  mouvement ne retient plus le déplacement d'une période voisine. Niveau 1/8 de la pyramide lissé avant la recherche
+  exhaustive, puis positions demi-pixel autour des meilleurs minima ; hypothèse « petit mouvement » arbitrée bloc
+  par bloc sur structure contrastée ; cohérence avec les blocs voisins à pleine résolution. Le flux NVIDIA et le
+  flux demi-résolution, appariés à la même période voisine, sont de nouveau écartés par les garde-fous : plus de
+  dédoublement sur les plans lents de bâtiments.
+- Recherche MC : un échantillon hors de l'image compte comme un pixel mal expliqué (il donnait auparavant un coût
+  nul aux vecteurs sortant du cadre, d'où des accrocs sur les bords).
+- Garde-fou R05 élargi là où le mouvement reste sous le seuil des grands mouvements (ramené à la largeur de
+  l'image) ; consensus RIFE / MC du garde-fou NV pris sur les blocs voisins.
+- Qualité mesurée sur les bancs de référence (×2 et ×2,5 avec vérité terrain) : inchangée en moyenne, sans
+  régression ; coût de calcul : environ +5 % en Vulkan (Qualité 4K ×2,5).
+
 ## Nouveautés 1.9.0
 
 - Accélération NVIDIA (extension mvo-rife-trt 1.2.0 ou plus récente) : identités des images transmises au plugin,
