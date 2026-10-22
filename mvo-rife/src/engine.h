@@ -233,6 +233,7 @@ private:
     ncnn::Pipeline* pipeline_mc_motion;
     ncnn::Pipeline* pipeline_nv_flow = nullptr;
     ncnn::Pipeline* pipeline_nv_warp = nullptr;
+    ncnn::Pipeline* pipeline_nv_splat = nullptr;
     ncnn::Pipeline* pipeline_sel_stats = nullptr;
     ncnn::Pipeline* pipeline_sel_weights = nullptr;
     ncnn::Pipeline* pipeline_sel_blend = nullptr;

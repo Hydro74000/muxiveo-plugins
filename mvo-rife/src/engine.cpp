@@ -38,6 +38,7 @@
 #include "mc_motion.comp.hex.h"
 #include "nv_flow.comp.hex.h"
 #include "nv_warp.comp.hex.h"
+#include "nv_splat.comp.hex.h"
 #include "sel_blend.comp.hex.h"
 #include "sel_stats.comp.hex.h"
 #include "sel_weights.comp.hex.h"
@@ -126,6 +127,7 @@ RifeEngine::~RifeEngine()
     delete pipeline_mc_motion;
     delete pipeline_nv_flow;
     delete pipeline_nv_warp;
+    delete pipeline_nv_splat;
     delete pipeline_sel_stats;
     delete pipeline_sel_weights;
     delete pipeline_sel_blend;
@@ -485,12 +487,13 @@ bool RifeEngine::configure(const FrameFormat& _fmt, const ColorParams& _color, s
         pipeline_mc_motion = make_pipeline(mc_motion_comp_data, sizeof(mc_motion_comp_data), 8, 8, 1);
         pipeline_nv_flow = make_pipeline(nv_flow_comp_data, sizeof(nv_flow_comp_data), 8, 8, 1);
         pipeline_nv_warp = make_pipeline(nv_warp_comp_data, sizeof(nv_warp_comp_data), 8, 8, 1);
+        pipeline_nv_splat = make_pipeline(nv_splat_comp_data, sizeof(nv_splat_comp_data), 8, 8, 1);
         pipeline_sel_stats = make_pipeline(sel_stats_comp_data, sizeof(sel_stats_comp_data), 8, 8, 1);
         pipeline_sel_weights = make_pipeline(sel_weights_comp_data, sizeof(sel_weights_comp_data), 8, 8, 1);
         pipeline_sel_blend = make_pipeline(sel_blend_comp_data, sizeof(sel_blend_comp_data), 8, 8, 1);
         if (!pipeline_mc_luma || !pipeline_mc_down || !pipeline_mc_blur || !pipeline_mc_search || !pipeline_mc_median
                 || !pipeline_mc_recon || !pipeline_mc_filter || !pipeline_mc_region || !pipeline_mc_blend
-                || !pipeline_mc_motion || !pipeline_nv_flow || !pipeline_nv_warp || !pipeline_sel_stats
+                || !pipeline_mc_motion || !pipeline_nv_flow || !pipeline_nv_warp || !pipeline_nv_splat || !pipeline_sel_stats
                 || !pipeline_sel_weights || !pipeline_sel_blend)
         {
             error = "compilation des shaders de compensation de mouvement impossible";
@@ -1581,8 +1584,35 @@ bool RifeEngine::record_nv(ncnn::VkCompute& cmd, const GpuFrame& a, const GpuFra
         dispatcher.c = 1;
         cmd.record_pipeline(pipeline_nv_flow, bindings, constants, dispatcher);
     }
+    // flux vers t par projection avant : remise à zéro puis dépôt (accumulateur entier, 6 plans)
+    ncnn::VkMat splat = float_mat(6 * w * h);
+    if (splat.empty())
     {
-        std::vector<ncnn::VkMat> bindings(7);
+        error = "allocation mémoire GPU impossible (candidat NV)";
+        return false;
+    }
+    for (int mode = 0; mode < 2; mode++)
+    {
+        std::vector<ncnn::VkMat> bindings(4);
+        bindings[0] = dense_f_gpu;
+        bindings[1] = dense_b_gpu;
+        bindings[2] = dense_inc_cache;
+        bindings[3] = splat;
+        std::vector<ncnn::vk_constant_type> constants(6);
+        constants[0].i = w;
+        constants[1].i = h;
+        constants[2].i = dense_gw;
+        constants[3].i = dense_gh;
+        constants[4].f = t;
+        constants[5].i = mode;
+        ncnn::VkMat dispatcher;
+        dispatcher.w = w;
+        dispatcher.h = h;
+        dispatcher.c = 1;
+        cmd.record_pipeline(pipeline_nv_splat, bindings, constants, dispatcher);
+    }
+    {
+        std::vector<ncnn::VkMat> bindings(8);
         bindings[0] = dense_f_gpu;
         bindings[1] = dense_b_gpu;
         bindings[2] = dense_inc_cache;
@@ -1590,6 +1620,7 @@ bool RifeEngine::record_nv(ncnn::VkCompute& cmd, const GpuFrame& a, const GpuFra
         bindings[4] = b.rgb;
         bindings[5] = nv;
         bindings[6] = maps;
+        bindings[7] = splat;
         std::vector<ncnn::vk_constant_type> constants(10);
         constants[0].i = w;
         constants[1].i = h;

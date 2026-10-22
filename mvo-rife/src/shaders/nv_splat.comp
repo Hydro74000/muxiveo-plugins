@@ -1,0 +1,86 @@
+// Muxiveo — candidat NV : flux vers l'instant t par projection avant (« splatting »). Chaque pixel x de la source 0
+// est déposé en x + t·f01 avec le flux −t·f01, chaque pixel de la source 1 en x + (1−t)·f10 avec −(1−t)·f10, poids
+// bilinéaire × exp(−incohérence aller / retour). Sommes entières en virgule fixe (atomicAdd sur int : déterministe,
+// indépendant de l'ordre d'exécution). mode 0 : remise à zéro ; mode 1 : dépôt.
+// Accumulateur : 6 plans w × h — flux x, flux y, densité (source 0), puis idem (source 1).
+
+#version 450
+
+layout (binding = 0) readonly buffer fwd_blob { float fwd[]; };   // (gh, gw, 2)
+layout (binding = 1) readonly buffer bwd_blob { float bwd[]; };
+layout (binding = 2) readonly buffer inc_blob { float inc[]; };   // 2 plans w × h : inc0, inc1
+layout (binding = 3) buffer acc_blob { int acc[]; };
+
+layout (push_constant) uniform parameter
+{
+    int w;
+    int h;
+    int gw;
+    int gh;
+    float t;
+    int mode;
+} p;
+
+const float FLOW_FX = 1024.f;   // flux : 1/1024 px
+const float DENS_FX = 4096.f;   // poids : 1/4096
+
+vec2 grid_at(int which, int gx, int gy)
+{
+    int i = (clamp(gy, 0, p.gh - 1) * p.gw + clamp(gx, 0, p.gw - 1)) * 2;
+    return which == 0 ? vec2(fwd[i], fwd[i + 1]) : vec2(bwd[i], bwd[i + 1]);
+}
+
+vec2 flow_at(int which, float px, float py)
+{
+    float sx = max((px + 0.5f) * float(p.gw) / float(p.w) - 0.5f, 0.f);
+    float sy = max((py + 0.5f) * float(p.gh) / float(p.h) - 0.5f, 0.f);
+    int x0 = int(floor(sx));
+    int y0 = int(floor(sy));
+    float fx = sx - float(x0);
+    float fy = sy - float(y0);
+    return mix(mix(grid_at(which, x0, y0), grid_at(which, x0 + 1, y0), fx),
+               mix(grid_at(which, x0, y0 + 1), grid_at(which, x0 + 1, y0 + 1), fx), fy);
+}
+
+void deposit(int side, vec2 target, vec2 val, float weight)
+{
+    int plane = p.w * p.h;
+    int x0 = int(floor(target.x));
+    int y0 = int(floor(target.y));
+    for (int k = 0; k < 4; k++)
+    {
+        int cx = x0 + (k & 1);
+        int cy = y0 + (k >> 1);
+        if (cx < 0 || cy < 0 || cx >= p.w || cy >= p.h)
+            continue;
+        float kw = (1.f - abs(target.x - float(cx))) * (1.f - abs(target.y - float(cy))) * weight;
+        if (kw <= 0.f)
+            continue;
+        int i = cy * p.w + cx;
+        int base = side * 3 * plane;
+        atomicAdd(acc[base + i], int(round(kw * val.x * FLOW_FX)));
+        atomicAdd(acc[base + plane + i], int(round(kw * val.y * FLOW_FX)));
+        atomicAdd(acc[base + 2 * plane + i], int(round(kw * DENS_FX)));
+    }
+}
+
+void main()
+{
+    int gx = int(gl_GlobalInvocationID.x);
+    int gy = int(gl_GlobalInvocationID.y);
+    if (gx >= p.w || gy >= p.h)
+        return;
+    int i = gy * p.w + gx;
+    if (p.mode == 0)
+    {
+        for (int s = 0; s < 6; s++)
+            acc[s * p.w * p.h + i] = 0;
+        return;
+    }
+    vec2 x = vec2(float(gx), float(gy));
+    float t = p.t;
+    vec2 f01 = flow_at(0, x.x, x.y);
+    vec2 f10 = flow_at(1, x.x, x.y);
+    deposit(0, x + t * f01, -t * f01, exp(-inc[i]));
+    deposit(1, x + (1.f - t) * f10, -(1.f - t) * f10, exp(-inc[p.w * p.h + i]));
+}

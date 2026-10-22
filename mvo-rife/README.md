@@ -8,6 +8,18 @@ Extension de Muxiveo : installée, mise à jour et supprimée par l'application 
 utilisateur. Le moteur, ses modèles, les poids de son sélecteur et ses préréglages évoluent sans release de
 Muxiveo : l'application retient la version la plus récente dont le contrat (`--capabilities`) lui est connu.
 
+## Nouveautés 1.11.0
+
+- Moteur hybride, candidat NV (flux optique NVIDIA) : le flux vers l'instant interpolé est obtenu par projection avant
+  (chaque pixel des deux sources déposé à sa position à l'instant t, pondéré par la cohérence aller / retour du flux)
+  au lieu d'une approximation prise à la position des sources ; une zone découverte est prise sur la seule source qui
+  la voit. Bords d'objets en mouvement, flou rapide, pluie : beaucoup moins de taches (fond voisin ramené dans le
+  premier plan).
+- Sommes en virgule fixe (additions atomiques entières) : résultat déterministe, indépendant de l'ordre d'exécution.
+- Qualité mesurée sur les bancs de référence (×2 et ×2,5 avec vérité terrain) : en hausse ou inchangée pour Qualité,
+  Équilibré et Ultra, sans régression ; sans flux NVIDIA, sortie identique à la 1.10.0 ; coût de calcul : environ
+  +5 % en Vulkan (Qualité 4K ×2,5).
+
 ## Nouveautés 1.10.0
 
 - Moteur hybride, motifs répétitifs (façades à grilles de fenêtres, barreaux, rambardes) : la compensation de
@@ -134,7 +146,7 @@ zone par zone, le mélange des candidats calculés pour chaque image :
 | R05 | RIFE à flux demi-résolution | paires à grand mouvement (`--large-motion`) |
 | MC | compensation de mouvement par blocs | toujours |
 | Rbwd | RIFE dans le sens inverse (sources échangées, `1 - t`) | `--ultra` |
-| NV | déformation dense par le flux optique NVIDIA | carte NVIDIA avec NVOFA |
+| NV | flux optique NVIDIA projeté à l'instant t (1.11.0), déformation dense | carte NVIDIA avec NVOFA |
 
 - Blocs proportionnels à la largeur de l'image (`largeur / 120`, de 8 px en SD à 64 px en 8K) : même
   comportement de la SD à la 8K. Poids des candidats interpolés entre centres de blocs (aucune couture).
