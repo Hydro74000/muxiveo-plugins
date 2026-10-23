@@ -25,10 +25,11 @@ Muxiveo : l'application retient la version la plus récente dont le contrat (`--
 - Sélecteur : R05 ou NV seul contre RIFE et MC concordants est écarté aussi sur motif répétitif à mouvement modéré
   (quelques vecteurs MC aberrants tolérés) et, pour R05, partout où le mouvement reste lent ; dans une zone lente où
   RIFE et MC concordent, R05 ne s'écarte plus de RIFE de plus de 16 codes par pixel (traits fins, montants de façade
-  vitrée : plus de fantômes).
-- Qualité mesurée sur les bancs de référence (×2 et ×2,5 avec vérité terrain) : en hausse en moyenne (VMAF) pour
-  Qualité, Équilibré et Ultra, PSNR moyen inchangé, une scène de mouvement fort en léger retrait (≈ −0,05 dB) ; coût de
-  calcul : environ +3 % en Vulkan (Qualité 4K ×2,5).
+  vitrée : plus de fantômes), sauf écart étalé sans structure voisine (mouvement que MC ne voit pas : lueurs sombres en
+  mouvement rapide, où R05 est juste).
+- Qualité mesurée sur les bancs de référence (×2 et ×2,5 avec vérité terrain) : en hausse en moyenne (PSNR et VMAF)
+  pour Qualité, Équilibré et Ultra ; une scène de mouvement fort en léger retrait sans flux NVIDIA (≈ −0,05 dB) ; coût
+  de calcul : environ +3 % en Vulkan (Qualité 4K ×2,5).
 
 ## Nouveautés 1.10.0
 

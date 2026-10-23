@@ -2,7 +2,7 @@
 // l'apprentissage : désaccords des candidats présents (R05, MC, Rbwd, NV), texture, écart temporel, luminance,
 // désaccords dilatés (maximum 3 × 3 blocs), [incohérence, amplitude NVOF], bord, échelle log2(bloc / 16).
 // x = (log(f + 1e-3) - mu) / sd (bord et échelle : valeur brute). Sortie : 5 poids par bloc (R1, R05, MC,
-// Rbwd, NV) et l'écrêtage par pixel de R05 autour de R1 (0 : aucun), lu par sel_blend.comp. Bord : 1 si le bloc est à moins de B/2 px d'un bord de l'image (MC et NV y échantillonnent hors cadre).
+// Rbwd, NV) et la part d'écrêtage par pixel de R05 autour de R1 (0 ou 1), lue par sel_blend.comp. Bord : 1 si le bloc est à moins de B/2 px d'un bord de l'image (MC et NV y échantillonnent hors cadre).
 
 #version 450
 
@@ -52,14 +52,16 @@ layout (push_constant) uniform parameter
     float nv_iso_ratio;   // |NV - R1| au moins ce multiple de |MC - R1| (0 : désactivé)
     float r05_lone_ratio; // hors motif répétitif : |R05 - R1| au moins ce multiple de |MC - R1| (0 : désactivé)
     float r05_iso_cons;   // consensus R1 / MC exigé pour écarter R05 sur motif répétitif
-    float r05_thin_abs;   // trait fin : pire sous-bloc de |R05 - R1| minimal...
-    float r05_thin_ratio; // ...et rapport au pire sous-bloc de |MC - R1| (0 : désactivé)
-    float r05_clamp;      // écrêtage par pixel de R05 autour de R1 en zone lente consensuelle (RGB, 0 : désactivé)
+    float r05_clamp;      // écrêtage par pixel de R05 autour de R1 en zone lente consensuelle (codes, 0 : désactivé)...
+    float r05_clamp_spread_abs; // ...sauf écart de R05 à R1 net (au-delà de ce seuil)...
+    float r05_clamp_conc; // ...étalé (pire quart de bloc sous ce multiple de la moyenne du bloc)...
+    float r05_clamp_tex;  // ...sans structure dans le voisinage (texture maximale 3 × 3 sous ce seuil)...
+    float r05_clamp_cons; // ...et |MC - R1| du bloc sous ce seuil
 } p;
 
 float stat(int bx, int by, int k)
 {
-    return stats[(clamp(by, 0, p.nby - 1) * p.nbx + clamp(bx, 0, p.nbx - 1)) * 15 + k];
+    return stats[(clamp(by, 0, p.nby - 1) * p.nbx + clamp(bx, 0, p.nbx - 1)) * 14 + k];
 }
 
 // condition « priorité MC » d'un bloc (statistiques du bloc seul)
@@ -221,11 +223,6 @@ void main()
     bool drop_r05 = (p.cands & 2) != 0 && p.r05_abs > 0.f && stat(bx, by, 0) > p.r05_abs
                     && stat(bx, by, 0) > p.r05_ratio * r05_cons
                     && (r05_max <= 0.f || r05_cons < r05_max);
-    // trait fin dédoublé (montants de façade, câbles) : pire sous-bloc de R05 nettement au-delà de celui de MC, R1 et MC
-    // concordants, mouvement lent partout dans le voisinage (aucun vecteur MC au-delà du seuil des grands mouvements)
-    drop_r05 = drop_r05 || ((p.cands & 2) != 0 && p.r05_thin_ratio > 0.f && p.mc_bw > 0 && n_slow_out == 0
-                            && stat(bx, by, 13) > p.r05_thin_abs && stat(bx, by, 13) > p.r05_thin_ratio * stat(bx, by, 14)
-                            && mc_cons < p.r05_mc_max_slow);
     float sum = 0.f;
     for (int c = 0; c < k; c++)
     {
@@ -238,8 +235,18 @@ void main()
     // zone lente (aucun vecteur MC voisin au-delà du seuil des grands mouvements), R1 et MC concordants : R05 n'y apporte
     // que de petites corrections (zones lisses) ; écrêté par pixel autour de R1, il ne dédouble plus les traits fins
     // (montants de façade vitrée)
-    weights[o + 5] = (p.cands & 2) != 0 && p.r05_clamp > 0.f && p.mc_bw > 0 && n_slow_out == 0
-                     && mc_cons < p.r05_mc_max_slow ? p.r05_clamp : 0.f;
+    // sauf mouvement que le champ MC ne voit pas (zones sombres sans texture, lueurs floues en mouvement rapide, où R05
+    // est juste) : écart de R05 à R1 net, étalé sur le bloc (un trait fin dédoublé le concentre dans un quart de bloc)
+    // et aucune structure contrastée dans le voisinage 3 × 3 (sinon trait déplacé : montants de façade)
+    float tex9 = 0.f;
+    for (int dy = -1; dy <= 1; dy++)
+        for (int dx = -1; dx <= 1; dx++)
+            tex9 = max(tex9, stat(bx + dx, by + dy, 4));
+    bool r05_spread = stat(bx, by, 0) > p.r05_clamp_spread_abs && stat(bx, by, 13) < p.r05_clamp_conc * stat(bx, by, 0)
+                      && tex9 < p.r05_clamp_tex;
+    // consensus R1 / MC du bloc lui-même (la médiane du voisinage le masque au bord d'un aplat : R1 seul, R05 avec MC)
+    weights[o + 5] = (p.cands & 2) != 0 && p.r05_clamp > 0.f && p.mc_bw > 0 && n_slow_out == 0 && !r05_spread
+                     && stat(bx, by, 1) < p.r05_clamp_cons ? 1.f : 0.f;
     // priorité MC : motif répétitif (bardage, façade quadrillée) où le champ MC explique bien les deux sources et où
     // l'image de RIFE s'en écarte nettement sur une zone étendue (RIFE ondule) ; pas là où MC se contredit (blocs
     // voisins sur des périodes différentes d'un motif irrégulier : l'OBMC y dédouble)

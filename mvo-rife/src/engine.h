@@ -314,13 +314,15 @@ private:
     // Hors motif répétitif : R05 au moins r05_guard_lone_ratio × |MC - R1| (consensus médian), au plus iso_guard_frac
     // des vecteurs MC au-delà de lm_lo : même traitement (0 : désactivé)
     float r05_guard_lone_ratio = 20.f;
-    // Trait fin dédoublé : R05 écarté si le pire quart de bloc de |R05 - R1| dépasse r05_guard_thin_abs et
-    // r05_guard_thin_ratio × celui de |MC - R1|, consensus élargi, aucun vecteur MC voisin au-delà de lm_lo
-    float r05_guard_thin_abs = 16.f / 1023.f;
-    float r05_guard_thin_ratio = 0.f;
-    // Zone lente consensuelle (aucun vecteur MC voisin au-delà de lm_lo, consensus élargi) : R05 écrêté par pixel à
-    // R1 ± r05_guard_clamp codes 10 bits (0 : désactivé)
+    // Zone lente consensuelle (aucun vecteur MC voisin au-delà de lm_lo, |MC - R1| du bloc sous r05_guard_clamp_cons) :
+    // R05 écrêté par pixel à R1 ± r05_guard_clamp codes 10 bits (0 : désactivé), sauf écart de R05 net (au-delà de
+    // r05_guard_clamp_spread), étalé (pire quart de bloc sous r05_guard_clamp_conc × moyenne) et sans structure voisine
+    // (texture 3 × 3 sous r05_guard_clamp_tex) : mouvement réel que MC ne voit pas (lueurs sombres), où R05 est juste
     float r05_guard_clamp = 16.f;
+    float r05_guard_clamp_spread = 8.f / 1023.f;
+    float r05_guard_clamp_conc = 2.f;
+    float r05_guard_clamp_tex = 0.0075f;
+    float r05_guard_clamp_cons = 20.f / 1023.f;
     // Priorité MC sur motif répétitif (bardage, façade quadrillée) : source périodique (périodicité < -1), champ MC
     // bien expliqué (erreur bilatérale < 10 codes) et RIFE nettement différent (|MC - R1| > 6 codes) sur une zone
     // étendue (au moins 3 blocs du voisinage 3 × 3), MC cohérent avec lui-même (prédictions OBMC des blocs voisins à

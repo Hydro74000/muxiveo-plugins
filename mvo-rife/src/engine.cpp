@@ -1687,7 +1687,7 @@ bool RifeEngine::record_selector(ncnn::VkCompute& cmd, const GpuFrame& a, const 
     int plevel = 0;
     while (plevel < 2 && (block >> (plevel + 1)) >= 8)
         plevel++;
-    ncnn::VkMat stats = float_mat(nbx * nby * 15);
+    ncnn::VkMat stats = float_mat(nbx * nby * 14);
     ncnn::VkMat weights = float_mat(nbx * nby * 6);
     out.create(w_padded, h_padded, 3, cand[0]->elemsize, 1, blob_vkallocator);
     if (stats.empty() || weights.empty() || out.empty())
@@ -1756,7 +1756,7 @@ bool RifeEngine::record_selector(ncnn::VkCompute& cmd, const GpuFrame& a, const 
         bindings[1] = sel_models;
         bindings[2] = weights;
         bindings[3] = cached_field.empty() ? dummy : cached_field;
-        std::vector<ncnn::vk_constant_type> constants(41);
+        std::vector<ncnn::vk_constant_type> constants(43);
         constants[0].i = nbx;
         constants[1].i = nby;
         constants[2].i = mi * 128;
@@ -1796,10 +1796,11 @@ bool RifeEngine::record_selector(ncnn::VkCompute& cmd, const GpuFrame& a, const 
         constants[35].f = nv_guard_iso_ratio;
         constants[36].f = r05_guard_lone_ratio;
         constants[37].f = r05_guard_iso_cons;
-        constants[38].f = r05_guard_thin_abs;
-        constants[39].f = r05_guard_thin_ratio;
-        // écrêtage en codes 10 bits de luminance ramené aux composantes RGB (échelle de la luminance d'apprentissage)
-        constants[40].f = r05_guard_clamp / (color.full_range ? 1023.f : 876.f);
+        constants[38].f = r05_guard_clamp;
+        constants[39].f = r05_guard_clamp_spread;
+        constants[40].f = r05_guard_clamp_conc;
+        constants[41].f = r05_guard_clamp_tex;
+        constants[42].f = r05_guard_clamp_cons;
         ncnn::VkMat dispatcher;
         dispatcher.w = nbx;
         dispatcher.h = nby;
@@ -1815,7 +1816,7 @@ bool RifeEngine::record_selector(ncnn::VkCompute& cmd, const GpuFrame& a, const 
         bindings[4] = bind(cand[4]);
         bindings[5] = weights;
         bindings[6] = out;
-        std::vector<ncnn::vk_constant_type> constants(14);
+        std::vector<ncnn::vk_constant_type> constants(15);
         constants[0].i = w;
         constants[1].i = h;
         constants[2].i = w_padded;
@@ -1830,6 +1831,8 @@ bool RifeEngine::record_selector(ncnn::VkCompute& cmd, const GpuFrame& a, const 
         constants[11].i = cs(cand[3]);
         constants[12].i = cs(cand[4]);
         constants[13].i = (int)out.cstep;
+        // écrêtage en codes 10 bits de luminance ramené aux composantes RGB (échelle de la luminance d'apprentissage)
+        constants[14].f = r05_guard_clamp / (color.full_range ? 1023.f : 876.f);
         ncnn::VkMat dispatcher;
         dispatcher.w = w_padded;
         dispatcher.h = h_padded;

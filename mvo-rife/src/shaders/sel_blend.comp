@@ -1,6 +1,6 @@
 // Muxiveo — sélecteur : image finale = somme des candidats pondérée par les poids des blocs, interpolés
 // bilinéairement entre les centres de blocs (pas de couture). Hors image utile : R1. R05 écrêté par pixel autour de R1
-// là où le bloc le demande (zone lente consensuelle, sel_weights.comp).
+// là où les blocs le demandent (zone lente consensuelle, sel_weights.comp), part érodée puis interpolée comme les poids.
 
 #version 450
 
@@ -32,11 +32,19 @@ layout (push_constant) uniform parameter
     int cs_rb;
     int cs_nv;
     int cs_out;
+    float r05_clamp; // écart maximal de R05 à R1 par pixel là où le bloc le demande (RGB)
 } p;
 
 float wt(int bx, int by, int s)
 {
     return weights[(clamp(by, 0, p.nby - 1) * p.nbx + clamp(bx, 0, p.nbx - 1)) * 6 + s];
+}
+
+// part d'écrêtage érodée : le bloc et ses quatre voisins doivent la demander (la transition interpolée reste dans la
+// zone, pas sur le bloc voisin où R05 peut avoir raison : bord d'un aplat)
+float clamp_part(int bx, int by)
+{
+    return min(min(wt(bx, by, 5), min(wt(bx - 1, by, 5), wt(bx + 1, by, 5))), min(wt(bx, by - 1, 5), wt(bx, by + 1, 5)));
 }
 
 void main()
@@ -58,10 +66,12 @@ void main()
     int y0 = int(floor(cy));
     float fx = clamp(cx - float(x0), 0.f, 1.f);
     float fy = clamp(cy - float(y0), 0.f, 1.f);
-    float w5[5];
+    float w5[6];
     for (int s = 0; s < 5; s++)
         w5[s] = mix(mix(wt(x0, y0, s), wt(x0 + 1, y0, s), fx), mix(wt(x0, y0 + 1, s), wt(x0 + 1, y0 + 1, s), fx), fy);
-    float cl = wt(gx / p.block, gy / p.block, 5);
+    w5[5] = 0.f;
+    if ((p.cands & 2) != 0 && p.r05_clamp > 0.f)
+        w5[5] = mix(mix(clamp_part(x0, y0), clamp_part(x0 + 1, y0), fx), mix(clamp_part(x0, y0 + 1), clamp_part(x0 + 1, y0 + 1), fx), fy);
     for (int c = 0; c < 3; c++)
     {
         float y1 = float(r1[c * p.cs_r1 + i]);
@@ -69,7 +79,7 @@ void main()
         if ((p.cands & 2) != 0)
         {
             float y05 = float(r05[c * p.cs_r05 + i]);
-            v += w5[1] * (cl > 0.f ? y1 + clamp(y05 - y1, -cl, cl) : y05);
+            v += w5[1] * mix(y05, y1 + clamp(y05 - y1, -p.r05_clamp, p.r05_clamp), w5[5]);
         }
         if ((p.cands & 8) != 0)
             v += w5[3] * float(rb[c * p.cs_rb + i]);
