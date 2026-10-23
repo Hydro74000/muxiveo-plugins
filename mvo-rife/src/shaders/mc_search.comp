@@ -10,7 +10,8 @@
 // mode 3 : arbitrage entre le champ `parent` (principal) et `hints` (autre hypothèse) du même niveau : la seconde
 //          gagne si coût ≤ coût principal × (1 + lambda_) + hint_penalty (et texture du bloc ≥ alt_tex).
 // Échantillon hors de l'image (vecteur sortant du cadre) : erreur `outside` (pixel mal expliqué), pas ignoré.
-// 8 candidats évalués en parallèle (8 équipes de 32 threads) ; premier minimum strict retenu.
+// 8 candidats évalués en parallèle (8 équipes de 32 threads) ; premier minimum strict retenu. Mode 3 (deux candidats) :
+// 4 équipes par candidat. Mode 1 pleine résolution : décalages entiers d'abord, puis demi-pixel autour du meilleur.
 
 #version 450
 
@@ -54,7 +55,9 @@ shared float s_cost[8];
 shared vec2 s_best;
 shared float s_best_cost;
 shared vec2 s_pred;
-shared vec2 s_candidates[31];
+shared vec2 s_candidates[40];
+shared vec2 s_vec[8];
+shared bool s_best_hint;
 shared int s_total;
 shared int s_first_hint;
 
@@ -180,14 +183,17 @@ void main()
     else
         total = 29 + (p.full_res != 0 ? p.nhints : 0);
 
+    // mode 1 pleine résolution : décalages entiers (±1) d'abord, puis les 8 demi-pixels autour du meilleur candidat
+    bool two_step = p.mode == 1 && p.full_res != 0;
     if (lid == 0)
     {
         s_best = vec2(0.f);
         s_best_cost = 3.4e38f;
+        s_best_hint = false;
         s_pred = p.mode == 0 ? vec2(0.f) : (p.mode == 2 ? median_pred(bx, by) : parent_at(bx, by));
         s_total = total;
         s_first_hint = 29;
-        if (p.mode != 0 && total <= 31)
+        if (p.mode != 0 && total <= 40)
         {
             s_total = 0;
             for (int k = 0; k < total; k++)
@@ -195,6 +201,13 @@ void main()
                 int kk = p.mode == 2 ? (k < 9 ? (k + 4) % 9 : 9) : k;
                 if (p.mode == 1 && kk == 29)
                     s_first_hint = s_total;
+                if (two_step && kk >= 5 && kk < 29)
+                {
+                    int s5 = kk - 5;
+                    int idx = s5 < 12 ? s5 : s5 + 1;
+                    if ((idx % 5) % 2 == 1 || (idx / 5) % 2 == 1)
+                        continue;   // décalage demi-pixel : second temps, autour du meilleur
+                }
                 vec2 v = candidate(kk, bx, by, s_pred);
                 bool duplicate = false;
                 for (int j = 0; j < s_total; j++)
@@ -207,13 +220,31 @@ void main()
     }
     barrier();
     vec2 pred = s_pred;
-    bool compact = p.mode != 0 && total <= 31;
+    bool compact = p.mode != 0 && total <= 40;
     total = s_total;
     // mode 0 au pas de 0,5 : recherche entière, puis demi-pixel autour des trois meilleurs minima locaux
-    int stages = p.mode == 0 && p.coarse_step < 1.f && p.radius <= 8 ? 2 : 1;
+    int stages = (p.mode == 0 && p.coarse_step < 1.f && p.radius <= 8) || (two_step && compact) ? 2 : 1;
+    int tpc = p.mode == 3 ? 4 : 1;   // équipes par candidat
+    int per_round = 8 / tpc;
     for (int stage = 0; stage < stages; stage++)
     {
-    if (stage == 1)
+    if (stage == 1 && two_step)
+    {
+        if (lid == 0)
+        {
+            int n = 0;
+            for (int dy = -1; dy <= 1; dy++)
+                for (int dx = -1; dx <= 1; dx++)
+                    if (dx != 0 || dy != 0)
+                        s_candidates[n++] = s_best + 0.5f * vec2(float(dx), float(dy));
+            s_total = n;
+            s_first_hint = s_best_hint ? 0 : 1000;   // autour d'un candidat externe : même surcoût
+        }
+        barrier();
+        total = s_total;
+        compact = true;
+    }
+    else if (stage == 1)
     {
         if (lid == 0)
         {
@@ -269,21 +300,23 @@ void main()
         total = s_total;
         compact = true;
     }
-    for (int base = 0; base < total; base += 8)
+    for (int base = 0; base < total; base += per_round)
     {
-        int k = base + team;
+        int slot = team / tpc;
+        int sub = team % tpc;
+        int k = base + slot;
         float diff = 0.f;
         float cnt = 0.f;
         float inside = 0.f;
         vec2 v = vec2(0.f);
+        int wn = 16 + 2 * p.margin;
         if (k < total)
         {
             // mode 2 : bloc courant évalué en premier
             int kk = p.mode == 2 ? (k < 9 ? (k + 4) % 9 : 9) : k;
             v = compact ? s_candidates[k] : candidate(kk, bx, by, pred);
-            int wn = 16 + 2 * p.margin;
             int wq = wn * wn;
-            for (int q = lane; q < wq; q += 32)
+            for (int q = sub * 32 + lane; q < wq; q += 32 * tpc)
             {
                 int x = bx * 16 - p.margin + q % wn;
                 int y = by * 16 - p.margin + q / wn;
@@ -305,10 +338,9 @@ void main()
         s_cnt[lid] = cnt;
         s_in[lid] = inside;
         float tx = 0.f;
-        if (p.mode == 3 && team == 0 && p.alt_tex > 0.f)
+        if (p.mode == 3 && team < tpc && p.alt_tex > 0.f)
         {
-            int wn = 16 + 2 * p.margin;
-            for (int q = lane; q < wn * wn; q += 32)
+            for (int q = sub * 32 + lane; q < wn * wn; q += 32 * tpc)
             {
                 int x = clamp(bx * 16 - p.margin + q % wn, 0, p.iw - 2);
                 int y = clamp(by * 16 - p.margin + q / wn, 0, p.ih - 2);
@@ -318,50 +350,51 @@ void main()
         }
         s_tx[lid] = tx;
         barrier();
-        if (lane == 0)
+        if (lane == 0 && sub == 0)
         {
             float d = 0.f;
             float c = 0.f;
             float in_ = 0.f;
-            for (int i = 0; i < 32; i++)
-            {
-                d += s_diff[team * 32 + i];
-                c += s_cnt[team * 32 + i];
-                in_ += s_in[team * 32 + i];
-            }
-            float wn = float(16 + 2 * p.margin);
-            float cost = in_ > 0.25f * wn * wn ? (d + (in_ - c) * p.outside) / in_ : 0.f;
+            for (int tm = 0; tm < tpc; tm++)
+                for (int i = 0; i < 32; i++)
+                {
+                    d += s_diff[(team + tm) * 32 + i];
+                    c += s_cnt[(team + tm) * 32 + i];
+                    in_ += s_in[(team + tm) * 32 + i];
+                }
+            float fwn = float(wn);
+            float cost = in_ > 0.25f * fwn * fwn ? (d + (in_ - c) * p.outside) / in_ : 0.f;
             float lam = p.mode == 0 ? p.lambda_ * length(v) : (p.mode == 3 ? 0.f : p.lambda_ * length(v - pred));
             if (p.mode == 1 && p.full_res != 0 && p.nhints > 0 && k >= s_first_hint)
                 lam += p.hint_penalty;
-            s_cost[team] = k < total ? cost + lam : 3.4e38f;
+            s_cost[slot] = k < total ? cost + lam : 3.4e38f;
             if (p.mode == 0 && stage == 0 && k < total && k < 289)
                 s_all[k] = cost + lam;
-            s_diff[team * 32] = v.x;   // vecteur de l'équipe (réutilise la mémoire partagée)
-            s_cnt[team * 32] = v.y;
+            s_vec[slot] = v;
         }
         barrier();
         if (lid == 0 && p.mode == 3)
         {
             // arbitrage : hypothèse 1 si coût quasi égal (et structure contrastée)
-            s_best = vec2(s_diff[0], s_cnt[0]);
+            s_best = s_vec[0];
             float txm = 0.f;
-            for (int i = 0; i < 32; i++)
+            for (int i = 0; i < 32 * tpc; i++)
                 txm += s_tx[i];
-            float wn = float(16 + 2 * p.margin);
-            txm /= wn * wn;
+            float fwn = float(wn);
+            txm /= fwn * fwn;
             if (total > 1 && (p.alt_tex <= 0.f || txm >= p.alt_tex)
                     && s_cost[1] <= s_cost[0] * (1.f + p.lambda_) + p.hint_penalty)
-                s_best = vec2(s_diff[32], s_cnt[32]);
+                s_best = s_vec[1];
         }
         else if (lid == 0)
         {
             // ordre croissant des candidats : premier minimum strict retenu
-            for (int i = 0; i < 8; i++)
+            for (int i = 0; i < per_round; i++)
                 if (s_cost[i] < s_best_cost)
                 {
                     s_best_cost = s_cost[i];
-                    s_best = vec2(s_diff[i * 32], s_cnt[i * 32]);
+                    s_best = s_vec[i];
+                    s_best_hint = base + i >= s_first_hint;
                 }
         }
         barrier();

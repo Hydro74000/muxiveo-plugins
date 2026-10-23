@@ -1,4 +1,5 @@
-// Muxiveo — sélecteur : statistiques par bloc (une invocation par bloc de B px, pixels utiles seulement).
+// Muxiveo — sélecteur : statistiques par bloc (un groupe de 16 × 16 invocations par bloc de B px, pixels utiles
+// seulement ; sommes partielles par invocation puis réduction en mémoire partagée).
 // Luminance du domaine d'apprentissage : y = y_a + y_b · (kr R + kg G + kb B) (codes 10 bits limités / 1023).
 // Sorties (14 par bloc) : |y(R05) - y(R1)|, |y(MC) - y(R1)|, |y(Rbwd) - y(R1)|, |y(NV) - y(R1)|, texture
 // (|dx| + |dy| moyen des deux sources), |y(A) - y(B)|, y(R1), incohérence NVOF / 64, amplitude NVOF / 64 ; erreur
@@ -62,24 +63,6 @@ layout (push_constant) uniform parameter
                        // non calculés
 } p;
 
-// D(s) moyen sur la fenêtre [wx0, wx1) × [wy0, wy1) du niveau, direction horizontale (dir 0) ou verticale (dir 1)
-float shift_diff(int wx0, int wx1, int wy0, int wy1, int s, int dir)
-{
-    float acc = 0.f;
-    float cnt = 0.f;
-    for (int y = wy0; y < wy1; y++)
-        for (int x = wx0; x < wx1; x++)
-        {
-            int x2 = dir == 0 ? x + s : x;
-            int y2 = dir == 0 ? y : y + s;
-            if (x2 >= p.liw || y2 >= p.lih)
-                continue;
-            acc += abs(plum[y * p.lw + x] - plum[y2 * p.lw + x2]);
-            cnt += 1.f;
-        }
-    return cnt > 0.f ? acc / cnt : 0.f;
-}
-
 float lum(float r, float g, float b)
 {
     return p.ya + p.yb * (p.kr * r + (1.f - p.kr - p.kb) * g + p.kb * b);
@@ -112,16 +95,47 @@ float lum_at(int which, float x, float y)
     return mix(mix(v00, v01, fx), mix(v10, v11, fx), fy);
 }
 
+shared vec4 red[256];
+int lid;
+
+// somme de quatre valeurs sur les 256 invocations du groupe
+vec4 reduce4(vec4 v)
+{
+    red[lid] = v;
+    barrier();
+    for (int s = 128; s > 0; s >>= 1)
+    {
+        if (lid < s)
+            red[lid] += red[lid + s];
+        barrier();
+    }
+    vec4 r = red[0];
+    barrier();
+    return r;
+}
+
+// nombre de valeurs entières x de [a, b) telles que (x - a) * 4 / bs == c (colonne ou ligne c d'un quart de bloc)
+int quarter_count(int a, int b, int bs, int c)
+{
+    int n = 0;
+    for (int x = a; x < b; x++)
+        n += (x - a) * 4 / bs == c ? 1 : 0;
+    return n;
+}
+
 void main()
 {
-    int bx = int(gl_GlobalInvocationID.x);
-    int by = int(gl_GlobalInvocationID.y);
+    int bx = int(gl_WorkGroupID.x);
+    int by = int(gl_WorkGroupID.y);
+    lid = int(gl_LocalInvocationIndex);
     if (bx >= p.nbx || by >= p.nby)
         return;
     int x0 = bx * p.block;
     int y0 = by * p.block;
     int x1 = min(x0 + p.block, p.w);
     int y1 = min(y0 + p.block, p.h);
+    int bwid = x1 - x0;
+    int npx = bwid * (y1 - y0);
     bool has_r05 = (p.cands & 2) != 0;
     bool has_rb = (p.cands & 8) != 0;
     bool has_nv = (p.cands & 16) != 0;
@@ -129,62 +143,66 @@ void main()
     for (int k = 0; k < 14; k++)
         s[k] = 0.f;
     float sub05[16];
-    float subn[16];
     for (int k = 0; k < 16; k++)
-    {
         sub05[k] = 0.f;
-        subn[k] = 0.f;
-    }
-    for (int y = y0; y < y1; y++)
+    for (int q = lid; q < npx; q += 256)
     {
-        for (int x = x0; x < x1; x++)
+        int x = x0 + q % bwid;
+        int y = y0 + q / bwid;
+        int i = y * p.pw + x;
+        float yr = LUM(r1, p.cs_r1, i);
+        if (has_r05)
         {
-            int i = y * p.pw + x;
-            float yr = LUM(r1, p.cs_r1, i);
-            int sk = ((y - y0) * 4 / p.block) * 4 + (x - x0) * 4 / p.block;
-            if (has_r05)
-            {
-                float d = abs(LUM(r05, p.cs_r05, i) - yr);
-                s[0] += d;
-                sub05[sk] += d;
-            }
-            s[1] += abs(LUM(mc, p.cs_mc, i) - yr);
-            subn[sk] += 1.f;
-            if (has_rb)
-                s[2] += abs(LUM(rb, p.cs_rb, i) - yr);
-            if (has_nv)
-                s[3] += abs(LUM(nv, p.cs_nv, i) - yr);
-            if (p.reuse_sources == 0)
-            {
-                float ya = LUM(a_data, p.cs_src, i);
-                float yb = LUM(b_data, p.cs_src, i);
-                float ga = 0.f;
-                float gb = 0.f;
-                if (x + 1 < p.w)
-                {
-                    ga += abs(LUM(a_data, p.cs_src, i + 1) - ya);
-                    gb += abs(LUM(b_data, p.cs_src, i + 1) - yb);
-                }
-                if (y + 1 < p.h)
-                {
-                    ga += abs(LUM(a_data, p.cs_src, i + p.pw) - ya);
-                    gb += abs(LUM(b_data, p.cs_src, i + p.pw) - yb);
-                }
-                s[4] += (ga + gb) / 2.f;
-                s[5] += abs(ya - yb);
-                if (has_nv)
-                {
-                    int j = y * p.w + x;
-                    s[7] += maps[j] / 64.f;
-                    s[8] += maps[p.w * p.h + j] / 64.f;
-                }
-            }
-            s[6] += yr;
-
+            float d = abs(LUM(r05, p.cs_r05, i) - yr);
+            s[0] += d;
+            sub05[((y - y0) * 4 / p.block) * 4 + (x - x0) * 4 / p.block] += d;
         }
+        s[1] += abs(LUM(mc, p.cs_mc, i) - yr);
+        if (has_rb)
+            s[2] += abs(LUM(rb, p.cs_rb, i) - yr);
+        if (has_nv)
+            s[3] += abs(LUM(nv, p.cs_nv, i) - yr);
+        if (p.reuse_sources == 0)
+        {
+            float ya = LUM(a_data, p.cs_src, i);
+            float yb = LUM(b_data, p.cs_src, i);
+            float ga = 0.f;
+            float gb = 0.f;
+            if (x + 1 < p.w)
+            {
+                ga += abs(LUM(a_data, p.cs_src, i + 1) - ya);
+                gb += abs(LUM(b_data, p.cs_src, i + 1) - yb);
+            }
+            if (y + 1 < p.h)
+            {
+                ga += abs(LUM(a_data, p.cs_src, i + p.pw) - ya);
+                gb += abs(LUM(b_data, p.cs_src, i + p.pw) - yb);
+            }
+            s[4] += (ga + gb) / 2.f;
+            s[5] += abs(ya - yb);
+            if (has_nv)
+            {
+                int j = y * p.w + x;
+                s[7] += maps[j] / 64.f;
+                s[8] += maps[p.w * p.h + j] / 64.f;
+            }
+        }
+        s[6] += yr;
     }
-    float n = float(max((x1 - x0) * (y1 - y0), 1));
-    // périodicité de la source A (statistique de sources : calculée une fois par paire)
+    vec4 r0 = reduce4(vec4(s[0], s[1], s[2], s[3]));
+    vec4 r1_ = reduce4(vec4(s[4], s[5], s[6], s[7]));
+    float s8 = reduce4(vec4(s[8], 0.f, 0.f, 0.f)).x;
+    s[0] = r0.x; s[1] = r0.y; s[2] = r0.z; s[3] = r0.w;
+    s[4] = r1_.x; s[5] = r1_.y; s[6] = r1_.z; s[7] = r1_.w;
+    s[8] = s8;
+    for (int k = 0; k < 16; k += 4)
+    {
+        vec4 r = reduce4(vec4(sub05[k], sub05[k + 1], sub05[k + 2], sub05[k + 3]));
+        sub05[k] = r.x; sub05[k + 1] = r.y; sub05[k + 2] = r.z; sub05[k + 3] = r.w;
+    }
+    float n = float(max(npx, 1));
+    // périodicité de la source A (statistique de sources : calculée une fois par paire) ; D(s) : somme répartie sur les
+    // invocations, nombre de couples calculé directement
     if (p.reuse_sources == 0 && p.lum_on != 0)
     {
         int bl = p.block >> p.plevel;
@@ -194,62 +212,107 @@ void main()
         int wy0 = max((y0 >> p.plevel) - bl / 2, 0);
         int wy1 = min(((by + 1) * p.block >> p.plevel) + bl / 2, p.lih);
         int r = max(1, int(floor(k + 0.5f)));
+        int ww = max(wx1 - wx0, 0);
+        int nw = ww * max(wy1 - wy0, 0);
         for (int dir = 0; dir < 2; dir++)
         {
+            // décalages : r puis max(1, arrondi(j · k)) pour j = 2 … 16
+            float acc[16];
+            for (int j = 0; j < 16; j++)
+                acc[j] = 0.f;
+            for (int q = lid; q < nw; q += 256)
+            {
+                int x = wx0 + q % ww;
+                int y = wy0 + q / ww;
+                float c0 = plum[y * p.lw + x];
+                for (int j = 0; j < 16; j++)
+                {
+                    int sh = j == 0 ? r : max(1, int(floor(float(j + 1) * k + 0.5f)));
+                    int x2 = dir == 0 ? x + sh : x;
+                    int y2 = dir == 0 ? y : y + sh;
+                    if (x2 < p.liw && y2 < p.lih)
+                        acc[j] += abs(c0 - plum[y2 * p.lw + x2]);
+                }
+            }
+            for (int j = 0; j < 16; j += 4)
+            {
+                vec4 rr = reduce4(vec4(acc[j], acc[j + 1], acc[j + 2], acc[j + 3]));
+                acc[j] = rr.x; acc[j + 1] = rr.y; acc[j + 2] = rr.z; acc[j + 3] = rr.w;
+            }
             float dmin = 3.4e38f;
-            for (int j = 2; j <= 16; j++)
-                dmin = min(dmin, shift_diff(wx0, wx1, wy0, wy1, max(1, int(floor(float(j) * k + 0.5f))), dir));
-            s[10 + dir] = log((dmin + 1.f) / (shift_diff(wx0, wx1, wy0, wy1, r, dir) + 1.f)) * n;
+            float d0 = 0.f;
+            for (int j = 0; j < 16; j++)
+            {
+                int sh = j == 0 ? r : max(1, int(floor(float(j + 1) * k + 0.5f)));
+                int cx = dir == 0 ? max(min(wx1, p.liw - sh) - wx0, 0) : ww;
+                int cy = dir == 0 ? max(wy1 - wy0, 0) : max(min(wy1, p.lih - sh) - wy0, 0);
+                float cnt = float(cx * cy);
+                float d = cnt > 0.f ? acc[j] / cnt : 0.f;
+                if (j == 0)
+                    d0 = d;
+                else
+                    dmin = min(dmin, d);
+            }
+            s[10 + dir] = log((dmin + 1.f) / (d0 + 1.f)) * n;
         }
     }
     // erreur bilatérale et désaccord OBMC : seulement sur les blocs où MC s'écarte de R1 (candidats à la priorité MC ou
     // à son prolongement), les autres reçoivent des valeurs qui l'excluent
     if (p.mc_bw > 0 && s[1] / n > p.mcp_dis)
     {
-        for (int y = y0; y < y1; y++)
+        float s9 = 0.f;
+        float s12 = 0.f;
+        for (int q = lid; q < npx; q += 256)
         {
-            for (int x = x0; x < x1; x++)
+            int x = x0 + q % bwid;
+            int y = y0 + q / bwid;
+            // erreur bilatérale du champ MC (même voisinage que mc_recon.comp), codes 10 bits
+            float cy = (float(y) - 7.5f) / 16.f;
+            float cx = (float(x) - 7.5f) / 16.f;
+            int my = clamp(int(floor(cy)), 0, p.mc_bh - 1);
+            int mx = clamp(int(floor(cx)), 0, p.mc_bw - 1);
+            float ay = clamp(cy - float(my), 0.f, 1.f);
+            float ax = clamp(cx - float(mx), 0.f, 1.f);
+            float qb = 3.4e38f;
+            float pk[4];
+            float wk[4];
+            float pm = 0.f;
+            float ws = 0.f;
+            for (int k = 0; k < 4; k++)
             {
-                // erreur bilatérale du champ MC (même voisinage que mc_recon.comp), codes 10 bits
-                float cy = (float(y) - 7.5f) / 16.f;
-                float cx = (float(x) - 7.5f) / 16.f;
-                int my = clamp(int(floor(cy)), 0, p.mc_bh - 1);
-                int mx = clamp(int(floor(cx)), 0, p.mc_bw - 1);
-                float ay = clamp(cy - float(my), 0.f, 1.f);
-                float ax = clamp(cx - float(mx), 0.f, 1.f);
-                float qb = 3.4e38f;
-                float pk[4];
-                float wk[4];
-                float pm = 0.f;
-                float ws = 0.f;
-                for (int k = 0; k < 4; k++)
-                {
-                    vec2 v = field[clamp(my + (k >> 1), 0, p.mc_bh - 1) * p.mc_bw + clamp(mx + (k & 1), 0, p.mc_bw - 1)];
-                    float la = lum_at(0, float(x) - p.t * v.x, float(y) - p.t * v.y);
-                    float lb = lum_at(1, float(x) + (1.f - p.t) * v.x, float(y) + (1.f - p.t) * v.y);
-                    qb = min(qb, abs(la - lb));
-                    pk[k] = (1.f - p.t) * la + p.t * lb;
-                    wk[k] = ((k >> 1) != 0 ? ay : 1.f - ay) * ((k & 1) != 0 ? ax : 1.f - ax);
-                    pm += wk[k] * pk[k];
-                    ws += wk[k];
-                }
-                pm /= max(ws, 1e-6f);
-                float dev = 0.f;
-                for (int k = 0; k < 4; k++)
-                    dev += wk[k] * abs(pk[k] - pm);
-                s[9] += qb * 1023.f;
-                s[12] += dev / max(ws, 1e-6f) * 1023.f;
+                vec2 v = field[clamp(my + (k >> 1), 0, p.mc_bh - 1) * p.mc_bw + clamp(mx + (k & 1), 0, p.mc_bw - 1)];
+                float la = lum_at(0, float(x) - p.t * v.x, float(y) - p.t * v.y);
+                float lb = lum_at(1, float(x) + (1.f - p.t) * v.x, float(y) + (1.f - p.t) * v.y);
+                qb = min(qb, abs(la - lb));
+                pk[k] = (1.f - p.t) * la + p.t * lb;
+                wk[k] = ((k >> 1) != 0 ? ay : 1.f - ay) * ((k & 1) != 0 ? ax : 1.f - ax);
+                pm += wk[k] * pk[k];
+                ws += wk[k];
             }
+            pm /= max(ws, 1e-6f);
+            float dev = 0.f;
+            for (int k = 0; k < 4; k++)
+                dev += wk[k] * abs(pk[k] - pm);
+            s9 += qb * 1023.f;
+            s12 += dev / max(ws, 1e-6f) * 1023.f;
         }
+        vec4 rq = reduce4(vec4(s9, s12, 0.f, 0.f));
+        s[9] = rq.x;
+        s[12] = rq.y;
     }
     else
     {
         s[9] = 1e9f * n;
         s[12] = 1e9f * n;
     }
+    if (lid != 0)
+        return;
     for (int k = 0; k < 16; k++)
-        if (subn[k] > 0.f)
-            s[13] = max(s[13], sub05[k] / subn[k] * n);
+    {
+        int c = quarter_count(x0, x1, p.block, k & 3) * quarter_count(y0, y1, p.block, k >> 2);
+        if (c > 0)
+            s[13] = max(s[13], sub05[k] / float(c) * n);
+    }
     int o = (by * p.nbx + bx) * 14;
     for (int k = 0; k < 14; k++)
         stats[o + k] = p.reuse_sources != 0 && (k == 4 || k == 5 || k == 7 || k == 8 || k == 10 || k == 11)

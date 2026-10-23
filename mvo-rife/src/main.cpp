@@ -853,6 +853,14 @@ struct SourceFrame
     FrameBuffer data;
     GpuFrame gpu;
     int64_t index = -1;
+    int slot = -1;   // tampon de l'anneau d'entrée du moteur (copie de data), -1 : aucun
+};
+
+// trame lue et son tampon d'entrée
+struct InFrame
+{
+    FrameBuffer buf;
+    int slot = -1;
 };
 
 static int run(const Options& o, const fs::path& exe_dir)
@@ -992,6 +1000,11 @@ static int run(const Options& o, const fs::path& exe_dir)
     // moteur hybride : second réseau à flux demi-résolution (padding x2) pour les grands mouvements
     const bool large_motion = needs_gpu && !o.roundtrip && o.engine == "hybrid" && !o.uhd && o.large_motion == "auto";
     std::string large_motion_status = o.uhd ? "flux demi-résolution partout (--uhd)" : "désactivé";
+    // sortie différée (anneau de tampons du moteur, copie dans un fil dédié) ; sinon copie synchrone
+    bool async_out = false;
+    const int OUT_SLOTS = 3;
+    bool async_in = false;
+    const int IN_SLOTS = 8;   // file de lecture (3), trame d'avance, paire courante, trame en cours de lecture
     if (needs_gpu)
     {
         if (!engine.init(o.gpu, o.fp32, o.threads, error)
@@ -1003,6 +1016,9 @@ static int run(const Options& o, const fs::path& exe_dir)
             fprintf(stderr, "error: %s\n", error.c_str());
             return EXIT_GPU;
         }
+        std::string ring_error;
+        async_out = !o.roundtrip && engine.enable_output_ring(OUT_SLOTS, ring_error);
+        async_in = !o.roundtrip && engine.enable_input_ring(IN_SLOTS, ring_error);
         if (large_motion)
         {
             std::string lm_error;
@@ -1086,10 +1102,12 @@ static int run(const Options& o, const fs::path& exe_dir)
         }
         fprintf(stderr, "info: moteur %s | flux optique NVIDIA : %s%s\n", o.engine.c_str(), nvof_status.c_str(), extra.c_str());
     }
-    int64_t nvof_pair = -1;
+    int64_t nvof_pair = -1;       // paire (indice de sa première trame) dont le flux est chargé dans le moteur
+    int64_t nvof_job_pair = -1;   // paire du calcul en cours (nvof_pending)
     bool nvof_failed = false;
     std::vector<uint8_t> luma_a, luma_b;
     std::vector<int16_t> flow_f, flow_b;
+    std::vector<float> hints_next;   // médianes par bloc du flux, calculées avec lui en arrière-plan
     bool nvof_pending = false;
     std::string nvof_err;
     // déclaré après les tampons qu'il utilise : détruit (donc attendu) avant eux
@@ -1119,7 +1137,10 @@ static int run(const Options& o, const fs::path& exe_dir)
     const size_t frame_words = fmt.padded_frame_bytes() / 4;
     BufferPool pool(frame_words);
 
-    BoundedQueue<FrameBuffer> read_queue(3);
+    BoundedQueue<InFrame> read_queue(3);
+    BoundedQueue<int> free_in(IN_SLOTS);
+    for (int k = 0; k < IN_SLOTS; k++)
+        free_in.push(k);
     BoundedQueue<FrameBuffer> write_queue(4);
     std::atomic<bool> read_failed(false);
     std::atomic<bool> write_failed(false);
@@ -1140,7 +1161,14 @@ static int run(const Options& o, const fs::path& exe_dir)
                 }
                 break;
             }
-            if (!read_queue.push(buf))
+            int slot = -1;
+            if (async_in)
+            {
+                if (!free_in.pop(slot))
+                    break;
+                memcpy(engine.input_slot(slot), buf->data(), fmt.padded_frame_bytes());
+            }
+            if (!read_queue.push(InFrame{buf, slot}))
                 break;
         }
         read_queue.close();
@@ -1161,6 +1189,32 @@ static int run(const Options& o, const fs::path& exe_dir)
             write_failed = true;
     });
 
+    // sortie différée : images interpolées recopiées depuis l'anneau du moteur, puis toutes les trames (sources comprises)
+    // transmises à l'écrivain dans l'ordre, pendant que le GPU calcule l'image suivante
+    struct OutTask
+    {
+        FrameBuffer buf;
+        int slot;   // tampon de l'anneau à recopier dans buf, -1 : trame déjà prête
+    };
+    BoundedQueue<OutTask> copy_queue(OUT_SLOTS + 1);
+    BoundedQueue<int> free_slots(OUT_SLOTS);
+    for (int s = 0; s < OUT_SLOTS; s++)
+        free_slots.push(s);
+    std::thread copy_thread([&] {
+        OutTask task;
+        while (copy_queue.pop(task))
+        {
+            if (task.slot >= 0)
+            {
+                memcpy(task.buf->data(), engine.output_slot(task.slot), fmt.padded_frame_bytes());
+                free_slots.push(task.slot);
+            }
+            if (write_failed || !write_queue.push(task.buf))
+                write_failed = true;
+            task.buf.reset();
+        }
+    });
+
     int64_t frames_in = 0;
     int64_t frames_out = 0;
     int64_t interpolated = 0;
@@ -1175,14 +1229,66 @@ static int run(const Options& o, const fs::path& exe_dir)
     bool pair_static = false;
     double prev_mafd = 0.0;
 
+    // trames lues d'avance (flux NVOF de la paire suivante lancé pendant la paire courante)
+    std::deque<InFrame> ahead;
     auto fetch_next = [&]() -> bool {
-        FrameBuffer buf;
-        if (!read_queue.pop(buf))
+        InFrame in;
+        if (!ahead.empty())
+        {
+            in = ahead.front();
+            ahead.pop_front();
+        }
+        else if (!read_queue.pop(in))
             return false;
-        nxt.data = buf;
+        nxt.data = in.buf;
+        nxt.slot = in.slot;
         nxt.gpu.reset();
         nxt.index = frames_in++;
         return true;
+    };
+
+    // trame qui suit nxt, sans l'avancer (nulle en fin de flux)
+    auto peek_after = [&]() -> FrameBuffer {
+        if (ahead.empty())
+        {
+            InFrame in;
+            if (!read_queue.pop(in))
+                return FrameBuffer();
+            ahead.push_back(in);
+        }
+        return ahead.front().buf;
+    };
+
+    // tampon d'entrée rendu (trame envoyée au GPU, ou quittée sans l'avoir été : paire figée, coupe)
+    auto release_slot = [&](SourceFrame& f) {
+        if (f.slot >= 0)
+            free_in.push(f.slot);
+        f.slot = -1;
+    };
+    auto upload_frame = [&](SourceFrame& f, std::string& err) -> bool {
+        if (f.gpu.ready)
+            return true;
+        const bool ok = f.slot >= 0 ? engine.upload_slot(f.slot, f.gpu, err)
+                                    : engine.upload((const uint8_t*)f.data->data(), f.gpu, err);
+        release_slot(f);
+        return ok;
+    };
+
+    // calcul NVOF d'une paire en arrière-plan (moteur de flux optique dédié) ; tampons tenus par le calcul
+    auto launch_nvof = [&](FrameBuffer fa, FrameBuffer fb, int64_t pair) {
+        if (nvof_pending)
+            nvof_job.wait();   // paire sautée (coupe, trame figée) : calcul abandonné
+        nvof_job = std::async(std::launch::async, [&, fa, fb]() {
+            to_luma8((const uint8_t*)fa->data(), fmt, luma_a, nvof.scale());
+            to_luma8((const uint8_t*)fb->data(), fmt, luma_b, nvof.scale());
+            if (!nvof.compute(luma_a.data(), luma_b.data(), flow_f, flow_b, nvof_err))
+                return false;
+            engine.compute_flow_hints(flow_f.data(), flow_b.data(), nvof.grid_w(), nvof.grid_h(), nvof.grid() * nvof.scale(),
+                                      (float)nvof.scale(), hints_next);
+            return true;
+        });
+        nvof_pending = true;
+        nvof_job_pair = pair;
     };
 
     auto analyse_pair = [&]() {
@@ -1200,8 +1306,8 @@ static int run(const Options& o, const fs::path& exe_dir)
             scene_cuts++;
     };
 
-    auto emit = [&](const FrameBuffer& buf) -> bool {
-        if (write_failed || !write_queue.push(buf))
+    auto emit = [&](const FrameBuffer& buf, int slot = -1) -> bool {
+        if (write_failed || !(async_out ? copy_queue.push(OutTask{buf, slot}) : write_queue.push(buf)))
             return false;
         frames_out++;
         return true;
@@ -1230,6 +1336,7 @@ static int run(const Options& o, const fs::path& exe_dir)
 
     if (fetch_next())
     {
+        release_slot(cur);
         cur = std::move(nxt);
         nxt = SourceFrame();
         has_next = fetch_next();
@@ -1251,6 +1358,7 @@ static int run(const Options& o, const fs::path& exe_dir)
                     finished = true;
                     break;
                 }
+                release_slot(cur);
                 cur = std::move(nxt);
                 nxt = SourceFrame();
                 has_next = fetch_next();
@@ -1265,7 +1373,7 @@ static int run(const Options& o, const fs::path& exe_dir)
             {
                 std::string err;
                 FrameBuffer outbuf = pool.acquire();
-                if (!cur.gpu.ready && !engine.upload((const uint8_t*)cur.data->data(), cur.gpu, err))
+                if (!upload_frame(cur, err))
                 {
                     gpu_failure(err);
                     break;
@@ -1285,37 +1393,33 @@ static int run(const Options& o, const fs::path& exe_dir)
             else
             {
                 std::string err;
-                if (!cur.gpu.ready && !engine.upload((const uint8_t*)cur.data->data(), cur.gpu, err))
+                if (!upload_frame(cur, err))
                 {
                     gpu_failure(err);
                     break;
                 }
-                if (!nxt.gpu.ready && !engine.upload((const uint8_t*)nxt.data->data(), nxt.gpu, err))
+                if (!upload_frame(nxt, err))
                 {
                     gpu_failure(err);
                     break;
                 }
-                // flux NVOF de la nouvelle paire lancé en parallèle : recouvert par l'inférence RIFE
-                if (nvof.active() && !nvof_failed && cur.index != nvof_pair)
-                {
-                    const uint8_t* fa = (const uint8_t*)cur.data->data();
-                    const uint8_t* fb = (const uint8_t*)nxt.data->data();
-                    nvof_job = std::async(std::launch::async, [&, fa, fb]() {
-                        to_luma8(fa, fmt, luma_a, nvof.scale());
-                        to_luma8(fb, fmt, luma_b, nvof.scale());
-                        return nvof.compute(luma_a.data(), luma_b.data(), flow_f, flow_b, nvof_err);
-                    });
-                    nvof_pending = true;
-                    nvof_pair = cur.index;
-                }
+                // flux NVOF de la paire : d'ordinaire lancé pendant la paire précédente, sinon ici (recouvert par
+                // l'inférence RIFE)
+                if (nvof.active() && !nvof_failed && cur.index != nvof_pair && !(nvof_pending && nvof_job_pair == cur.index))
+                    launch_nvof(cur.data, nxt.data, cur.index);
                 auto before_mc = [&]() {
-                    if (!nvof_pending)
+                    if (!nvof_pending || nvof_job_pair != cur.index)
                         return;
                     nvof_pending = false;
                     if (nvof_job.get())
                     {
-                        engine.set_flow_hints(flow_f.data(), flow_b.data(), nvof.grid_w(), nvof.grid_h(), nvof.grid() * nvof.scale(), (float)nvof.scale());
+                        nvof_pair = cur.index;
+                        engine.set_flow_hints_host(hints_next);
                         engine.set_dense_flow(flow_f.data(), flow_b.data(), nvof.grid_w(), nvof.grid_h(), (float)nvof.scale());
+                        // paire suivante lancée dès maintenant : son calcul recouvre toute la paire courante
+                        if (has_next)
+                            if (FrameBuffer n2 = peek_after())
+                                launch_nvof(nxt.data, n2, nxt.index);
                     }
                     else
                     {
@@ -1328,13 +1432,23 @@ static int run(const Options& o, const fs::path& exe_dir)
                 };
                 FrameBuffer outbuf = pool.acquire();
                 const float t = (float)((double)rem / (double)ra);
-                if (!engine.interpolate(cur.gpu, nxt.gpu, t, (uint8_t*)outbuf->data(), err, before_mc))
+                int slot = -1;
+                if (async_out)
+                {
+                    if (!free_slots.pop(slot))
+                    {
+                        exit_code = EXIT_IO;
+                        break;
+                    }
+                    engine.set_output_slot(slot);
+                }
+                if (!engine.interpolate(cur.gpu, nxt.gpu, t, async_out ? nullptr : (uint8_t*)outbuf->data(), err, before_mc))
                 {
                     gpu_failure(err);
                     break;
                 }
                 interpolated++;
-                ok = emit(outbuf);
+                ok = emit(outbuf, slot);
             }
             if (!ok)
             {
@@ -1376,6 +1490,9 @@ static int run(const Options& o, const fs::path& exe_dir)
         std::_Exit(exit_code);
     }
 
+    copy_queue.close();
+    copy_thread.join();
+    free_in.close();
     read_queue.close();
     write_queue.close();
     reader_thread.join();

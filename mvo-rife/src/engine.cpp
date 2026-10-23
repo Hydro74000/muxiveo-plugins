@@ -147,12 +147,65 @@ RifeEngine::~RifeEngine()
     flownet.clear();
     flownet_lm.clear();
 
+    out_ring.clear();
+    delete out_alloc;
+    in_ring.clear();
+    delete in_alloc;
     if (vkdev)
     {
         delete blob_vkallocator;
         if (staging_vkallocator)
             vkdev->reclaim_staging_allocator(staging_vkallocator);
     }
+}
+
+bool RifeEngine::enable_input_ring(int slots, std::string& error)
+{
+    in_ring.clear();
+    delete in_alloc;
+    in_alloc = new ncnn::VkStagingAllocator(vkdev);
+    for (int i = 0; i < slots; i++)
+    {
+        ncnn::VkMat m;
+        m.create(words, (size_t)4u, 1, in_alloc);
+        if (m.empty() || !m.mapped_ptr())
+        {
+            in_ring.clear();
+            delete in_alloc;
+            in_alloc = nullptr;
+            error = "allocation de l'anneau d'entrée impossible";
+            return false;
+        }
+        in_ring.push_back(m);
+    }
+    return true;
+}
+
+bool RifeEngine::upload_slot(int slot, GpuFrame& out, std::string& error)
+{
+    return upload_impl(nullptr, slot, out, error);
+}
+
+bool RifeEngine::enable_output_ring(int slots, std::string& error)
+{
+    out_ring.clear();
+    delete out_alloc;
+    out_alloc = new ncnn::VkStagingAllocator(vkdev);
+    for (int i = 0; i < slots; i++)
+    {
+        ncnn::VkMat m;
+        m.create(words, (size_t)4u, 1, out_alloc);
+        if (m.empty() || !m.mapped_ptr())
+        {
+            out_ring.clear();
+            delete out_alloc;
+            out_alloc = nullptr;
+            error = "allocation de l'anneau de sortie impossible";
+            return false;
+        }
+        out_ring.push_back(m);
+    }
+    return true;
 }
 
 bool RifeEngine::init(int gpu_index, bool fp32, int num_threads, std::string& error)
@@ -488,7 +541,7 @@ bool RifeEngine::configure(const FrameFormat& _fmt, const ColorParams& _color, s
         pipeline_nv_flow = make_pipeline(nv_flow_comp_data, sizeof(nv_flow_comp_data), 8, 8, 1);
         pipeline_nv_warp = make_pipeline(nv_warp_comp_data, sizeof(nv_warp_comp_data), 8, 8, 1);
         pipeline_nv_splat = make_pipeline(nv_splat_comp_data, sizeof(nv_splat_comp_data), 8, 8, 1);
-        pipeline_sel_stats = make_pipeline(sel_stats_comp_data, sizeof(sel_stats_comp_data), 8, 8, 1);
+        pipeline_sel_stats = make_pipeline(sel_stats_comp_data, sizeof(sel_stats_comp_data), 16, 16, 1);
         pipeline_sel_weights = make_pipeline(sel_weights_comp_data, sizeof(sel_weights_comp_data), 8, 8, 1);
         pipeline_sel_blend = make_pipeline(sel_blend_comp_data, sizeof(sel_blend_comp_data), 8, 8, 1);
         if (!pipeline_mc_luma || !pipeline_mc_down || !pipeline_mc_blur || !pipeline_mc_search || !pipeline_mc_median
@@ -531,11 +584,18 @@ static float median_of(std::vector<float>& v)
 
 void RifeEngine::set_flow_hints(const int16_t* fwd, const int16_t* bwd, int gw, int gh, int grid, float vscale)
 {
+    compute_flow_hints(fwd, bwd, gw, gh, grid, vscale, hints_host);
+    hints_dirty = true;
+}
+
+void RifeEngine::compute_flow_hints(const int16_t* fwd, const int16_t* bwd, int gw, int gh, int grid, float vscale,
+                                    std::vector<float>& out) const
+{
     // grid : taille de cellule en pixels pleine résolution ; vscale : facteur des vecteurs
     const int bw = (lw[0] + 15) / 16;
     const int bh = (lh[0] + 15) / 16;
     const int cells = std::max(1, 16 / grid);
-    hints_host.assign((size_t)bw * bh * 4, 0.f);
+    out.assign((size_t)bw * bh * 4, 0.f);
     std::vector<float> fx, fy, bx_, by_;
     for (int by = 0; by < bh; by++)
     {
@@ -559,7 +619,7 @@ void RifeEngine::set_flow_hints(const int16_t* fwd, const int16_t* bwd, int gw, 
                     by_.push_back(-vscale * bwd[k + 1] / 32.f);
                 }
             }
-            float* dst = &hints_host[((size_t)by * bw + bx) * 4];
+            float* dst = &out[((size_t)by * bw + bx) * 4];
             if (fx.empty())
                 continue;   // bloc entièrement dans le padding : vecteur nul
             dst[0] = median_of(fx);
@@ -568,7 +628,6 @@ void RifeEngine::set_flow_hints(const int16_t* fwd, const int16_t* bwd, int gw, 
             dst[3] = median_of(by_);
         }
     }
-    hints_dirty = true;
 }
 
 ncnn::VkMat RifeEngine::float_mat(int n)
@@ -1016,6 +1075,11 @@ static CodeScale code_scale(const FrameFormat& fmt, bool full_range)
 
 bool RifeEngine::upload(const uint8_t* frame, GpuFrame& out, std::string& error)
 {
+    return upload_impl(frame, -1, out, error);
+}
+
+bool RifeEngine::upload_impl(const uint8_t* frame, int slot, GpuFrame& out, std::string& error)
+{
     const size_t elemsize = opt.use_fp16_storage ? 2u : 4u;
 
     ncnn::Option o = opt;
@@ -1025,9 +1089,18 @@ bool RifeEngine::upload(const uint8_t* frame, GpuFrame& out, std::string& error)
 
     ncnn::VkCompute cmd(vkdev);
 
-    ncnn::Mat raw(words, (void*)frame, (size_t)4u, 1);
     ncnn::VkMat raw_gpu;
-    cmd.record_clone(raw, raw_gpu, o);
+    if (slot >= 0)
+    {
+        // tampon de l'anneau rempli par le fil de lecture : copie côté GPU
+        in_alloc->flush(in_ring[slot].data);
+        cmd.record_clone(in_ring[slot], raw_gpu, o);
+    }
+    else
+    {
+        ncnn::Mat raw(words, (void*)frame, (size_t)4u, 1);
+        cmd.record_clone(raw, raw_gpu, o);
+    }
 
     out.rgb.create(w_padded, h_padded, 3, elemsize, 1, blob_vkallocator);
     if (raw_gpu.empty() || out.rgb.empty())
@@ -1741,8 +1814,8 @@ bool RifeEngine::record_selector(ncnn::VkCompute& cmd, const GpuFrame& a, const 
         constants[26].f = mc_prio_perio;
         constants[27].f = std::min(mc_prio_dis, mc_prio_dis_ext);
         ncnn::VkMat dispatcher;
-        dispatcher.w = nbx;
-        dispatcher.h = nby;
+        dispatcher.w = nbx * 16;   // un groupe de 16 × 16 par bloc
+        dispatcher.h = nby * 16;
         dispatcher.c = 1;
         cmd.record_pipeline(pipeline_sel_stats, bindings, constants, dispatcher);
     }
@@ -2079,8 +2152,9 @@ bool RifeEngine::convert_and_download(ncnn::VkCompute& cmd, const ncnn::VkMat& o
     ncnn::VkMat yuvf;
     yuvf.create((int)fmt.total_samples(), (size_t)4u, 1, blob_vkallocator);
     ncnn::VkMat packed;
-    packed.create(words, (size_t)4u, 1, blob_vkallocator);
-    if (yuvf.empty() || packed.empty())
+    if (out_slot < 0)
+        packed.create(words, (size_t)4u, 1, blob_vkallocator);
+    if (yuvf.empty() || (out_slot < 0 && packed.empty()))
     {
         error = "allocation mémoire GPU impossible (download)";
         return false;
@@ -2115,10 +2189,13 @@ bool RifeEngine::convert_and_download(ncnn::VkCompute& cmd, const ncnn::VkMat& o
         cmd.record_pipeline(pipeline_rgb_to_yuv, bindings, constants, dispatcher);
     }
 
+    // sortie différée : empaquetage écrit directement dans le tampon de l'anneau (mémoire visible du CPU)
+    const int slot = out_slot;
+    out_slot = -1;
     {
         std::vector<ncnn::VkMat> bindings(2);
         bindings[0] = yuvf;
-        bindings[1] = packed;
+        bindings[1] = slot >= 0 ? out_ring[slot] : packed;
 
         std::vector<ncnn::vk_constant_type> constants(5);
         constants[0].i = (int)fmt.total_samples();
@@ -2134,6 +2211,16 @@ bool RifeEngine::convert_and_download(ncnn::VkCompute& cmd, const ncnn::VkMat& o
         cmd.record_pipeline(pipeline_pack, bindings, constants, dispatcher);
     }
 
+    if (slot >= 0)
+    {
+        if (cmd.submit_and_wait() != 0)
+        {
+            error = "échec d'exécution GPU (conversion RGB -> YUV)";
+            return false;
+        }
+        out_alloc->invalidate(out_ring[slot].data);
+        return true;
+    }
     ncnn::Mat out(words, (void*)dst, (size_t)4u, 1);
     cmd.record_clone(packed, out, o);
 

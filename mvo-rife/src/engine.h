@@ -150,6 +150,11 @@ public:
     // Candidats de flux matériel (NVOF) pour la paire courante : flux aller et retour sur une
     // grille de `grid` px (S10.5, entrelacés), réduits en médianes par bloc de 16.
     void set_flow_hints(const int16_t* fwd, const int16_t* bwd, int gw, int gh, int grid, float vscale = 1.f);
+    // même calcul (médianes par bloc) sans toucher à l'état du moteur : appelable depuis un autre fil pendant que le
+    // moteur travaille (calcul NVOF de la paire suivante), puis remis par set_flow_hints_host
+    void compute_flow_hints(const int16_t* fwd, const int16_t* bwd, int gw, int gh, int grid, float vscale,
+                            std::vector<float>& out) const;
+    void set_flow_hints_host(std::vector<float>& hints) { hints_host.swap(hints); hints_dirty = true; }
     void clear_flow_hints() { hints_host.clear(); hints_dirty = true; }
     int gpu_index() const { return gpu; }
     uint32_t vendor_id() const;
@@ -163,6 +168,19 @@ public:
     bool interpolate(const GpuFrame& a, const GpuFrame& b, float t, uint8_t* dst, std::string& error,
                      const std::function<void()>& before_mc = {});
 
+    // Sortie différée : anneau de tampons visibles du CPU où le shader d'empaquetage écrit directement l'image ; la
+    // copie vers la trame de sortie se fait ensuite dans un autre fil, pendant le calcul de l'image suivante.
+    // set_output_slot(s) avant interpolate (dst ignoré) ; output_slot(s) lisible dès le retour d'interpolate.
+    bool enable_output_ring(int slots, std::string& error);
+    void set_output_slot(int slot) { out_slot = slot; }
+    const void* output_slot(int slot) const { return out_ring[slot].mapped_ptr(); }
+
+    // Entrée symétrique : tampons visibles du GPU remplis par le fil de lecture ; upload_slot copie le tampon côté GPU
+    // (la copie CPU vers la mémoire de transfert quitte le fil principal).
+    bool enable_input_ring(int slots, std::string& error);
+    void* input_slot(int slot) { return in_ring[slot].mapped_ptr(); }
+    bool upload_slot(int slot, GpuFrame& out, std::string& error);
+
     // Diagnostic : conversion YUV -> RGB -> YUV sans réseau (mesure de la perte de conversion).
     bool roundtrip(const GpuFrame& a, uint8_t* dst, std::string& error);
 
@@ -172,6 +190,12 @@ public:
     bool out_of_memory() const { return blob_vkallocator && blob_vkallocator->failed; }
 
 private:
+    ncnn::VkAllocator* out_alloc = nullptr;   // allocateur propre à l'anneau (aucune allocation pendant le traitement)
+    std::vector<ncnn::VkMat> out_ring;
+    int out_slot = -1;
+    ncnn::VkAllocator* in_alloc = nullptr;
+    std::vector<ncnn::VkMat> in_ring;
+    bool upload_impl(const uint8_t* frame, int slot, GpuFrame& out, std::string& error);
     bool convert_and_download(ncnn::VkCompute& cmd, const ncnn::VkMat& rgb, uint8_t* dst, std::string& error);
     bool record_timestep(ncnn::VkCompute& cmd, float t, ncnn::VkMat& timestep, std::string& error);
     bool record_network(ncnn::Net& net, ncnn::VkCompute& cmd, const ncnn::VkMat& in0, const ncnn::VkMat& in1,

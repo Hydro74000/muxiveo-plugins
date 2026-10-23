@@ -27,9 +27,12 @@ Muxiveo : l'application retient la version la plus récente dont le contrat (`--
   RIFE et MC concordent, R05 ne s'écarte plus de RIFE de plus de 16 codes par pixel (traits fins, montants de façade
   vitrée : plus de fantômes), sauf écart étalé sans structure voisine (mouvement que MC ne voit pas : lueurs sombres en
   mouvement rapide, où R05 est juste).
+- Vitesse : flux NVIDIA de la paire suivante calculé pendant la paire courante, statistiques du sélecteur calculées en
+  parallèle, recherche MC allégée (raffinement pleine résolution en deux temps, arbitrages répartis), copies des images
+  d'entrée et de sortie hors du fil principal.
 - Qualité mesurée sur les bancs de référence (×2 et ×2,5 avec vérité terrain) : en hausse en moyenne (PSNR et VMAF)
-  pour Qualité, Équilibré et Ultra ; une scène de mouvement fort en léger retrait sans flux NVIDIA (≈ −0,05 dB) ; coût
-  de calcul : environ +3 % en Vulkan (Qualité 4K ×2,5).
+  pour Qualité, Équilibré et Ultra ; une scène de mouvement fort en léger retrait sans flux NVIDIA (≈ −0,05 dB) ;
+  environ 8 % plus rapide que la 1.10.0 en Vulkan (Qualité 4K ×2,5).
 
 ## Nouveautés 1.10.0
 
