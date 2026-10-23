@@ -1829,7 +1829,7 @@ bool RifeEngine::record_selector(ncnn::VkCompute& cmd, const GpuFrame& a, const 
         bindings[1] = sel_models;
         bindings[2] = weights;
         bindings[3] = cached_field.empty() ? dummy : cached_field;
-        std::vector<ncnn::vk_constant_type> constants(43);
+        std::vector<ncnn::vk_constant_type> constants(45);
         constants[0].i = nbx;
         constants[1].i = nby;
         constants[2].i = mi * 128;
@@ -1874,6 +1874,8 @@ bool RifeEngine::record_selector(ncnn::VkCompute& cmd, const GpuFrame& a, const 
         constants[40].f = r05_guard_clamp_conc;
         constants[41].f = r05_guard_clamp_tex;
         constants[42].f = r05_guard_clamp_cons;
+        constants[43].f = r05_guard_clamp_iso;
+        constants[44].f = r05_guard_clamp_iso_perio;
         ncnn::VkMat dispatcher;
         dispatcher.w = nbx;
         dispatcher.h = nby;

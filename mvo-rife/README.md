@@ -26,7 +26,8 @@ Muxiveo : l'application retient la version la plus récente dont le contrat (`--
   (quelques vecteurs MC aberrants tolérés) et, pour R05, partout où le mouvement reste lent ; dans une zone lente où
   RIFE et MC concordent, R05 ne s'écarte plus de RIFE de plus de 16 codes par pixel (traits fins, montants de façade
   vitrée : plus de fantômes), sauf écart étalé sans structure voisine (mouvement que MC ne voit pas : lueurs sombres en
-  mouvement rapide, où R05 est juste).
+  mouvement rapide, où R05 est juste). Même écrêtage sur motif répétitif lent quand R05 s'écarte de RIFE au moins quatre
+  fois plus que MC (barreaux texturés, où RIFE et MC diffèrent un peu sans se tromper : plus de barreaux baveux).
 - Vitesse : flux NVIDIA de la paire suivante calculé pendant la paire courante, statistiques du sélecteur calculées en
   parallèle, recherche MC allégée (raffinement pleine résolution en deux temps, arbitrages répartis), copies des images
   d'entrée et de sortie hors du fil principal.

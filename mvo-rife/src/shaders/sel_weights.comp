@@ -56,7 +56,9 @@ layout (push_constant) uniform parameter
     float r05_clamp_spread_abs; // ...sauf écart de R05 à R1 net (au-delà de ce seuil)...
     float r05_clamp_conc; // ...étalé (pire quart de bloc sous ce multiple de la moyenne du bloc)...
     float r05_clamp_tex;  // ...sans structure dans le voisinage (texture maximale 3 × 3 sous ce seuil)...
-    float r05_clamp_cons; // ...et |MC - R1| du bloc sous ce seuil
+    float r05_clamp_cons; // ...et |MC - R1| du bloc sous ce seuil, ou R05 isolé (|R05 - R1| au moins ce multiple de |MC - R1|,
+    float r05_clamp_iso;  // 0 : sans) sur source périodique (périodicité sous ce seuil, < 0 ; 0 : sans condition) : barreaux
+    float r05_clamp_iso_perio; // texturés où R1 et MC s'écartent davantage sans se tromper
 } p;
 
 float stat(int bx, int by, int k)
@@ -244,9 +246,14 @@ void main()
             tex9 = max(tex9, stat(bx + dx, by + dy, 4));
     bool r05_spread = stat(bx, by, 0) > p.r05_clamp_spread_abs && stat(bx, by, 13) < p.r05_clamp_conc * stat(bx, by, 0)
                       && tex9 < p.r05_clamp_tex;
-    // consensus R1 / MC du bloc lui-même (la médiane du voisinage le masque au bord d'un aplat : R1 seul, R05 avec MC)
+    // consensus R1 / MC du bloc lui-même (la médiane du voisinage le masque au bord d'un aplat : R1 seul, R05 avec MC),
+    // ou R05 isolé face à R1 et MC sur motif répétitif (barreaux texturés : R1 et MC s'y écartent de 20 à 35 codes sans
+    // se tromper, R05 apparié à la période voisine s'en écarte de 150 à 200 ; hors motif répétitif, mouvement réel que
+    // MC ne voit pas, où R05 est juste)
+    bool r05_iso = p.r05_clamp_iso > 0.f && stat(bx, by, 0) >= p.r05_clamp_iso * stat(bx, by, 1)
+                   && (p.r05_clamp_iso_perio >= 0.f || min(stat(bx, by, 10), stat(bx, by, 11)) < p.r05_clamp_iso_perio);
     weights[o + 5] = (p.cands & 2) != 0 && p.r05_clamp > 0.f && p.mc_bw > 0 && n_slow_out == 0 && !r05_spread
-                     && stat(bx, by, 1) < p.r05_clamp_cons ? 1.f : 0.f;
+                     && (stat(bx, by, 1) < p.r05_clamp_cons || r05_iso) ? 1.f : 0.f;
     // priorité MC : motif répétitif (bardage, façade quadrillée) où le champ MC explique bien les deux sources et où
     // l'image de RIFE s'en écarte nettement sur une zone étendue (RIFE ondule) ; pas là où MC se contredit (blocs
     // voisins sur des périodes différentes d'un motif irrégulier : l'OBMC y dédouble)

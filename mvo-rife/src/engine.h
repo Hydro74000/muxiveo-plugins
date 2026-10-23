@@ -347,6 +347,11 @@ private:
     float r05_guard_clamp_conc = 2.f;
     float r05_guard_clamp_tex = 0.0075f;
     float r05_guard_clamp_cons = 20.f / 1023.f;
+    // ... ou R05 isolé sur motif répétitif : |R05 - R1| au moins r05_guard_clamp_iso × |MC - R1| (0 : désactivé), périodicité
+    // de la source sous r05_guard_clamp_iso_perio (barreaux texturés : R1 et MC s'écartent de 20 à 35 codes sans se tromper,
+    // R05 apparié à la période voisine ; hors motif répétitif, R05 y est juste sur un mouvement que MC ne voit pas)
+    float r05_guard_clamp_iso = 4.f;
+    float r05_guard_clamp_iso_perio = -0.3f;
     // Priorité MC sur motif répétitif (bardage, façade quadrillée) : source périodique (périodicité < -1), champ MC
     // bien expliqué (erreur bilatérale < 10 codes) et RIFE nettement différent (|MC - R1| > 6 codes) sur une zone
     // étendue (au moins 3 blocs du voisinage 3 × 3), MC cohérent avec lui-même (prédictions OBMC des blocs voisins à
