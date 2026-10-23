@@ -20,8 +20,15 @@ Muxiveo : l'application retient la version la plus récente dont le contrat (`--
   périodique, où le champ MC explique bien les deux sources et reste cohérent avec lui-même (prédictions des blocs
   voisins concordantes) et où l'image de RIFE s'en écarte nettement sur une zone étendue, MC seul. RIFE y ondule ou
   dédouble les lignes ; MC suit la translation des deux sources.
-- Qualité mesurée sur les bancs de référence (×2 et ×2,5 avec vérité terrain) : en hausse ou inchangée pour Qualité,
-  Équilibré et Ultra, sans régression ; coût de calcul : environ +3 % en Vulkan (Qualité 4K ×2,5).
+- Compensation de mouvement : là où les prédictions des blocs voisins de l'OBMC se contredisent, la plus proche de RIFE
+  est retenue (plus de montants dédoublés par MC sur les façades quadrillées).
+- Sélecteur : R05 ou NV seul contre RIFE et MC concordants est écarté aussi sur motif répétitif à mouvement modéré
+  (quelques vecteurs MC aberrants tolérés) et, pour R05, partout où le mouvement reste lent ; dans une zone lente où
+  RIFE et MC concordent, R05 ne s'écarte plus de RIFE de plus de 16 codes par pixel (traits fins, montants de façade
+  vitrée : plus de fantômes).
+- Qualité mesurée sur les bancs de référence (×2 et ×2,5 avec vérité terrain) : en hausse en moyenne (VMAF) pour
+  Qualité, Équilibré et Ultra, PSNR moyen inchangé, une scène de mouvement fort en léger retrait (≈ −0,05 dB) ; coût de
+  calcul : environ +3 % en Vulkan (Qualité 4K ×2,5).
 
 ## Nouveautés 1.10.0
 

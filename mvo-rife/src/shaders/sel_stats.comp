@@ -1,13 +1,14 @@
 // Muxiveo — sélecteur : statistiques par bloc (une invocation par bloc de B px, pixels utiles seulement).
 // Luminance du domaine d'apprentissage : y = y_a + y_b · (kr R + kg G + kb B) (codes 10 bits limités / 1023).
-// Sorties (13 par bloc) : |y(R05) - y(R1)|, |y(MC) - y(R1)|, |y(Rbwd) - y(R1)|, |y(NV) - y(R1)|, texture
+// Sorties (15 par bloc) : |y(R05) - y(R1)|, |y(MC) - y(R1)|, |y(Rbwd) - y(R1)|, |y(NV) - y(R1)|, texture
 // (|dx| + |dy| moyen des deux sources), |y(A) - y(B)|, y(R1), incohérence NVOF / 64, amplitude NVOF / 64 ; erreur
 // bilatérale du champ MC à l'instant t (|y(A)(x - t v) - y(B)(x + (1 - t) v)|, meilleur des 4 blocs voisins, codes) ;
 // périodicité de la source A, horizontale puis verticale : log((min D(s) + 1) / (D(r) + 1)), D(s) = |L(x) - L(x + s)|
 // moyen sur la fenêtre du bloc élargie d'un demi-bloc, au niveau de la pyramide MC où le bloc mesure 8 px (L en codes),
 // s = 2k à 16k, r = k ; désaccord des prédictions des 4 blocs voisins de l'OBMC (écart absolu moyen pondéré à leur
 // mélange, codes : MC « en conflit avec lui-même », vecteurs voisins décalés d'une période sur un motif irrégulier).
-// Erreur bilatérale, périodicité et désaccord OBMC : garde-fou « priorité MC » de sel_weights.comp.
+// Erreur bilatérale, périodicité et désaccord OBMC : garde-fou « priorité MC » de sel_weights.comp. Puis pire sous-bloc
+// (quart de bloc) de |y(R05) - y(R1)| et de |y(MC) - y(R1)| : trait fin dédoublé, invisible dans la moyenne du bloc.
 
 #version 450
 
@@ -23,7 +24,7 @@ layout (binding = 4) readonly buffer nv_blob { sfp nv[]; };
 layout (binding = 5) readonly buffer a_blob { sfp a_data[]; };
 layout (binding = 6) readonly buffer b_blob { sfp b_data[]; };
 layout (binding = 7) readonly buffer map_blob { float maps[]; };      // nvinc, nvmag (w × h), si NV
-layout (binding = 8) writeonly buffer stat_blob { float stats[]; };   // (nby, nbx, 13)
+layout (binding = 8) writeonly buffer stat_blob { float stats[]; };   // (nby, nbx, 15)
 layout (binding = 9) readonly buffer source_stat_blob { float source_stats[]; };
 layout (binding = 10) readonly buffer plum_blob { float plum[]; };     // pyramide MC de la source A, niveau plevel
 layout (binding = 11) readonly buffer field_blob { vec2 field[]; };   // champ MC pleine résolution (blocs de 16 px)
@@ -56,8 +57,9 @@ layout (push_constant) uniform parameter
     float t;           // instant interpolé
     int mc_bw;         // dimensions du champ MC (0 : erreur bilatérale nulle)
     int mc_bh;
-    float mcp_perio;   // seuils du garde-fou « priorité MC » (sel_weights.comp) : périodicité...
-    float mcp_dis;     // ...et |MC - R1| minimal ; ailleurs, erreur bilatérale et désaccord OBMC non calculés
+    float mcp_perio;   // seuil de périodicité du garde-fou « priorité MC » (sel_weights.comp)
+    float mcp_dis;     // |MC - R1| minimal d'un bloc candidat ou prolongé ; ailleurs, erreur bilatérale et désaccord OBMC
+                       // non calculés
 } p;
 
 // D(s) moyen sur la fenêtre [wx0, wx1) × [wy0, wy1) du niveau, direction horizontale (dir 0) ou verticale (dir 1)
@@ -123,18 +125,35 @@ void main()
     bool has_r05 = (p.cands & 2) != 0;
     bool has_rb = (p.cands & 8) != 0;
     bool has_nv = (p.cands & 16) != 0;
-    float s[13];
-    for (int k = 0; k < 13; k++)
+    float s[15];
+    for (int k = 0; k < 15; k++)
         s[k] = 0.f;
+    float sub05[16];
+    float submc[16];
+    float subn[16];
+    for (int k = 0; k < 16; k++)
+    {
+        sub05[k] = 0.f;
+        submc[k] = 0.f;
+        subn[k] = 0.f;
+    }
     for (int y = y0; y < y1; y++)
     {
         for (int x = x0; x < x1; x++)
         {
             int i = y * p.pw + x;
             float yr = LUM(r1, p.cs_r1, i);
+            int sk = ((y - y0) * 4 / p.block) * 4 + (x - x0) * 4 / p.block;
             if (has_r05)
-                s[0] += abs(LUM(r05, p.cs_r05, i) - yr);
-            s[1] += abs(LUM(mc, p.cs_mc, i) - yr);
+            {
+                float d = abs(LUM(r05, p.cs_r05, i) - yr);
+                s[0] += d;
+                sub05[sk] += d;
+            }
+            float dm = abs(LUM(mc, p.cs_mc, i) - yr);
+            s[1] += dm;
+            submc[sk] += dm;
+            subn[sk] += 1.f;
             if (has_rb)
                 s[2] += abs(LUM(rb, p.cs_rb, i) - yr);
             if (has_nv)
@@ -187,11 +206,9 @@ void main()
             s[10 + dir] = log((dmin + 1.f) / (shift_diff(wx0, wx1, wy0, wy1, r, dir) + 1.f)) * n;
         }
     }
-    // erreur bilatérale et désaccord OBMC : seulement sur les blocs candidats à la priorité MC (source périodique, MC
-    // nettement différent de R1), les autres reçoivent des valeurs qui l'excluent
-    float per = p.reuse_sources != 0 ? min(source_stats[(by * p.nbx + bx) * 13 + 10], source_stats[(by * p.nbx + bx) * 13 + 11])
-                                     : min(s[10], s[11]) / n;
-    if (p.mc_bw > 0 && per < p.mcp_perio && s[1] / n > p.mcp_dis)
+    // erreur bilatérale et désaccord OBMC : seulement sur les blocs où MC s'écarte de R1 (candidats à la priorité MC ou
+    // à son prolongement), les autres reçoivent des valeurs qui l'excluent
+    if (p.mc_bw > 0 && s[1] / n > p.mcp_dis)
     {
         for (int y = y0; y < y1; y++)
         {
@@ -234,8 +251,14 @@ void main()
         s[9] = 1e9f * n;
         s[12] = 1e9f * n;
     }
-    int o = (by * p.nbx + bx) * 13;
-    for (int k = 0; k < 13; k++)
+    for (int k = 0; k < 16; k++)
+        if (subn[k] > 0.f)
+        {
+            s[13] = max(s[13], sub05[k] / subn[k] * n);
+            s[14] = max(s[14], submc[k] / subn[k] * n);
+        }
+    int o = (by * p.nbx + bx) * 15;
+    for (int k = 0; k < 15; k++)
         stats[o + k] = p.reuse_sources != 0 && (k == 4 || k == 5 || k == 7 || k == 8 || k == 10 || k == 11)
                        ? source_stats[o + k] : s[k] / n;
 }

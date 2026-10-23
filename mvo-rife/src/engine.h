@@ -186,7 +186,7 @@ private:
     bool interpolate_tta(const GpuFrame& a, const GpuFrame& b, float t, uint8_t* dst, std::string& error);
     bool rife_tta_rgb(const GpuFrame& a, const GpuFrame& b, float t, ncnn::VkMat& merged, std::string& error);
     bool record_mc(ncnn::VkCompute& cmd, const GpuFrame& a, const GpuFrame& b, float t, const ncnn::VkMat& rife,
-                   ncnn::VkMat& out, std::string& error);
+                   ncnn::VkMat& out, std::string& error, const ncnn::VkMat* ref = nullptr);
     bool record_large_motion(ncnn::VkCompute& cmd, const GpuFrame& a, const GpuFrame& b, float t, ncnn::VkMat& out,
                              std::string& error);
     bool decide_large_motion(ncnn::VkCompute& cmd, const GpuFrame& a, const GpuFrame& b, std::string& error);
@@ -301,6 +301,26 @@ private:
     float r05_guard_mc_max_slow = 12.f / 1023.f;
     float r05_guard_slow_tex = 0.015f;
     float r05_guard_slow_ratio = 40.f;
+    // Zone de motif répétitif à mouvement modéré (périodicité sous iso_guard_perio, au plus iso_guard_frac des
+    // vecteurs MC du bloc et de ses voisins à iso_guard_px (px 4K) ou au-delà) : R05 / NV isolés (écart à R1 au moins
+    // r05_guard_iso_ratio / nv_guard_iso_ratio × |MC - R1|) jugés avec le consensus élargi (appariement à la période
+    // voisine : dédoublement) ; pour R05, consensus du bloc ou médiane 3 × 3 si plus faible
+    float iso_guard_px = 24.f;
+    float iso_guard_frac = 0.25f;
+    float iso_guard_perio = -0.3f;
+    float r05_guard_iso_ratio = 8.f;
+    float r05_guard_iso_cons = 40.f / 1023.f;   // consensus R1 / MC exigé pour R05 dans cette zone
+    float nv_guard_iso_ratio = 8.f;
+    // Hors motif répétitif : R05 au moins r05_guard_lone_ratio × |MC - R1| (consensus médian), au plus iso_guard_frac
+    // des vecteurs MC au-delà de lm_lo : même traitement (0 : désactivé)
+    float r05_guard_lone_ratio = 20.f;
+    // Trait fin dédoublé : R05 écarté si le pire quart de bloc de |R05 - R1| dépasse r05_guard_thin_abs et
+    // r05_guard_thin_ratio × celui de |MC - R1|, consensus élargi, aucun vecteur MC voisin au-delà de lm_lo
+    float r05_guard_thin_abs = 16.f / 1023.f;
+    float r05_guard_thin_ratio = 0.f;
+    // Zone lente consensuelle (aucun vecteur MC voisin au-delà de lm_lo, consensus élargi) : R05 écrêté par pixel à
+    // R1 ± r05_guard_clamp codes 10 bits (0 : désactivé)
+    float r05_guard_clamp = 16.f;
     // Priorité MC sur motif répétitif (bardage, façade quadrillée) : source périodique (périodicité < -1), champ MC
     // bien expliqué (erreur bilatérale < 10 codes) et RIFE nettement différent (|MC - R1| > 6 codes) sur une zone
     // étendue (au moins 3 blocs du voisinage 3 × 3), MC cohérent avec lui-même (prédictions OBMC des blocs voisins à
@@ -310,6 +330,12 @@ private:
     float mc_prio_dis = 6.f / 1023.f;
     int mc_prio_nmin = 3;
     float mc_prio_obmc = 2.f;
+    // prolongement aux blocs voisins d'une zone retenue (au moins 1), sans condition de périodicité, |MC - R1| > 3 codes
+    float mc_prio_dis_ext = 3.f / 1023.f;
+    int mc_prio_dil = 1;
+    // Candidat MC du sélecteur : là où les prédictions OBMC des blocs voisins se contredisent de plus de 4 codes (blocs
+    // sur des périodes différentes d'un motif irrégulier), prédiction voisine la plus proche de RIFE au lieu du mélange.
+    float mc_conflict_tau = 4.f;
     // Surcoût des vecteurs NVOF dans la recherche MC pleine résolution (écart bilatéral moyen, codes de luminance) :
     // retenus seulement s'ils battent les candidats hiérarchiques de plus qu'un pixel mal expliqué (MC_Q_THRESHOLD).
     // Sinon, sur un motif périodique, MC reprend l'appariement à la période voisine de NVOF et le confirme.

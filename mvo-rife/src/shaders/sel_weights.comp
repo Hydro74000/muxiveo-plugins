@@ -2,13 +2,13 @@
 // l'apprentissage : désaccords des candidats présents (R05, MC, Rbwd, NV), texture, écart temporel, luminance,
 // désaccords dilatés (maximum 3 × 3 blocs), [incohérence, amplitude NVOF], bord, échelle log2(bloc / 16).
 // x = (log(f + 1e-3) - mu) / sd (bord et échelle : valeur brute). Sortie : 5 poids par bloc (R1, R05, MC,
-// Rbwd, NV). Bord : 1 si le bloc est à moins de B/2 px d'un bord de l'image (MC et NV y échantillonnent hors cadre).
+// Rbwd, NV) et l'écrêtage par pixel de R05 autour de R1 (0 : aucun), lu par sel_blend.comp. Bord : 1 si le bloc est à moins de B/2 px d'un bord de l'image (MC et NV y échantillonnent hors cadre).
 
 #version 450
 
 layout (binding = 0) readonly buffer stat_blob { float stats[]; };
 layout (binding = 1) readonly buffer model_blob { float model[]; };   // 128 flottants par modèle
-layout (binding = 2) writeonly buffer w_blob { float weights[]; };    // (nby, nbx, 5)
+layout (binding = 2) writeonly buffer w_blob { float weights[]; };    // (nby, nbx, 6) : 5 poids, écrêtage de R05
 layout (binding = 3) readonly buffer field_blob { vec2 field[]; };    // champ MC pleine résolution (blocs de 16 px)
 
 layout (push_constant) uniform parameter
@@ -42,11 +42,24 @@ layout (push_constant) uniform parameter
     float mcp_dis;        // ...MC nettement différent de R1 (|MC - R1| au-delà de ce seuil)...
     int mcp_nmin;         // ...sur au moins ce nombre de blocs du voisinage 3 × 3, bloc compris (étendue du défaut de RIFE)...
     float mcp_obmc;       // ...et MC cohérent avec lui-même : désaccord des prédictions OBMC sous ce seuil (codes)
+    float mcp_dis_ext;    // prolongement aux blocs voisins d'une zone retenue (sans condition de périodicité) : |MC - R1|
+                          // minimal...
+    int mcp_dil;          // ...et nombre minimal de blocs retenus dans le voisinage 3 × 3 (0 : sans prolongement)
+    float iso_px;         // zone de motif répétitif à mouvement modéré : seuil d'amplitude MC (px)...
+    float iso_frac;       // ...part maximale des vecteurs MC (bloc et voisins) à ce seuil ou au-delà...
+    float iso_perio;      // ...et périodicité de la source sous ce seuil (log, < 0) ; flux isolé y écarté si :
+    float r05_iso_ratio;  // |R05 - R1| au moins ce multiple de |MC - R1| (0 : désactivé)
+    float nv_iso_ratio;   // |NV - R1| au moins ce multiple de |MC - R1| (0 : désactivé)
+    float r05_lone_ratio; // hors motif répétitif : |R05 - R1| au moins ce multiple de |MC - R1| (0 : désactivé)
+    float r05_iso_cons;   // consensus R1 / MC exigé pour écarter R05 sur motif répétitif
+    float r05_thin_abs;   // trait fin : pire sous-bloc de |R05 - R1| minimal...
+    float r05_thin_ratio; // ...et rapport au pire sous-bloc de |MC - R1| (0 : désactivé)
+    float r05_clamp;      // écrêtage par pixel de R05 autour de R1 en zone lente consensuelle (RGB, 0 : désactivé)
 } p;
 
 float stat(int bx, int by, int k)
 {
-    return stats[(clamp(by, 0, p.nby - 1) * p.nbx + clamp(bx, 0, p.nbx - 1)) * 13 + k];
+    return stats[(clamp(by, 0, p.nby - 1) * p.nbx + clamp(bx, 0, p.nbx - 1)) * 15 + k];
 }
 
 // condition « priorité MC » d'un bloc (statistiques du bloc seul)
@@ -54,6 +67,23 @@ bool mc_prio_at(int bx, int by)
 {
     return min(stat(bx, by, 10), stat(bx, by, 11)) < p.mcp_perio && stat(bx, by, 9) < p.mcp_q && stat(bx, by, 1) > p.mcp_dis
            && stat(bx, by, 12) < p.mcp_obmc;
+}
+
+// bloc retenu : condition remplie sur le bloc et sur au moins mcp_nmin blocs du voisinage 3 × 3 (étendue)
+bool mc_prio_full(int bx, int by)
+{
+    if (!mc_prio_at(bx, by))
+        return false;
+    int cnt = 0;
+    for (int dy = -1; dy <= 1; dy++)
+        for (int dx = -1; dx <= 1; dx++)
+        {
+            int xx = bx + dx;
+            int yy = by + dy;
+            if (xx >= 0 && yy >= 0 && xx < p.nbx && yy < p.nby && mc_prio_at(xx, yy))
+                cnt++;
+        }
+    return cnt >= p.mcp_nmin;
 }
 
 void main()
@@ -119,6 +149,24 @@ void main()
         logit[c] = z;
         mx = max(mx, z);
     }
+    // zone de motif répétitif (façade quadrillée, bardage) à mouvement modéré : source périodique, au plus une petite
+    // part des vecteurs MC du bloc et de ses voisins (blocs de 16 px) au-delà du seuil (quelques vecteurs aberrants
+    // tolérés : MC lui-même parfois apparié à la période voisine). Un flux (R05, NV) isolé face à R1 et MC concordants
+    // y est apparié à la période voisine (dédoublement) : consensus élargi
+    float amp = 0.f;
+    int n_fast = 0, n_slow_out = 0, n_vec = 0;
+    if (p.mc_bw > 0)
+        for (int my = max(y0 / 16 - 1, 0); my <= min((y1 - 1) / 16 + 1, p.mc_bh - 1); my++)
+            for (int mx2 = max(x0 / 16 - 1, 0); mx2 <= min((x1 - 1) / 16 + 1, p.mc_bw - 1); mx2++)
+            {
+                float a = length(field[my * p.mc_bw + mx2]);
+                amp = max(amp, a);
+                n_fast += a >= p.iso_px ? 1 : 0;
+                n_slow_out += a >= p.r05_slow_px ? 1 : 0;
+                n_vec++;
+            }
+    bool iso_zone = p.mc_bw > 0 && min(stat(bx, by, 10), stat(bx, by, 11)) < p.iso_perio
+                    && n_fast <= int(p.iso_frac * float(n_vec));
     // garde-fou : R1 et MC concordent, NV s'en écarte nettement -> flux NVIDIA aberrant dans ce bloc (fonds unis,
     // textes de génériques, pluie) : poids NV nul
     // Mouvement dans la portée de RIFE (amplitude NVOF modérée) : consensus élargi, NV y vaut surtout par ses
@@ -135,7 +183,8 @@ void main()
             if (nb9[j] < nb9[i]) { float tt = nb9[i]; nb9[i] = nb9[j]; nb9[j] = tt; }
     float mc_cons = min(stat(bx, by, 1), nb9[4]);
     float mc_max = p.nv_mc_max;
-    if (p.nv_mc_max_slow > mc_max && stat(bx, by, 8) < p.nv_slow_mag)
+    if (p.nv_mc_max_slow > mc_max && (stat(bx, by, 8) < p.nv_slow_mag
+                                      || (p.nv_iso_ratio > 0.f && iso_zone && stat(bx, by, 3) >= p.nv_iso_ratio * stat(bx, by, 1))))
         mc_max = p.nv_mc_max_slow;
     bool drop_nv = (p.cands & 16) != 0 && p.nv_abs > 0.f && stat(bx, by, 3) > p.nv_abs
                    && stat(bx, by, 3) > p.nv_ratio * mc_cons
@@ -147,32 +196,58 @@ void main()
     // R05 ne sert qu'aux grands mouvements : là où le champ MC reste sous le seuil, sur structure contrastée,
     // consensus élargi (motifs répétitifs : flux demi-résolution apparié à la période voisine, dédoublement)
     float r05_max = p.r05_mc_max;
-    if (p.r05_mc_max_slow > r05_max && p.mc_bw > 0)
+    float r05_cons = stat(bx, by, 1);
+    if (p.r05_mc_max_slow > r05_max && p.mc_bw > 0 && amp < p.r05_slow_px
+        && (stat(bx, by, 4) >= p.r05_slow_tex || stat(bx, by, 0) >= p.r05_slow_ratio * stat(bx, by, 1)))
+        r05_max = p.r05_mc_max_slow;
+    // zone de motif répétitif : consensus du bloc ou médiane 3 × 3 si plus faible, comme pour NV (bloc MC resté sur une
+    // autre période, souvent au bord de l'image)
+    // R05 seul contre R1 et MC concordants (rapport r05_lone_ratio), mouvement lent pour l'essentiel du voisinage
+    // (au plus iso_frac des vecteurs MC au-delà du seuil des grands mouvements) : même traitement, toute structure
+    bool r05_lone = p.r05_lone_ratio > 0.f && p.mc_bw > 0 && n_slow_out <= int(p.iso_frac * float(n_vec))
+                    && stat(bx, by, 0) >= p.r05_lone_ratio * mc_cons;
+    // motif répétitif : consensus encore élargi (structures fines contrastées, persiennes : R1 et MC y diffèrent
+    // davantage sans se tromper)
+    if (p.r05_iso_ratio > 0.f && iso_zone && stat(bx, by, 0) >= p.r05_iso_ratio * mc_cons)
     {
-        float amp = 0.f;
-        for (int my = max(y0 / 16 - 1, 0); my <= min((y1 - 1) / 16 + 1, p.mc_bh - 1); my++)
-            for (int mx2 = max(x0 / 16 - 1, 0); mx2 <= min((x1 - 1) / 16 + 1, p.mc_bw - 1); mx2++)
-                amp = max(amp, length(field[my * p.mc_bw + mx2]));
-        if (amp < p.r05_slow_px && (stat(bx, by, 4) >= p.r05_slow_tex || stat(bx, by, 0) >= p.r05_slow_ratio * stat(bx, by, 1)))
-            r05_max = p.r05_mc_max_slow;
+        r05_cons = mc_cons;
+        r05_max = max(r05_max, p.r05_iso_cons);
+    }
+    else if (r05_lone)
+    {
+        r05_cons = mc_cons;
+        r05_max = max(r05_max, p.r05_mc_max_slow);
     }
     bool drop_r05 = (p.cands & 2) != 0 && p.r05_abs > 0.f && stat(bx, by, 0) > p.r05_abs
-                    && stat(bx, by, 0) > p.r05_ratio * stat(bx, by, 1)
-                    && (r05_max <= 0.f || stat(bx, by, 1) < r05_max);
+                    && stat(bx, by, 0) > p.r05_ratio * r05_cons
+                    && (r05_max <= 0.f || r05_cons < r05_max);
+    // trait fin dédoublé (montants de façade, câbles) : pire sous-bloc de R05 nettement au-delà de celui de MC, R1 et MC
+    // concordants, mouvement lent partout dans le voisinage (aucun vecteur MC au-delà du seuil des grands mouvements)
+    drop_r05 = drop_r05 || ((p.cands & 2) != 0 && p.r05_thin_ratio > 0.f && p.mc_bw > 0 && n_slow_out == 0
+                            && stat(bx, by, 13) > p.r05_thin_abs && stat(bx, by, 13) > p.r05_thin_ratio * stat(bx, by, 14)
+                            && mc_cons < p.r05_mc_max_slow);
     float sum = 0.f;
     for (int c = 0; c < k; c++)
     {
         logit[c] = ((drop_nv && slot[c] == 4) || (drop_r05 && slot[c] == 1)) ? 0.f : exp(logit[c] - mx);
         sum += logit[c];
     }
-    int o = (by * p.nbx + bx) * 5;
+    int o = (by * p.nbx + bx) * 6;
     for (int s = 0; s < 5; s++)
         weights[o + s] = 0.f;
+    // zone lente (aucun vecteur MC voisin au-delà du seuil des grands mouvements), R1 et MC concordants : R05 n'y apporte
+    // que de petites corrections (zones lisses) ; écrêté par pixel autour de R1, il ne dédouble plus les traits fins
+    // (montants de façade vitrée)
+    weights[o + 5] = (p.cands & 2) != 0 && p.r05_clamp > 0.f && p.mc_bw > 0 && n_slow_out == 0
+                     && mc_cons < p.r05_mc_max_slow ? p.r05_clamp : 0.f;
     // priorité MC : motif répétitif (bardage, façade quadrillée) où le champ MC explique bien les deux sources et où
     // l'image de RIFE s'en écarte nettement sur une zone étendue (RIFE ondule) ; pas là où MC se contredit (blocs
     // voisins sur des périodes différentes d'un motif irrégulier : l'OBMC y dédouble)
-    bool mc_prio = false;
-    if (p.mcp_perio < 0.f && p.mc_bw > 0 && mc_prio_at(bx, by))
+    bool mc_prio = p.mcp_perio < 0.f && p.mc_bw > 0 && mc_prio_full(bx, by);
+    // prolongement : bloc voisin d'une zone retenue (motif moins net, bord de la zone : le gravier du toit au-dessus du
+    // bardage), MC bien expliqué et cohérent, nettement différent de R1
+    if (!mc_prio && p.mcp_perio < 0.f && p.mc_bw > 0 && p.mcp_dil > 0 && stat(bx, by, 9) < p.mcp_q
+        && stat(bx, by, 12) < p.mcp_obmc && stat(bx, by, 1) > p.mcp_dis_ext)
     {
         int cnt = 0;
         for (int dy = -1; dy <= 1; dy++)
@@ -180,10 +255,10 @@ void main()
             {
                 int xx = bx + dx;
                 int yy = by + dy;
-                if (xx >= 0 && yy >= 0 && xx < p.nbx && yy < p.nby && mc_prio_at(xx, yy))
+                if ((dx != 0 || dy != 0) && xx >= 0 && yy >= 0 && xx < p.nbx && yy < p.nby && mc_prio_full(xx, yy))
                     cnt++;
             }
-        mc_prio = cnt >= p.mcp_nmin;
+        mc_prio = cnt >= p.mcp_dil;
     }
     if (mc_prio)
     {

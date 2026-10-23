@@ -1,5 +1,6 @@
 // Muxiveo — sélecteur : image finale = somme des candidats pondérée par les poids des blocs, interpolés
-// bilinéairement entre les centres de blocs (pas de couture). Hors image utile : R1.
+// bilinéairement entre les centres de blocs (pas de couture). Hors image utile : R1. R05 écrêté par pixel autour de R1
+// là où le bloc le demande (zone lente consensuelle, sel_weights.comp).
 
 #version 450
 
@@ -12,7 +13,7 @@ layout (binding = 1) readonly buffer r05_blob { sfp r05[]; };
 layout (binding = 2) readonly buffer mc_blob { sfp mc[]; };
 layout (binding = 3) readonly buffer rb_blob { sfp rb[]; };
 layout (binding = 4) readonly buffer nv_blob { sfp nv[]; };
-layout (binding = 5) readonly buffer w_blob { float weights[]; };
+layout (binding = 5) readonly buffer w_blob { float weights[]; };   // (nby, nbx, 6)
 layout (binding = 6) writeonly buffer out_blob { sfp out_data[]; };
 
 layout (push_constant) uniform parameter
@@ -35,7 +36,7 @@ layout (push_constant) uniform parameter
 
 float wt(int bx, int by, int s)
 {
-    return weights[(clamp(by, 0, p.nby - 1) * p.nbx + clamp(bx, 0, p.nbx - 1)) * 5 + s];
+    return weights[(clamp(by, 0, p.nby - 1) * p.nbx + clamp(bx, 0, p.nbx - 1)) * 6 + s];
 }
 
 void main()
@@ -60,11 +61,16 @@ void main()
     float w5[5];
     for (int s = 0; s < 5; s++)
         w5[s] = mix(mix(wt(x0, y0, s), wt(x0 + 1, y0, s), fx), mix(wt(x0, y0 + 1, s), wt(x0 + 1, y0 + 1, s), fx), fy);
+    float cl = wt(gx / p.block, gy / p.block, 5);
     for (int c = 0; c < 3; c++)
     {
-        float v = w5[0] * float(r1[c * p.cs_r1 + i]) + w5[2] * float(mc[c * p.cs_mc + i]);
+        float y1 = float(r1[c * p.cs_r1 + i]);
+        float v = w5[0] * y1 + w5[2] * float(mc[c * p.cs_mc + i]);
         if ((p.cands & 2) != 0)
-            v += w5[1] * float(r05[c * p.cs_r05 + i]);
+        {
+            float y05 = float(r05[c * p.cs_r05 + i]);
+            v += w5[1] * (cl > 0.f ? y1 + clamp(y05 - y1, -cl, cl) : y05);
+        }
         if ((p.cands & 8) != 0)
             v += w5[3] * float(rb[c * p.cs_rb + i]);
         if ((p.cands & 16) != 0)

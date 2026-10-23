@@ -602,7 +602,7 @@ void RifeEngine::record_filter(ncnn::VkCompute& cmd, const ncnn::VkMat& src, ncn
 // Compensation de mouvement : pyramide bilatérale par blocs de 16 (1/8 → 1/1), reconstruction
 // recouvrante, puis, en mode hybride, choix par région entre MC et RIFE (rife non vide).
 bool RifeEngine::record_mc(ncnn::VkCompute& cmd, const GpuFrame& a, const GpuFrame& b, float t, const ncnn::VkMat& rife,
-                           ncnn::VkMat& out, std::string& error)
+                           ncnn::VkMat& out, std::string& error, const ncnn::VkMat* ref)
 {
     const int plane = w_padded * h_padded;
     // Champ unique par paire : recherche au milieu de la paire (t = 0,5), réutilisée pour toutes
@@ -857,7 +857,8 @@ bool RifeEngine::record_mc(ncnn::VkCompute& cmd, const GpuFrame& a, const GpuFra
         return false;
     }
     {
-        std::vector<ncnn::VkMat> bindings(7);
+        const bool use_ref = !hybrid && ref && !ref->empty();
+        std::vector<ncnn::VkMat> bindings(8);
         bindings[0] = a.rgb;
         bindings[1] = b.rgb;
         bindings[2] = field[0];
@@ -865,7 +866,8 @@ bool RifeEngine::record_mc(ncnn::VkCompute& cmd, const GpuFrame& a, const GpuFra
         bindings[4] = q;
         bindings[5] = edge;
         bindings[6] = hybrid ? dummy : out;
-        std::vector<ncnn::vk_constant_type> constants(12);
+        bindings[7] = use_ref ? *ref : dummy;
+        std::vector<ncnn::vk_constant_type> constants(15);
         constants[0].i = w_padded;
         constants[1].i = h_padded;
         constants[2].i = (int)a.rgb.cstep;
@@ -878,6 +880,9 @@ bool RifeEngine::record_mc(ncnn::VkCompute& cmd, const GpuFrame& a, const GpuFra
         constants[9].f = color.kb;
         constants[10].f = MC_LUM_SCALE;
         constants[11].i = hybrid ? 0 : 1;
+        constants[12].i = use_ref ? 1 : 0;
+        constants[13].f = mc_conflict_tau;
+        constants[14].i = use_ref ? (int)ref->cstep : 0;
         ncnn::VkMat dispatcher;
         dispatcher.w = w_padded;
         dispatcher.h = h_padded;
@@ -1682,8 +1687,8 @@ bool RifeEngine::record_selector(ncnn::VkCompute& cmd, const GpuFrame& a, const 
     int plevel = 0;
     while (plevel < 2 && (block >> (plevel + 1)) >= 8)
         plevel++;
-    ncnn::VkMat stats = float_mat(nbx * nby * 13);
-    ncnn::VkMat weights = float_mat(nbx * nby * 5);
+    ncnn::VkMat stats = float_mat(nbx * nby * 15);
+    ncnn::VkMat weights = float_mat(nbx * nby * 6);
     out.create(w_padded, h_padded, 3, cand[0]->elemsize, 1, blob_vkallocator);
     if (stats.empty() || weights.empty() || out.empty())
     {
@@ -1734,7 +1739,7 @@ bool RifeEngine::record_selector(ncnn::VkCompute& cmd, const GpuFrame& a, const 
         constants[24].i = cached_field.empty() ? 0 : (lw[0] + 15) / 16;
         constants[25].i = cached_field.empty() ? 0 : (lh[0] + 15) / 16;
         constants[26].f = mc_prio_perio;
-        constants[27].f = mc_prio_dis;
+        constants[27].f = std::min(mc_prio_dis, mc_prio_dis_ext);
         ncnn::VkMat dispatcher;
         dispatcher.w = nbx;
         dispatcher.h = nby;
@@ -1751,7 +1756,7 @@ bool RifeEngine::record_selector(ncnn::VkCompute& cmd, const GpuFrame& a, const 
         bindings[1] = sel_models;
         bindings[2] = weights;
         bindings[3] = cached_field.empty() ? dummy : cached_field;
-        std::vector<ncnn::vk_constant_type> constants(29);
+        std::vector<ncnn::vk_constant_type> constants(41);
         constants[0].i = nbx;
         constants[1].i = nby;
         constants[2].i = mi * 128;
@@ -1782,6 +1787,19 @@ bool RifeEngine::record_selector(ncnn::VkCompute& cmd, const GpuFrame& a, const 
         constants[26].f = mc_prio_dis;
         constants[27].i = mc_prio_nmin;
         constants[28].f = mc_prio_obmc;
+        constants[29].f = mc_prio_dis_ext;
+        constants[30].i = mc_prio_dil;
+        constants[31].f = iso_guard_px * (float)w / 3840.f;
+        constants[32].f = iso_guard_frac;
+        constants[33].f = iso_guard_perio;
+        constants[34].f = r05_guard_iso_ratio;
+        constants[35].f = nv_guard_iso_ratio;
+        constants[36].f = r05_guard_lone_ratio;
+        constants[37].f = r05_guard_iso_cons;
+        constants[38].f = r05_guard_thin_abs;
+        constants[39].f = r05_guard_thin_ratio;
+        // écrêtage en codes 10 bits de luminance ramené aux composantes RGB (échelle de la luminance d'apprentissage)
+        constants[40].f = r05_guard_clamp / (color.full_range ? 1023.f : 876.f);
         ncnn::VkMat dispatcher;
         dispatcher.w = nbx;
         dispatcher.h = nby;
@@ -1849,7 +1867,7 @@ bool RifeEngine::interpolate_selector(const GpuFrame& a, const GpuFrame& b, floa
         before_mc();
     }
     ncnn::VkMat mc;
-    if (!record_mc(cmd, a, b, t, ncnn::VkMat(), mc, error))
+    if (!record_mc(cmd, a, b, t, ncnn::VkMat(), mc, error, &r1))
         return false;
     ncnn::VkMat r05;
     if (lm_loaded)

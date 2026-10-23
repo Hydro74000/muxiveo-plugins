@@ -2,6 +2,9 @@
 // 4 blocs voisins. Chaque côté est écarté s'il échantillonne hors image. Sorties :
 // RGB direct dans le format du réseau, ou RGB fp32 + erreur bilatérale et bord de cadre
 // pour l'ancienne règle hybride.
+// Conflit OBMC (sélecteur, image RIFE fournie) : là où les prédictions des 4 blocs voisins se contredisent (désaccord
+// moyen pondéré au-delà de tau codes : blocs voisins sur des périodes différentes d'un motif irrégulier), la prédiction
+// voisine la plus proche de RIFE (écart moyen sur 3 × 3 pixels) remplace le mélange, qui dédoublerait.
 
 #version 450
 
@@ -16,6 +19,7 @@ layout (binding = 3) writeonly buffer mc_blob { float mc_data[]; };
 layout (binding = 4) writeonly buffer q_blob { float q_data[]; };
 layout (binding = 5) writeonly buffer edge_blob { float edge_data[]; };
 layout (binding = 6) writeonly buffer rgb_blob { sfp rgb_data[]; };
+layout (binding = 7) readonly buffer ref_blob { sfp ref_data[]; };    // image RIFE (arbitrage des conflits OBMC)
 
 layout (push_constant) uniform parameter
 {
@@ -31,6 +35,9 @@ layout (push_constant) uniform parameter
     float kb;
     float lum_scale;
     int rgb_only; // candidat MC du sélecteur : sortie directe, sans cartes q/edge
+    int use_ref;  // arbitrage des conflits OBMC par l'image RIFE (0 : désactivé)
+    float tau;    // désaccord OBMC (codes) au-delà duquel le conflit est arbitré
+    int cs_ref;
 } p;
 
 vec3 sample_rgb(int which, float x, float y)
@@ -73,6 +80,24 @@ float lum(vec3 c)
     return p.lum_scale * (p.kr * c.r + (1.f - p.kr - p.kb) * c.g + p.kb * c.b);
 }
 
+// prédiction bilatérale d'un vecteur au pixel (x, y)
+vec3 predict(vec2 v, float x, float y)
+{
+    float xa = x - p.t * v.x;
+    float ya = y - p.t * v.y;
+    float xb = x + (1.f - p.t) * v.x;
+    float yb = y + (1.f - p.t) * v.y;
+    float wa = (1.f - p.t) * inside(xa, ya) + 1e-3f;
+    float wb = p.t * inside(xb, yb) + 1e-3f;
+    return (wa * sample_rgb(0, xa, ya) + wb * sample_rgb(1, xb, yb)) / (wa + wb);
+}
+
+float ref_lum(int x, int y)
+{
+    int i = clamp(y, 0, p.ih - 1) * p.w + clamp(x, 0, p.iw - 1);
+    return lum(vec3(float(ref_data[i]), float(ref_data[p.cs_ref + i]), float(ref_data[2 * p.cs_ref + i])));
+}
+
 void main()
 {
     int gx = int(gl_GlobalInvocationID.x);
@@ -90,6 +115,9 @@ void main()
     vec3 acc = vec3(0.f);
     float wsum = 0.f;
     float qbest = 3.4e38f;
+    vec3 preds[4];
+    vec2 vecs[4];
+    float wts[4];
     for (int k = 0; k < 4; k++)
     {
         int dy = k >> 1;
@@ -114,9 +142,40 @@ void main()
         }
         acc += wbl * pk;
         wsum += wbl;
+        preds[k] = pk;
+        vecs[k] = v;
+        wts[k] = wbl;
     }
     int i = gy * p.w + gx;
     vec3 o = acc / max(wsum, 1e-12f);
+    if (p.use_ref != 0 && gx < p.iw && gy < p.ih)
+    {
+        float lo = lum(o);
+        float dev = 0.f;
+        for (int k = 0; k < 4; k++)
+            dev += wts[k] * abs(lum(preds[k]) - lo);
+        if (dev / max(wsum, 1e-12f) > p.tau)
+        {
+            float best = 3.4e38f;
+            for (int k = 0; k < 4; k++)
+            {
+                if (wts[k] <= 1e-6f)
+                    continue;
+                float e = 0.f;
+                for (int dy = -1; dy <= 1; dy++)
+                    for (int dx = -1; dx <= 1; dx++)
+                    {
+                        vec3 q = dx == 0 && dy == 0 ? preds[k] : predict(vecs[k], float(gx + dx), float(gy + dy));
+                        e += abs(lum(q) - ref_lum(gx + dx, gy + dy));
+                    }
+                if (e < best)
+                {
+                    best = e;
+                    o = preds[k];
+                }
+            }
+        }
+    }
     if (p.rgb_only != 0)
     {
         rgb_data[i] = sfp(o.r);
