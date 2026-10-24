@@ -25,17 +25,19 @@ def _rife_bin() -> str | None:
 RIFE_BIN = _rife_bin() or ""
 
 
-def _gpus() -> list[dict]:
+def _gpus() -> tuple[list[dict], int]:
+    """GPU listés par --list-gpus et indice de celui que le moteur choisit seul (« default »)."""
     if not RIFE_BIN:
-        return []
+        return [], 0
     out = subprocess.run([RIFE_BIN, "--list-gpus"], capture_output=True, text=True, timeout=120, check=False)
     try:
-        return list(json.loads(out.stdout or "{}").get("gpus") or [])
+        data = json.loads(out.stdout or "{}")
+        return list(data.get("gpus") or []), int(data.get("default", 0))
     except ValueError:
-        return []
+        return [], 0
 
 
-GPUS = _gpus()
+GPUS, DEFAULT_GPU = _gpus()
 
 pytestmark = pytest.mark.skipif(
     not RIFE_BIN or not GPUS or shutil.which("ffmpeg") is None,
@@ -98,6 +100,12 @@ def run_rife(data: bytes, *args: str) -> subprocess.CompletedProcess:
 def _test_gpu() -> int:
     """GPU des tests : ``MUXIVEO_RIFE_GPU`` sinon le périphérique par défaut."""
     return int(os.environ.get("MUXIVEO_RIFE_GPU", "-1"))
+
+
+def _tested_gpu() -> dict:
+    """GPU utilisé par les tests : MUXIVEO_RIFE_GPU, sinon celui que le moteur choisit seul (dédié avant intégré)."""
+    index = _test_gpu() if _test_gpu() >= 0 else DEFAULT_GPU
+    return next((g for g in GPUS if g["index"] == index), GPUS[0])
 
 
 def _psnr(a: bytes, b: bytes, depth: int) -> float:
@@ -392,8 +400,7 @@ def test_hybrid_combines_with_rife_options(extra: list[str]) -> None:
 @needs_hybrid
 def test_hybrid_reports_optical_flow_status() -> None:
     data = make_y4m("testsrc2=size=96x64:rate=25", frames=3)
-    gpu = GPUS[_test_gpu()] if _test_gpu() >= 0 else next(
-        (g for g in GPUS if g["index"] == 0), GPUS[0])
+    gpu = _tested_gpu()
     for nvof, expected in (("off", "désactivé"), ("auto", "actif" if gpu.get("nvof") else "indisponible")):
         proc = subprocess.run(
             [RIFE_BIN, "-g", str(_test_gpu()), "--engine", "hybrid", "--nvof", nvof, "--matrix", "bt709"],
@@ -828,7 +835,7 @@ def test_ultra_and_selector_option_values(args: list[str]) -> None:
 
 @needs_selector
 def test_selector_uses_nvidia_flow_candidate_when_available() -> None:
-    gpu = GPUS[_test_gpu()] if _test_gpu() >= 0 else next((g for g in GPUS if g["index"] == 0), GPUS[0])
+    gpu = _tested_gpu()
     if not gpu.get("nvof"):
         pytest.skip("flux optique NVIDIA indisponible sur ce GPU")
     data = _panning(6)
