@@ -16,7 +16,6 @@ constexpr double TARGET[GRAIN_BINS] = {1.7984791736585508, 1.417293485886066, 1.
                                        0.22548441513119627, -1.0, -1.0, -1.0, -1.0, -1.0};
 constexpr double MEDIAN_CORR = 0.8724929518;  // 1 / √(1 + π / 10) : biais de la médiane de 5 images
 constexpr double RATIO_GUARD = 2.0;           // borne de l'Auto v2 : 2 × médiane pondérée par tranche
-constexpr double FLOW_BIAS = 0.91;            // désalignement des flux du réseau face au flux optique du banc
 
 int reflect101(int i, int n)
 {
@@ -456,7 +455,9 @@ GrainBins sigma_bins(const std::map<int, AnalysisFrame>& frames, const std::vect
     return out;
 }
 
-std::optional<double> ratio_from_sigma(const GrainBins& bins)
+double flow_bias(int width) { return 0.91 - 0.15 * std::clamp((width - 1920) / 1920.0, 0.0, 1.0); }
+
+std::optional<double> ratio_from_sigma(const GrainBins& bins, int width)
 {
     double meas_sum = 0.0, common_s = 0.0, common_t = 0.0;
     int meas = 0, common = 0;
@@ -497,7 +498,7 @@ std::optional<double> ratio_from_sigma(const GrainBins& bins)
             }
         }
     }
-    return std::min(r * FLOW_BIAS, 10.0);
+    return std::min(r * flow_bias(width), 10.0);
 }
 
 double auto_part(std::optional<double> ratio, double k) { return ratio ? std::min(1.0, k / std::max(*ratio, 1e-3)) : 0.25 * k; }

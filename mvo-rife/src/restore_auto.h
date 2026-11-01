@@ -93,12 +93,15 @@ struct GrainBins
 // de chaque centre c doivent être présentes.
 GrainBins sigma_bins(const std::map<int, AnalysisFrame>& frames, const std::vector<int>& centers, int w, int h, double ar = 1.0);
 
-// Rapport de grain du plan face au profil cible : min(A, 2 × B) × 0,91, plafonné à 10 ; A = moyenne des σ / moyenne du
-// profil sur les tranches communes (Auto v2), B = médiane, pondérée par les pixels, des σ / profil par tranche. A saute
-// quand une tranche claire (profil 0,22–0,37) entre dans le masque ; B le borne. 0,91 : désalignement des flux du
-// réseau face au flux optique du banc (σ + 10–20 %). Sans tranche commune : σ moyen face au niveau médian du profil
-// (× 0,91) ; aucune mesure : vide.
-std::optional<double> ratio_from_sigma(const GrainBins& bins);
+// Biais des flux du réseau face au flux optique du banc (σ surestimé par le désalignement), selon la largeur de l'image :
+// 0,91 jusqu'à 1920 px, 0,76 à 3840 px, linéaire entre les deux.
+double flow_bias(int width);
+
+// Rapport de grain du plan face au profil cible : min(A, 2 × B) × flow_bias(largeur), plafonné à 10 ; A = moyenne des σ /
+// moyenne du profil sur les tranches communes (Auto v2), B = médiane, pondérée par les pixels, des σ / profil par
+// tranche. A saute quand une tranche claire (profil 0,22–0,37) entre dans le masque ; B le borne. Sans tranche commune :
+// σ moyen face au niveau médian du profil ; aucune mesure : vide.
+std::optional<double> ratio_from_sigma(const GrainBins& bins, int width);
 
 // Niveau de l'Auto (Fort 0,5, Auto / Moyen 1, Léger 1,5) ; contenu animé : un cran vers Fort (k × 0,5).
 inline double auto_k(double k, bool animation) { return animation ? k * 0.5 : k; }

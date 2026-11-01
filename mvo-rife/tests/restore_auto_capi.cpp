@@ -72,7 +72,7 @@ void ra_sigma_bins(const float* lumas, const float* flows, int nframes, int firs
     }
 }
 
-double ra_ratio(const double* sigma, const double* pixels)
+double ra_ratio(const double* sigma, const double* pixels, int width)
 {
     GrainBins s;
     for (int b = 0; b < GRAIN_BINS; b++)
@@ -81,7 +81,7 @@ double ra_ratio(const double* sigma, const double* pixels)
             s.sigma[b] = sigma[b];
         s.pixels[b] = pixels[b];
     }
-    const auto r = ratio_from_sigma(s);
+    const auto r = ratio_from_sigma(s, width);
     return r ? *r : NAN;
 }
 
