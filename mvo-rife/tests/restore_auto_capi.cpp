@@ -58,7 +58,7 @@ int ra_cuts(const uint16_t* frames, int n, std::size_t frame_size, int w, int h,
 
 // lumas : nframes × h × w ; flows : nframes × 4 × h × w × 2 ; image i = numéro first + i.
 void ra_sigma_bins(const float* lumas, const float* flows, int nframes, int first, const int* centers, int ncenters, int w, int h,
-                   double ar, double* sigma_out)
+                   double ar, double* sigma_out, double* pixels_out)
 {
     std::map<int, AnalysisFrame> frames;
     const std::size_t n = (std::size_t)w * h;
@@ -66,15 +66,21 @@ void ra_sigma_bins(const float* lumas, const float* flows, int nframes, int firs
         frames[first + i] = AnalysisFrame{lumas + i * n, flows + i * n * 8};
     const auto s = sigma_bins(frames, std::vector<int>(centers, centers + ncenters), w, h, ar);
     for (int b = 0; b < GRAIN_BINS; b++)
-        sigma_out[b] = s[b] ? *s[b] : NAN;
+    {
+        sigma_out[b] = s.sigma[b] ? *s.sigma[b] : NAN;
+        pixels_out[b] = s.pixels[b];
+    }
 }
 
-double ra_ratio(const double* sigma)
+double ra_ratio(const double* sigma, const double* pixels)
 {
-    std::array<std::optional<double>, GRAIN_BINS> s;
+    GrainBins s;
     for (int b = 0; b < GRAIN_BINS; b++)
+    {
         if (!std::isnan(sigma[b]))
-            s[b] = sigma[b];
+            s.sigma[b] = sigma[b];
+        s.pixels[b] = pixels[b];
+    }
     const auto r = ratio_from_sigma(s);
     return r ? *r : NAN;
 }

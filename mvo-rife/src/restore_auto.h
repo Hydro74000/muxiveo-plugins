@@ -5,7 +5,7 @@
 //   max(4 × médiane, 8) ; médiane sur la fenêtre [t − past, t + look] (aucune passe préalable sur le film) ;
 // - courbe de grain σ(luminance) d'une image et carte de grain (entrée du réseau), courbe du plan = médiane des courbes ;
 // - rapport de grain d'un plan face au profil cible : résidu face à la médiane recalée t ± 2 par les flux du réseau,
-//   sur les aplats où l'aller-retour des flux tient ;
+//   sur les aplats où l'aller-retour des flux tient ; formule bornée contre le surnettoyage ;
 // - σ du résidu (source − sortie) pour l'égalisation du dosage par plan ;
 // - dosage : sortie + part × égalisation × (source − sortie), un seul arrondi, tramage triangulaire en option.
 //
@@ -81,16 +81,24 @@ struct AnalysisFrame
     const float* flows = nullptr;
 };
 
+struct GrainBins
+{
+    std::array<std::optional<double>, GRAIN_BINS> sigma;  // σ médian des centres (tranche mesurée)
+    std::array<double, GRAIN_BINS> pixels{};              // pixels retenus, sommés sur les centres
+};
+
 // σ du grain par tranche (r0_real.measure, partie σ) sur les centres donnés : résidu face à la médiane des 5 images
 // recalées, aplats (gradient de la médiane, lissé σ 2, sous son 40e centile) où l'aller-retour des 4 flux reste sous
 // `ar` px, tranches de plus de 4000 pixels, × biais de la médiane de 5 ; médiane des centres. Les images c ± 1, c ± 2
 // de chaque centre c doivent être présentes.
-std::array<std::optional<double>, GRAIN_BINS> sigma_bins(const std::map<int, AnalysisFrame>& frames, const std::vector<int>& centers,
-                                                         int w, int h, double ar = 1.0);
+GrainBins sigma_bins(const std::map<int, AnalysisFrame>& frames, const std::vector<int>& centers, int w, int h, double ar = 1.0);
 
-// Rapport robuste de l'Auto v2 : σ mesuré / profil cible sur les tranches communes, plafonné à 10 ; sans tranche
-// commune : σ moyen face au niveau médian du profil ; aucune mesure : vide.
-std::optional<double> ratio_from_sigma(const std::array<std::optional<double>, GRAIN_BINS>& sigma);
+// Rapport de grain du plan face au profil cible : min(A, 2 × B) × 0,91, plafonné à 10 ; A = moyenne des σ / moyenne du
+// profil sur les tranches communes (Auto v2), B = médiane, pondérée par les pixels, des σ / profil par tranche. A saute
+// quand une tranche claire (profil 0,22–0,37) entre dans le masque ; B le borne. 0,91 : désalignement des flux du
+// réseau face au flux optique du banc (σ + 10–20 %). Sans tranche commune : σ moyen face au niveau médian du profil
+// (× 0,91) ; aucune mesure : vide.
+std::optional<double> ratio_from_sigma(const GrainBins& bins);
 
 // Niveau de l'Auto (Fort 0,5, Auto / Moyen 1, Léger 1,5) ; contenu animé : un cran vers Fort (k × 0,5).
 inline double auto_k(double k, bool animation) { return animation ? k * 0.5 : k; }

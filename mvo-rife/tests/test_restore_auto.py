@@ -33,8 +33,8 @@ def lib(tmp_path_factory):
     lib.ra_residual_sigma.restype = C.c_float
     lib.ra_cuts.argtypes = [u16p, C.c_int, C.c_size_t, C.c_int, C.c_int, C.c_int, C.c_int, i32p]
     lib.ra_cuts.restype = C.c_int
-    lib.ra_sigma_bins.argtypes = [f32p, f32p, C.c_int, C.c_int, i32p, C.c_int, C.c_int, C.c_int, C.c_double, f64p]
-    lib.ra_ratio.argtypes = [f64p]
+    lib.ra_sigma_bins.argtypes = [f32p, f32p, C.c_int, C.c_int, i32p, C.c_int, C.c_int, C.c_int, C.c_double, f64p, f64p]
+    lib.ra_ratio.argtypes = [f64p, f64p]
     lib.ra_ratio.restype = C.c_double
     lib.ra_dose.argtypes = [u16p, f32p, C.c_size_t, C.c_double, C.c_uint16, C.c_uint16, u16p, C.c_longlong]
     lib.ra_percentile.argtypes = [f32p, C.c_size_t, C.c_double]
@@ -189,30 +189,60 @@ def test_sigma_bins_and_ratio_with_zero_flow(lib):
     h, w, sigma = 480, 560, 2.0  # ≥ 4000 pixels d'aplats par tranche
     lumas = np.ascontiguousarray(np.stack([synthetic(h, w, sigma, seed=10 + i).astype(np.float32) for i in range(5)]))
     flows = np.zeros((5, 4, h, w, 2), np.float32)
-    got = np.zeros(14, np.float64)
-    lib.ra_sigma_bins(lumas, flows, 5, 0, np.array([2], np.int32), 1, w, h, 1.0, got)
+    got, pix = np.zeros(14, np.float64), np.zeros(14, np.float64)
+    lib.ra_sigma_bins(lumas, flows, 5, 0, np.array([2], np.int32), 1, w, h, 1.0, got, pix)
     # référence : médiane des 5 images (flux nuls), aplats sous le 40e centile du gradient lissé
     med = np.median(lumas, 0)
     grad = ref_gauss(np.hypot(ref_sobel(med, True), ref_sobel(med, False)).astype(np.float32), 2.0)
     flat = grad < np.percentile(grad, 40)
     res = lumas[2] - med
-    ref = np.full(14, np.nan)
+    ref, ref_pix = np.full(14, np.nan), np.zeros(14)
     for i in range(14):
         sel = flat & (med >= EDGES[i]) & (med < EDGES[i + 1])
         if sel.sum() > 4000:
             lo, hi = np.percentile(res[sel], [15.87, 84.13])
             ref[i] = (hi - lo) / 2 / np.sqrt(1 + np.pi / 10)
+            ref_pix[i] = sel.sum()
     assert np.array_equal(np.isnan(got), np.isnan(ref))
     ok = ~np.isnan(ref)
     assert ok.sum() >= 3 and np.allclose(got[ok], ref[ok], rtol=2e-3)  # seuil du 40e centile : quelques pixels basculent
     assert np.all(np.abs(got[ok] / sigma - 1) < 0.2)  # biais de la médiane corrigé
-    target = [1.7984791736585508, 1.417293485886066, 1.4111985095540818, 1.1557043183924918, 0.8855069513296798,
-              0.6741703446217169, 0.36706075453127496, 0.2554514033936689, 0.22548441513119627]
-    common = [i for i in range(9) if ok[i]]
-    expected = min(np.mean(got[common]) / np.mean([target[i] for i in common]), 10.0) if common else \
-        min(np.mean(got[ok]) / np.median(target), 10.0)
-    assert lib.ra_ratio(got) == pytest.approx(expected, rel=1e-9)
-    assert np.isnan(lib.ra_ratio(np.full(14, np.nan)))
+    assert np.allclose(pix[ok], ref_pix[ok], rtol=1e-2) and np.all(pix[~ok] == 0)
+    assert lib.ra_ratio(got, pix) == pytest.approx(ref_ratio(got, pix), rel=1e-9)
+    assert np.isnan(lib.ra_ratio(np.full(14, np.nan), np.zeros(14)))
+
+
+TARGET = [1.7984791736585508, 1.417293485886066, 1.4111985095540818, 1.1557043183924918, 0.8855069513296798,
+          0.6741703446217169, 0.36706075453127496, 0.2554514033936689, 0.22548441513119627]
+
+
+def ref_ratio(sig, pix):
+    """min(Auto v2, 2 × médiane pondérée des σ / profil) × 0,91, plafond 10."""
+    meas = ~np.isnan(sig)
+    common = [i for i in range(9) if meas[i]]
+    if not common:
+        return min(np.mean(sig[meas]) / np.median(TARGET) * 0.91, 10.0)
+    r = np.mean(sig[common]) / np.mean([TARGET[i] for i in common])
+    rr = np.array([sig[i] / TARGET[i] for i in common])
+    ww = np.array([pix[i] for i in common])
+    o = np.argsort(rr, kind='stable')
+    cw = np.cumsum(ww[o])
+    return min(min(r, 2.0 * rr[o][np.searchsorted(cw, cw[-1] / 2)]) * 0.91, 10.0)
+
+
+def test_ratio_formula_bounds_bright_bins(lib):
+    # tranche sombre sous le profil, tranches claires très au-dessus (profil 0,37 / 0,22) : l'Auto v2 s'envole, la borne la retient
+    sig = np.full(14, np.nan)
+    sig[[0, 6, 8]] = [1.3, 2.0, 2.4]
+    pix = np.zeros(14)
+    pix[[0, 6, 8]] = [60000, 9000, 5000]
+    auto_v2 = np.mean(sig[[0, 6, 8]]) / np.mean([TARGET[i] for i in (0, 6, 8)])
+    got = lib.ra_ratio(sig, pix)
+    assert got == pytest.approx(ref_ratio(sig, pix), rel=1e-9)
+    assert got < 0.91 * auto_v2 and got == pytest.approx(0.91 * 2 * 1.3 / TARGET[0], rel=1e-9)
+    sig2 = np.full(14, np.nan)
+    sig2[[10, 12]] = [1.0, 2.0]  # aucune tranche commune avec le profil
+    assert lib.ra_ratio(sig2, np.ones(14)) == pytest.approx(1.5 / np.median(TARGET) * 0.91, rel=1e-9)
 
 
 def test_dose_rounding_and_dither(lib):

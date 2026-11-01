@@ -15,6 +15,8 @@ constexpr double TARGET[GRAIN_BINS] = {1.7984791736585508, 1.417293485886066, 1.
                                        0.8855069513296798, 0.6741703446217169, 0.36706075453127496, 0.2554514033936689,
                                        0.22548441513119627, -1.0, -1.0, -1.0, -1.0, -1.0};
 constexpr double MEDIAN_CORR = 0.8724929518;  // 1 / √(1 + π / 10) : biais de la médiane de 5 images
+constexpr double RATIO_GUARD = 2.0;           // borne de l'Auto v2 : 2 × médiane pondérée par tranche
+constexpr double FLOW_BIAS = 0.91;            // désalignement des flux du réseau face au flux optique du banc
 
 int reflect101(int i, int n)
 {
@@ -383,12 +385,12 @@ int CutDetector::shot_start(int t) const
     return std::max(t, 0);
 }
 
-std::array<std::optional<double>, GRAIN_BINS> sigma_bins(const std::map<int, AnalysisFrame>& frames, const std::vector<int>& centers,
-                                                         int w, int h, double ar)
+GrainBins sigma_bins(const std::map<int, AnalysisFrame>& frames, const std::vector<int>& centers, int w, int h, double ar)
 {
     static const int order[4] = {-2, -1, 1, 2};
     const std::size_t n = (std::size_t)w * h;
     std::array<std::vector<double>, GRAIN_BINS> acc;
+    GrainBins out;
     std::vector<float> med(n), res(n), gx(n), gy(n), mag(n), grad(n);
     std::vector<uint8_t> mask(n);
     for (int c : centers)
@@ -443,39 +445,59 @@ std::array<std::optional<double>, GRAIN_BINS> sigma_bins(const std::map<int, Ana
         }
         for (int b = 0; b < GRAIN_BINS; b++)
             if (sel[b].size() > 4000)
+            {
+                out.pixels[b] += (double)sel[b].size();
                 acc[b].push_back(robust_sigma(std::move(sel[b])) * MEDIAN_CORR);
+            }
     }
-    std::array<std::optional<double>, GRAIN_BINS> out;
     for (int b = 0; b < GRAIN_BINS; b++)
         if (!acc[b].empty())
-            out[b] = median_of(acc[b]);
+            out.sigma[b] = median_of(acc[b]);
     return out;
 }
 
-std::optional<double> ratio_from_sigma(const std::array<std::optional<double>, GRAIN_BINS>& sigma)
+std::optional<double> ratio_from_sigma(const GrainBins& bins)
 {
     double meas_sum = 0.0, common_s = 0.0, common_t = 0.0;
     int meas = 0, common = 0;
     std::vector<double> targets;
+    std::vector<std::pair<double, double>> per_bin;  // (σ / profil, pixels)
     for (int b = 0; b < GRAIN_BINS; b++)
     {
         if (TARGET[b] > 0)
             targets.push_back(TARGET[b]);
-        if (!sigma[b])
+        if (!bins.sigma[b])
             continue;
-        meas_sum += *sigma[b];
+        meas_sum += *bins.sigma[b];
         meas++;
         if (TARGET[b] > 0)
         {
-            common_s += *sigma[b];
+            common_s += *bins.sigma[b];
             common_t += TARGET[b];
             common++;
+            per_bin.push_back({*bins.sigma[b] / TARGET[b], bins.pixels[b]});
         }
     }
     if (!meas)
         return std::nullopt;
-    const double r = common ? (common_s / common) / (common_t / common) : (meas_sum / meas) / median_of(targets);
-    return std::min(r, 10.0);
+    double r = common ? (common_s / common) / (common_t / common) : (meas_sum / meas) / median_of(targets);
+    if (common)
+    {
+        std::stable_sort(per_bin.begin(), per_bin.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
+        double total = 0.0, cum = 0.0;
+        for (const auto& p : per_bin)
+            total += p.second;
+        for (const auto& p : per_bin)
+        {
+            cum += p.second;
+            if (cum >= total / 2)
+            {
+                r = std::min(r, RATIO_GUARD * p.first);
+                break;
+            }
+        }
+    }
+    return std::min(r * FLOW_BIAS, 10.0);
 }
 
 double auto_part(std::optional<double> ratio, double k) { return ratio ? std::min(1.0, k / std::max(*ratio, 1e-3)) : 0.25 * k; }
