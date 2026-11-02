@@ -42,6 +42,7 @@
 #include "nvof.h"
 #include "cuda_driver.h"
 #include "trt_backend.h"
+#include "restore_stage.h"
 #include "numparse.h"
 #include <limits>
 #include "y4m.h"
@@ -368,6 +369,14 @@ struct Options
     bool allow_interlaced = false;
     bool roundtrip = false;
     double progress_interval = 1.0;
+    // Restauration (R2), étage avant l'interpolation
+    std::string restore;                  // vide : désactivée | auto | leger | moyen | fort
+    bool restore_animation = false;       // contenu animé (niveau auto : un cran vers fort)
+    bool restore_fast = false;            // poids du mode rapide (flux au quart)
+    std::string restore_model;            // dossier des graphes (défaut : <exe>/restore-models/r2 ou r2q)
+    std::string restore_dither = "auto";  // auto (±1 code) | off | 8 (±1 pas 8 bits : sortie 10 bits vers un encodeur 8 bits)
+    std::string transfer;                 // sdr | pq | hlg : canal de transfert du réseau (PQ ou non)
+    int restore_tile = 512;               // côté des tuiles du réseau de restauration
 };
 
 static void print_usage(FILE* fp)
@@ -409,6 +418,15 @@ static void print_usage(FILE* fp)
             "  --padding <n>           padding du réseau (défaut : selon le modèle, x2 avec --uhd)\n"
             "  -j, --threads <n>       threads CPU ncnn (défaut : 2)\n"
             "  --allow-interlaced      accepter une entrée entrelacée\n"
+            "  --restore <niveau>      Restauration (grain et bruit), avant l'interpolation : auto | leger | moyen | fort ;\n"
+            "                          seule avec --factor 1\n"
+            "  --restore-animation     contenu animé (niveau auto : un cran vers fort)\n"
+            "  --restore-fast          Restauration rapide (flux au quart de la définition)\n"
+            "  --restore-model <dir>   graphes de restauration (défaut : <exe>/restore-models/r2, r2q avec --restore-fast)\n"
+            "  --restore-dither <d>    arrondi de sortie : auto (tramé ±1 code, défaut) | off | 8 (±1 pas 8 bits, sortie\n"
+            "                          10 bits destinée à un encodeur 8 bits)\n"
+            "  --transfer <t>          sdr | pq | hlg : fonction de transfert de la source (Restauration ; défaut : sdr)\n"
+            "  --restore-tile <n>      côté des tuiles du réseau de restauration (défaut : 512)\n"
             "  --progress-interval <s> intervalle des lignes de progression (défaut : 1)\n"
             "  --quiet                 pas de ligne de progression\n"
             "  --verbose               affiche les diagnostics Vulkan de ncnn\n"
@@ -527,6 +545,43 @@ static bool parse_args(const std::vector<std::string>& args, Options& o, std::st
         else if (a == "--progress-interval")
         {
             if (!value(v) || !parse_double_option(a, v, 0.0, std::numeric_limits<double>::max(), o.progress_interval, error)) return false;
+        }
+        else if (a == "--restore")
+        {
+            if (!value(v)) return false;
+            if (v != "auto" && v != "leger" && v != "moyen" && v != "fort")
+            {
+                error = "--restore : auto, leger, moyen ou fort attendu (reçu : " + v + ")";
+                return false;
+            }
+            o.restore = v;
+        }
+        else if (a == "--restore-animation") o.restore_animation = true;
+        else if (a == "--restore-fast") o.restore_fast = true;
+        else if (a == "--restore-model") { if (!value(o.restore_model)) return false; }
+        else if (a == "--restore-dither")
+        {
+            if (!value(v)) return false;
+            if (v != "auto" && v != "off" && v != "8")
+            {
+                error = "--restore-dither : auto, off ou 8 attendu (reçu : " + v + ")";
+                return false;
+            }
+            o.restore_dither = v;
+        }
+        else if (a == "--transfer")
+        {
+            if (!value(v)) return false;
+            if (v != "sdr" && v != "pq" && v != "hlg")
+            {
+                error = "--transfer : sdr, pq ou hlg attendu (reçu : " + v + ")";
+                return false;
+            }
+            o.transfer = v;
+        }
+        else if (a == "--restore-tile")
+        {
+            if (!value(v) || !parse_int_option(a, v, 64, 8192, o.restore_tile, error)) return false;
         }
         else if (a == "--fp32") o.fp32 = true;
         else if (a == "--feature-cache") o.feature_cache = true;
@@ -704,7 +759,8 @@ static int print_capabilities(const Options& o, const fs::path& exe_dir)
         "input", "output", "factor", "fps", "model", "gpu", "matrix", "range", "chroma-loc", "scene-threshold", "uhd",
         "fp32", "feature-cache", "feature-cache-reserve", "tta", "engine", "trt-plugin", "trt-cache", "backend", "nvof", "large-motion", "selector",
         "selector-weights", "ultra", "padding", "threads", "allow-interlaced", "progress-interval", "quiet", "verbose",
-        "list-gpus", "capabilities", "version"};
+        "list-gpus", "capabilities", "version", "restore", "restore-animation", "restore-fast", "restore-model",
+        "restore-dither", "transfer", "restore-tile"};
     std::vector<std::string> models;
     std::error_code ec;
     for (fs::directory_iterator it(exe_dir / "rife-models", ec), end; !ec && it != end; it.increment(ec))
@@ -735,6 +791,22 @@ static int print_capabilities(const Options& o, const fs::path& exe_dir)
     const std::vector<std::string> families = selector_families(weights);
     for (size_t i = 0; i < families.size(); i++)
         json += std::string(i ? ", " : "") + "\"" + json_escape(families[i]) + "\"";
+    json += "]}";
+    // Restauration : niveaux et graphes présents (<exe>/restore-models/<nom>/r2_{flow,body}.ncnn.{param,bin})
+    std::vector<std::string> restore_models;
+    for (fs::directory_iterator it(exe_dir / "restore-models", ec), end; !ec && it != end; it.increment(ec))
+    {
+        std::error_code fe;
+        bool ok = it->is_directory(fe);
+        for (const char* f : {"r2_flow.ncnn.param", "r2_flow.ncnn.bin", "r2_body.ncnn.param", "r2_body.ncnn.bin"})
+            ok = ok && fs::is_regular_file(it->path() / f, fe);
+        if (ok)
+            restore_models.push_back(path_to_utf8(it->path().filename()));
+    }
+    std::sort(restore_models.begin(), restore_models.end());
+    json += ", \"restore\": {\"levels\": [\"auto\", \"leger\", \"moyen\", \"fort\"], \"dither\": [\"auto\", \"off\", \"8\"], \"models\": [";
+    for (size_t i = 0; i < restore_models.size(); i++)
+        json += std::string(i ? ", " : "") + "\"" + json_escape(restore_models[i]) + "\"";
     json += "]}}\n";
     fputs(json.c_str(), stdout);
     return EXIT_OK;
@@ -848,6 +920,36 @@ static void to_luma8(const uint8_t* frame, const FrameFormat& fmt, std::vector<u
     }
 }
 
+// Définition du flux des graphes de restauration : <dir>/model.json (« "flow_scale": x »), sinon selon le mode.
+static double restore_flow_scale(const fs::path& dir, bool fast)
+{
+    double fs_value = fast ? 0.25 : 0.5;
+    FILE* fp = open_file(dir / "model.json", false);
+    if (!fp)
+        return fs_value;
+    std::string text;
+    char buf[4096];
+    size_t n;
+    while ((n = fread(buf, 1, sizeof buf, fp)) > 0)
+        text.append(buf, n);
+    fclose(fp);
+    const size_t key = text.find("\"flow_scale\"");
+    const size_t colon = key == std::string::npos ? key : text.find(':', key);
+    if (colon != std::string::npos)
+    {
+        size_t b = colon + 1;
+        while (b < text.size() && (text[b] == ' ' || text[b] == '\t'))
+            b++;
+        size_t e = b;
+        while (e < text.size() && (isdigit((unsigned char)text[e]) || text[e] == '.'))
+            e++;
+        double v = 0.0;
+        if (parse_double_strict(text.substr(b, e - b), 0.05, 1.0, v))
+            fs_value = v;
+    }
+    return fs_value;
+}
+
 struct SourceFrame
 {
     FrameBuffer data;
@@ -948,6 +1050,57 @@ static int run(const Options& o, const fs::path& exe_dir)
     {
         fprintf(stderr, "error: %s\n", error.c_str());
         return EXIT_USAGE;
+    }
+
+    // Restauration (R2) : étage en flux exécuté dans le fil de lecture, avant l'interpolation (restaurée seule si facteur 1)
+    const bool restoring = !o.restore.empty();
+    RestoreNet restore_net;
+    RestoreStage restore_stage;
+    if (restoring)
+    {
+        if (o.roundtrip || fmt.interlace == 't' || fmt.interlace == 'b' || fmt.interlace == 'm')
+        {
+            fprintf(stderr, "error: Restauration indisponible sur une entrée entrelacée\n");
+            return EXIT_USAGE;
+        }
+        if (o.restore_dither == "8" && fmt.bit_depth != 10)
+        {
+            fprintf(stderr, "error: --restore-dither 8 exige une entrée 10 bits\n");
+            return EXIT_USAGE;
+        }
+        const fs::path rdir = o.restore_model.empty() ? exe_dir / "restore-models" / (o.restore_fast ? "r2q" : "r2")
+                                                      : path_from_utf8(o.restore_model);
+        const double rfs = restore_flow_scale(rdir, o.restore_fast);
+        const int gpu_count = ncnn::get_gpu_count();
+        const int gpu_index = o.gpu >= 0 ? o.gpu : ncnn::get_default_gpu_index();
+        if (gpu_count <= 0 || gpu_index >= gpu_count)
+        {
+            fprintf(stderr, "error: aucun GPU Vulkan pour la Restauration\n");
+            return EXIT_GPU;
+        }
+        ncnn::VulkanDevice* rdev = ncnn::get_gpu_device(gpu_index);
+        ncnn::Option ropt;
+        ropt.num_threads = std::max(1, o.threads);
+        ropt.use_vulkan_compute = true;
+        ropt.use_fp16_packed = ropt.use_fp16_storage = !o.fp32 && rdev->info.support_fp16_storage();
+        ropt.use_fp16_arithmetic = false;
+        ropt.use_int8_storage = false;
+        RestoreOptions ro;
+        ro.k = o.restore == "fort" ? 0.5 : (o.restore == "leger" ? 1.5 : 1.0);
+        ro.animation = o.restore == "auto" && o.restore_animation;
+        ro.dither_step = o.restore_dither == "off" ? 0 : (o.restore_dither == "8" ? 4 : 1);
+        if (!restore_net.init(rdev, ropt, rdir, rfs, error)
+                || !restore_net.configure(fmt, color, o.transfer == "pq", o.restore_tile, error)
+                || !restore_stage.init(&restore_net, fmt, color, ro, error))
+        {
+            fprintf(stderr, "error: %s\n", error.c_str());
+            return EXIT_GPU;
+        }
+        if (!o.quiet)
+            fprintf(stderr, "info: restauration : niveau %s%s | graphes %s (flux x%g) | tramage %s | tuiles %d | transfert %s | GPU %s\n",
+                    o.restore.c_str(), ro.animation ? " (animation)" : "", path_to_utf8(rdir.filename()).c_str(), rfs,
+                    ro.dither_step == 0 ? "non" : (ro.dither_step == 4 ? "±1 pas 8 bits" : "±1 code"), o.restore_tile,
+                    o.transfer.empty() ? "sdr" : o.transfer.c_str(), rdev->info.device_name());
     }
 
     FrameFormat out_fmt = fmt;
@@ -1146,7 +1299,51 @@ static int run(const Options& o, const fs::path& exe_dir)
     std::atomic<bool> write_failed(false);
     std::string read_error;
 
+    std::atomic<bool> restore_failed(false);
     std::thread reader_thread([&] {
+        if (restoring)
+        {
+            // trames lues -> étage de Restauration -> trames restaurées, dans l'ordre, vers le pipeline
+            std::vector<uint8_t> raw(fmt.padded_frame_bytes()), restored;
+            for (;;)
+            {
+                std::string err;
+                const int r = reader.read_frame(raw.data(), err);
+                if (r < 0)
+                {
+                    read_error = err;
+                    read_failed = true;
+                    break;
+                }
+                if (!(r > 0 ? restore_stage.push(raw.data()) : restore_stage.finish()))
+                {
+                    read_error = restore_stage.error();
+                    restore_failed = true;
+                    break;
+                }
+                bool closed = false;
+                while (!closed && restore_stage.pop(restored))
+                {
+                    FrameBuffer buf = pool.acquire();
+                    memcpy(buf->data(), restored.data(), fmt.padded_frame_bytes());
+                    int slot = -1;
+                    if (async_in)
+                    {
+                        if (!free_in.pop(slot))
+                        {
+                            closed = true;
+                            break;
+                        }
+                        memcpy(engine.input_slot(slot), buf->data(), fmt.padded_frame_bytes());
+                    }
+                    closed = !read_queue.push(InFrame{buf, slot});
+                }
+                if (r == 0 || closed)
+                    break;
+            }
+            read_queue.close();
+            return;
+        }
         for (;;)
         {
             FrameBuffer buf = pool.acquire();
@@ -1502,6 +1699,30 @@ static int run(const Options& o, const fs::path& exe_dir)
     {
         fprintf(stderr, "error: %s\n", read_error.c_str());
         exit_code = EXIT_INPUT;
+    }
+    if (restore_failed)
+    {
+        fprintf(stderr, "error: %s\n", read_error.c_str());
+        exit_code = EXIT_GPU;
+    }
+    if (!o.quiet && restoring)
+    {
+        // un résumé par plan : rapport de grain mesuré (ou repris du plan précédent) et part du résidu réinjectée
+        std::string shots;
+        for (int c : restore_stage.cuts())
+        {
+            const auto it = restore_stage.log().find(c);
+            if (it == restore_stage.log().end())
+                continue;
+            char one[96];
+            if (it->second.ratio)
+                snprintf(one, sizeof one, "%s%d: rapport %.3f part %.3f", shots.empty() ? "" : ", ", c, *it->second.ratio, it->second.part);
+            else
+                snprintf(one, sizeof one, "%s%d: rapport inconnu part %.3f", shots.empty() ? "" : ", ", c, it->second.part);
+            shots += one;
+        }
+        fprintf(stderr, "info: restauration : %zu plan(s) [%s], %zu trame(s) tenues au plus\n", restore_stage.cuts().size(),
+                shots.c_str(), restore_stage.max_held());
     }
     if (exit_code == EXIT_OK && write_failed)
     {

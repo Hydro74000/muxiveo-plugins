@@ -64,3 +64,44 @@ def test_invalid_selector_weights_are_reported(tmp_path, mutate, message):
 def test_missing_selector_weights_are_reported(tmp_path):
     selector = _capabilities("--selector-weights", str(tmp_path / "absent.txt"))["selector"]
     assert selector["status"] == "fichier introuvable"
+
+
+def _has_restore() -> bool:
+    return "restore" in _capabilities().get("options", [])
+
+
+@pytest.mark.skipif(not RIFE_BIN or not Path(RIFE_BIN).is_file() or not _has_restore(), reason="Restauration absente du binaire")
+def test_capabilities_describe_restore():
+    caps = _capabilities()
+    assert {"restore", "restore-animation", "restore-fast", "restore-model", "restore-dither", "transfer",
+            "restore-tile"} <= set(caps["options"])
+    restore = caps["restore"]
+    assert restore["levels"] == ["auto", "leger", "moyen", "fort"] and restore["dither"] == ["auto", "off", "8"]
+    models_dir = Path(RIFE_BIN).resolve().parent / "restore-models"
+    files = ("r2_flow.ncnn.param", "r2_flow.ncnn.bin", "r2_body.ncnn.param", "r2_body.ncnn.bin")
+    expected = sorted(p.name for p in models_dir.glob("*") if all((p / f).is_file() for f in files))
+    assert restore["models"] == expected
+
+
+@pytest.mark.skipif(not RIFE_BIN or not Path(RIFE_BIN).is_file() or not _has_restore(), reason="Restauration absente du binaire")
+@pytest.mark.parametrize("args,message", [
+    (["--restore", "maximal"], "--restore : auto, leger, moyen ou fort"),
+    (["--restore", "auto", "--restore-dither", "4"], "--restore-dither : auto, off ou 8"),
+    (["--restore", "auto", "--transfer", "linear"], "--transfer : sdr, pq ou hlg"),
+    (["--restore", "auto", "--restore-tile", "16"], "--restore-tile"),
+])
+def test_restore_options_rejected(args, message):
+    out = subprocess.run([RIFE_BIN, *args], capture_output=True, text=True, timeout=60, input="")
+    assert out.returncode == 1 and message in out.stderr
+
+
+@pytest.mark.skipif(not RIFE_BIN or not Path(RIFE_BIN).is_file() or not _has_restore(), reason="Restauration absente du binaire")
+def test_restore_without_graphs_fails_cleanly(tmp_path):
+    gpus = subprocess.run([RIFE_BIN, "--list-gpus"], capture_output=True, text=True, timeout=60)
+    if gpus.returncode != 0 or not json.loads(gpus.stdout or "{}").get("gpus"):
+        pytest.skip("aucun périphérique Vulkan")
+    header = b"YUV4MPEG2 W64 H64 F24:1 Ip A1:1 C420p10\n"
+    frame = b"FRAME\n" + bytes(64 * 64 * 3 // 2 * 2)
+    out = subprocess.run([RIFE_BIN, "--factor", "1", "--matrix", "bt709", "--restore", "auto", "--restore-model",
+                          str(tmp_path / "absent")], capture_output=True, input=header + frame, timeout=120)
+    assert out.returncode == 3 and "graphe de restauration introuvable" in out.stderr.decode()
