@@ -87,3 +87,8 @@ def test_source_statistics_measure_the_frames_read(tmp_path):
     assert source.read_text() == produced.read_text()  # recopie : trames lues = trames produites
     r = _run(_y4m([512]), produced, "--transfer", "pq", "--factor", "2", "--source-statistics", str(source))
     assert r.returncode == 0 and len([line for line in source.read_text().splitlines() if '"frame"' in line]) == 1
+
+
+def test_unwritable_statistics_are_reported(tmp_path):
+    r = _run(_y4m([512]), tmp_path / "absent" / "s.jsonl", "--transfer", "pq")
+    assert r.returncode != 0 and b"statistiques des trames" in r.stderr

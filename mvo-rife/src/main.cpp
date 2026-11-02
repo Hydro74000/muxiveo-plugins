@@ -1765,7 +1765,10 @@ static int run(const Options& o, const fs::path& exe_dir)
 
     if (exit_code != EXIT_OK)
     {
-        // le lecteur peut rester bloqué sur stdin : sortie immédiate
+        // le lecteur peut rester bloqué sur stdin : sortie immédiate ; écriture interrompue par les statistiques :
+        // leur erreur (affectée avant le drapeau atomique)
+        if (stats_failed || source_stats_failed)
+            fprintf(stderr, "error: %s\n", (stats_failed ? stats_error : source_stats_error).c_str());
         fprintf(stderr, "done in=%lld out=%lld interpolated=%lld scenes=%lld static=%lld exit=%d\n",
                 (long long)frames_in, (long long)frames_out, (long long)interpolated,
                 (long long)scene_cuts, (long long)static_pairs, exit_code);
