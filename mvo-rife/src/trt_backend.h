@@ -25,7 +25,9 @@ public:
 
     // Charge le plugin et apparie le GPU Vulkan à son périphérique CUDA. Faux = indisponible (reason).
     // quiet : pas de lignes « info: » du plugin (construction du moteur, spécialisation).
-    bool load(const std::filesystem::path& plugin_dir, const ncnn::VulkanDevice* vkdev, bool quiet, std::string& reason);
+    // graph : interface 2 exigée (sessions de graphe génériques, Restauration).
+    bool load(const std::filesystem::path& plugin_dir, const ncnn::VulkanDevice* vkdev, bool quiet, std::string& reason,
+              bool graph = false);
     // Session d'un modèle (nom de dossier muxiveo-rife, suffixe « -uhd » éventuel), dimensions paddées.
     bool open(const std::string& model, int width, int height, const std::filesystem::path& cache_dir, std::string& reason);
 
@@ -36,10 +38,19 @@ public:
     // id0, id1 : identités des images (0 : inconnue), transmises au plugin pour réutiliser leurs caractéristiques
     bool infer(float t, std::string& error, bool reverse_inputs = false, uint64_t id0 = 0, uint64_t id1 = 0);
 
+    // Session de graphe (interface 2) : modèle ONNX quelconque (entrées in0…, au plus 2, sortie out0), dimensions fixes ;
+    // cache_name : nom unique des moteurs en cache. Tampons partagés : input(k) (k < graph_inputs()), output().
+    bool open_graph(const std::filesystem::path& model, const std::string& cache_name, int width, int height,
+                    const std::filesystem::path& cache_dir, std::string& reason);
+    int graph_inputs() const { return graph_in; }
+    // Inférence synchrone du graphe (Vulkan doit avoir terminé d'écrire les entrées).
+    bool infer_graph(std::string& error);
+
     std::string description() const { return summary; }
 
     // Charge la bibliothèque du plugin et vérifie son interface (NULL = raison).
-    static const MvoTrtApi* load_api(const std::filesystem::path& plugin_dir, void*& handle, std::string& reason);
+    static const MvoTrtApi* load_api(const std::filesystem::path& plugin_dir, void*& handle, std::string& reason,
+                                     uint32_t version = MVO_TRT_ABI_VERSION);
     // Ordinal CUDA du GPU Vulkan s'il peut exécuter TensorRT for RTX (Turing+, pilote assez récent), sinon -1.
     static int cuda_ordinal(const ncnn::GpuInfo& info, std::string& reason);
 
@@ -53,7 +64,7 @@ private:
         CUexternalMemory cuda_memory = nullptr;
         CUdeviceptr cuda_ptr = 0;
     };
-    bool create_slot(Slot& slot, size_t bytes, int width, int height, std::string& reason);
+    bool create_slot(Slot& slot, size_t bytes, int width, int height, int channels, std::string& reason);
     void destroy_slot(Slot& slot);
 
     void* library = nullptr;
@@ -65,6 +76,7 @@ private:
     int cuda_ordinal_ = -1;
     CUcontext cuda_ctx = nullptr;
     Slot slots[3];
+    int graph_in = 0;
     std::string summary;
 };
 

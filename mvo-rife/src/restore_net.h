@@ -11,10 +11,12 @@
 #include <cstdint>
 #include <filesystem>
 #include <map>
+#include <memory>
 #include <string>
 #include <vector>
 
 #include "engine.h"
+#include "trt_backend.h"
 #include "gpu.h"
 #include "mat.h"
 #include "net.h"
@@ -52,6 +54,13 @@ public:
     bool process(int64_t t, const int64_t nb[4], const uint8_t* grain_map, std::vector<float>& yuv, const Crop* crop,
                  std::vector<float>* flows, std::string& error);
 
+    // Inférence par le plugin TensorRT (interface 2) : graphes <onnx_dir>/r2_flow.onnx et r2_body.onnx, moteurs en cache
+    // sous le nom « <tag>-r2_* » ; corps calculé sur l'image entière. Faux = Vulkan conservé (reason).
+    bool enable_trt(const std::filesystem::path& plugin_dir, const std::filesystem::path& onnx_dir, const std::string& tag,
+                    const std::filesystem::path& cache_dir, bool quiet, std::string& reason);
+    bool uses_trt() const { return trt_on; }
+    const std::string& trt_description() const { return trt_summary; }
+
     // Mémoire GPU épuisée lors du dernier appel (repli possible sur des tuiles plus petites).
     bool out_of_memory() const { return oom; }
     int tile_size() const { return tile; }
@@ -74,6 +83,16 @@ private:
     ncnn::Pipeline* make_pipeline(const char* data, int size, int lx, int ly, int lz);
     bool resize(ncnn::VkCompute& cmd, const ncnn::VkMat& src, int inc, int outw, int outh, int outc, float mul0, float mul1,
                 ncnn::VkMat& dst);
+    bool warp_from_flow(ncnn::VkCompute& cmd, const ncnn::VkMat& f, const ncnn::VkMat& rgb, ncnn::VkMat& full, ncnn::VkMat& warped,
+                        std::string& error);
+    bool assemble(ncnn::VkCompute& cmd, const ncnn::VkMat& rgb, const ncnn::VkMat warped[4], const uint8_t* grain_map, ncnn::VkMat& x);
+    bool to_yuv(ncnn::VkCompute& cmd, const ncnn::VkMat& acc, const ncnn::VkMat& wsum, ncnn::VkMat& out);
+    std::vector<ncnn::vk_constant_type> tile_constants(int mode, const ncnn::VkMat& x, const ncnn::VkMat& acc, int c, int x0, int y0, int tw,
+                                                       int th, int tcstep, int wx0, int wy0, int tpw, int tph) const;
+    void crop_flows(const ncnn::Mat host_flows[4], const Crop& crop, std::vector<float>& flows) const;
+    void copy_dense(ncnn::VkCompute& cmd, const ncnn::VkMat& src, int c, const ncnn::VkMat& dst);
+    bool process_trt(int64_t t, const int64_t nb[4], const uint8_t* grain_map, std::vector<float>& yuv, const Crop* crop,
+                     std::vector<float>* flows, std::string& error);
     void release();
 
     ncnn::VulkanDevice* vkdev = nullptr;
@@ -88,6 +107,10 @@ private:
     ncnn::Pipeline* p_assemble = nullptr;
     ncnn::Pipeline* p_tile = nullptr;
     ncnn::Pipeline* p_rgb_to_yuv = nullptr;
+    ncnn::Pipeline* p_copy = nullptr;
+    std::unique_ptr<TrtBackend> trt_flow, trt_body;
+    bool trt_on = false;
+    std::string trt_summary;
     double flow_scale = 0.5;
     FrameFormat fmt;
     ColorParams color;

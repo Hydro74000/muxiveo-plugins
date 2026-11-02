@@ -524,9 +524,9 @@ bool load_or_build_engine(MvoTrtSession& s, TrtNet& n, const fs::path& model, co
 
 // Réseau prêt : moteur (cache ou construction), configuration d'exécution, cache des noyaux, formes des entrées
 // (1 × canaux × hauteur × largeur) et mémoire de travail.
-bool prepare_net(MvoTrtSession& s, TrtNet& n, const fs::path& model, std::string& error)
+bool prepare_net(MvoTrtSession& s, TrtNet& n, const fs::path& model, std::string& error, const std::string& cache_name = "")
 {
-    const std::string stem = model.stem().u8string() + s.device_suffix;
+    const std::string stem = (cache_name.empty() ? model.stem().u8string() : cache_name) + s.device_suffix;
     n.runtime_cache_path = s.cache_dir / (stem + "-" + s.uuid_hex + ".rtcache");
     if (!load_or_build_engine(s, n, model, s.cache_dir / (stem + ".engine"), error))
         return false;
@@ -881,11 +881,142 @@ void destroy(MvoTrtSession* s)
     delete s;
 }
 
+// Interface 2 : session de graphe générique (entrées in0…, sortie out0, fp16 NCHW), dimensions fixées à la création.
+MvoTrtSession* graph_create(const MvoTrtGraphParams* p, char* error, size_t error_size)
+{
+    if (!p || p->struct_size < sizeof(MvoTrtGraphParams) || !p->model_path || !p->cache_dir || !p->cache_name
+        || p->width < kMinSide || p->height < kMinSide || p->width > kMaxSide || p->height > kMaxSide)
+    {
+        set_error(error, error_size, "paramètres de session invalides");
+        return nullptr;
+    }
+    if (!device_supported(p->cuda_device, error, error_size))
+        return nullptr;
+    auto s = std::make_unique<MvoTrtSession>();
+    s->cu = &cuda();
+    s->log = p->log;
+    s->log_user = p->log_user;
+    s->width = p->width;
+    s->height = p->height;
+    Cuda& c = *s->cu;
+    if (c.cuDeviceGet(&s->dev, p->cuda_device) != 0 || c.cuDevicePrimaryCtxRetain(&s->ctx, s->dev) != 0)
+    {
+        set_error(error, error_size, "contexte CUDA indisponible");
+        s->ctx = nullptr;
+        return nullptr;
+    }
+    ContextScope scope(c, s->ctx);
+    if (!scope.ok())
+    {
+        set_error(error, error_size, "contexte CUDA indisponible");
+        return nullptr;
+    }
+    try
+    {
+        s->model_path = fs::u8path(p->model_path);
+        s->cache_dir = fs::u8path(p->cache_dir);
+        std::error_code ec;
+        fs::create_directories(s->cache_dir, ec);
+        const int cc = compute_capability(c, s->dev);
+        CUuuid uuid{};
+        c.cuDeviceGetUuid(&uuid, s->dev);
+        s->device_suffix = "-sm" + std::to_string(cc) + "-trtrtx" + trt_version();
+        s->uuid_hex = hex(uuid.bytes, 16);
+        s->runtime.reset(nvinfer1::createInferRuntime(s->logger));
+        if (!s->runtime)
+        {
+            set_error(error, error_size, "runtime TensorRT indisponible");
+            return nullptr;
+        }
+        s->full.runtime = s->runtime.get();
+        std::string err;
+        if (!prepare_net(*s, s->full, s->model_path, err, p->cache_name))
+        {
+            set_error(error, error_size, err);
+            return nullptr;
+        }
+        if (c.cuStreamCreate(&s->stream, CU_STREAM_NON_BLOCKING) != 0)
+        {
+            s->stream = nullptr;
+            set_error(error, error_size, "flux CUDA impossible");
+            return nullptr;
+        }
+    }
+    catch (const std::exception& e)
+    {
+        set_error(error, error_size, std::string("erreur interne : ") + e.what());
+        return nullptr;
+    }
+    return s.release();
+}
+
+int graph_channels(MvoTrtSession* s, int* in_channels, int max_inputs, int* out_channels)
+{
+    if (!s || !s->full)
+        return 0;
+    const nvinfer1::ICudaEngine& e = *s->full.engine;
+    int inputs = 0;
+    for (int k = 0; k < MVO_TRT_GRAPH_MAX_INPUTS; k++)
+    {
+        const std::string name = "in" + std::to_string(k);
+        bool found = false;
+        for (int i = 0; i < e.getNbIOTensors(); i++)
+            if (name == e.getIOTensorName(i) && e.getTensorIOMode(name.c_str()) == nvinfer1::TensorIOMode::kINPUT)
+                found = true;
+        if (!found)
+            break;
+        if (k < max_inputs && in_channels)
+            in_channels[k] = (int)e.getTensorShape(name.c_str()).d[1];
+        inputs++;
+    }
+    if (out_channels)
+        *out_channels = (int)e.getTensorShape("out0").d[1];
+    return inputs;
+}
+
+int graph_infer(MvoTrtSession* s, const uint64_t* inputs, int input_count, uint64_t output, char* error, size_t error_size)
+{
+    if (!s || !s->full || !inputs || input_count < 1 || input_count > MVO_TRT_GRAPH_MAX_INPUTS || !output)
+    {
+        set_error(error, error_size, "paramètres d'inférence invalides");
+        return 0;
+    }
+    Cuda& c = *s->cu;
+    ContextScope scope(c, s->ctx);
+    if (!scope.ok())
+    {
+        set_error(error, error_size, "contexte CUDA indisponible");
+        return 0;
+    }
+    for (int k = 0; k < input_count; k++)
+        if (!s->full.context->setTensorAddress(("in" + std::to_string(k)).c_str(), reinterpret_cast<void*>(inputs[k])))
+        {
+            set_error(error, error_size, "tenseur d'entrée refusé : " + s->logger.take_error());
+            return 0;
+        }
+    if (!s->full.context->setTensorAddress("out0", reinterpret_cast<void*>(output)))
+    {
+        set_error(error, error_size, "tenseur de sortie refusé : " + s->logger.take_error());
+        return 0;
+    }
+    std::string err;
+    if (!run_net(*s, s->full, err))
+    {
+        set_error(error, error_size, err);
+        return 0;
+    }
+    return 1;
+}
+
 const MvoTrtApi kApi = {MVO_TRT_ABI_VERSION, plugin_version, device_supported, create, infer, destroy};
+const MvoTrtApi2 kApi2 = {{MVO_TRT_ABI_VERSION_GRAPH, plugin_version, device_supported, create, infer, destroy},
+                          graph_create, graph_channels, graph_infer};
 
 } // namespace
 
 extern "C" MVO_TRT_EXPORT const MvoTrtApi* mvo_trt_get_api(uint32_t abi_version)
 {
+    if (abi_version == MVO_TRT_ABI_VERSION_GRAPH)
+        return &kApi2.v1;  // MvoTrtApi2 commence par ses champs de l'interface 1
     return abi_version == MVO_TRT_ABI_VERSION ? &kApi : nullptr;
 }

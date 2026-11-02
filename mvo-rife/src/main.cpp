@@ -1096,11 +1096,29 @@ static int run(const Options& o, const fs::path& exe_dir)
             fprintf(stderr, "error: %s\n", error.c_str());
             return EXIT_GPU;
         }
+        // inférence TensorRT (plugin mvo-rife-trt, interface 2) si fourni ; Vulkan sinon ou au moindre obstacle
+        std::string restore_backend = "Vulkan";
+        if (o.backend != "vulkan" && !o.trt_plugin.empty())
+        {
+            std::string reason;
+            if (restore_net.enable_trt(path_from_utf8(o.trt_plugin), rdir, path_to_utf8(rdir.filename()),
+                                       o.trt_cache.empty() ? default_trt_cache() : path_from_utf8(o.trt_cache), o.quiet, reason))
+                restore_backend = restore_net.trt_description();
+            else
+                restore_backend = "Vulkan (TensorRT indisponible : " + reason + ")";
+        }
+        if (o.backend == "tensorrt" && !restore_net.uses_trt())
+        {
+            fprintf(stderr, "error: inférence TensorRT indisponible pour la Restauration : %s\n",
+                    o.trt_plugin.empty() ? "aucun plugin (--trt-plugin)" : restore_backend.c_str());
+            return EXIT_GPU;
+        }
         if (!o.quiet)
-            fprintf(stderr, "info: restauration : niveau %s%s | graphes %s (flux x%g) | tramage %s | tuiles %d | transfert %s | GPU %s\n",
+            fprintf(stderr, "info: restauration : niveau %s%s | graphes %s (flux x%g) | tramage %s | %s | transfert %s | GPU %s | %s\n",
                     o.restore.c_str(), ro.animation ? " (animation)" : "", path_to_utf8(rdir.filename()).c_str(), rfs,
-                    ro.dither_step == 0 ? "non" : (ro.dither_step == 4 ? "±1 pas 8 bits" : "±1 code"), o.restore_tile,
-                    o.transfer.empty() ? "sdr" : o.transfer.c_str(), rdev->info.device_name());
+                    ro.dither_step == 0 ? "non" : (ro.dither_step == 4 ? "±1 pas 8 bits" : "±1 code"),
+                    restore_net.uses_trt() ? "image entière" : ("tuiles " + std::to_string(o.restore_tile)).c_str(),
+                    o.transfer.empty() ? "sdr" : o.transfer.c_str(), rdev->info.device_name(), restore_backend.c_str());
     }
 
     FrameFormat out_fmt = fmt;

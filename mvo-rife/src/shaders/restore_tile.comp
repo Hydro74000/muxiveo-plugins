@@ -1,6 +1,7 @@
 // Restauration (R2) : tuiles du corps. mode 2 : remise à zéro de acc et wsum (tw × th = W × H) ; mode 0 : copie de
 // la région [x0, x0 + tw) × [y0, y0 + th) de l'entrée (c canaux) dans la tuile tpw × tph (multiple de 4 : bords droit
-// et bas répliqués, comme UNetRestore.forward) ; mode 1 : accumulation de la partie utile de la sortie de la tuile (3 canaux), pondérée par une fenêtre de
+// et bas répliqués, comme UNetRestore.forward) ; mode 3 : copie directe de la sortie (image entière) ; mode 1 :
+// accumulation de la partie utile de la sortie de la tuile (3 canaux), pondérée par une fenêtre de
 // Hann (taille n, arrondie au format de stockage puis bornée à 1e-3), dans acc (3 canaux) et wsum (flottants 32 bits).
 #version 450
 #if NCNN_fp16_storage
@@ -40,6 +41,13 @@ void main()
         return;
     int gi = (p.y0 + gy) * p.W + (p.x0 + gx);
     int ti = gy * p.tpw + gx;
+    if (p.mode == 3)  // sortie de l'image entière (TensorRT, pas tpw) : acc = sortie, wsum = 1
+    {
+        for (int k = 0; k < 3; k++)
+            acc_data[k * p.acstep + gi] = float(src_data[k * p.tcstep + ti]);
+        wsum_data[gi] = 1.0;
+        return;
+    }
     if (p.mode == 2)
     {
         for (int k = 0; k < 3; k++)

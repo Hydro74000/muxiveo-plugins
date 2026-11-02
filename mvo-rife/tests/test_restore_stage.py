@@ -93,3 +93,18 @@ def test_restore_dither_8bit_and_interpolation():
     assert len(both) == 2 * N
     assert all(np.array_equal(both[2 * i], alone[i]) for i in range(N))  # trames d'origine = trames restaurées
     assert "done in=%d out=%d" % (N, 2 * N) in log
+
+
+TRT_PLUGIN = os.environ.get("MUXIVEO_RIFE_TRT_PLUGIN", "")
+
+
+@pytest.mark.skipif(not TRT_PLUGIN or not (Path(MODELS) / "r2_body.onnx").is_file(),
+                    reason="plugin TensorRT (MUXIVEO_RIFE_TRT_PLUGIN) et graphes ONNX de restauration requis")
+def test_restore_tensorrt_matches_vulkan(tmp_path):
+    src_bytes = _source()
+    vk, _ = _run(src_bytes, "--factor", "1", "--restore", "auto", "--restore-dither", "off", "--backend", "vulkan")
+    trt, log = _run(src_bytes, "--factor", "1", "--restore", "auto", "--restore-dither", "off", "--trt-plugin", TRT_PLUGIN,
+                    "--trt-cache", str(tmp_path), "--backend", "tensorrt")
+    assert "TensorRT" in log and len(trt) == N
+    y = np.stack([f[: W * H] for f in trt]).astype(np.float64) - np.stack([f[: W * H] for f in vk])
+    assert 10 * np.log10(1023 ** 2 / max(np.mean(y ** 2), 1e-9)) > 60  # mêmes graphes : écarts d'arrondi fp16 seulement

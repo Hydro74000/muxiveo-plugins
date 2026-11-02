@@ -125,7 +125,7 @@ void log_to_stderr(void*, int level, const char* message)
 
 } // namespace
 
-const MvoTrtApi* TrtBackend::load_api(const fs::path& plugin_dir, void*& handle, std::string& reason)
+const MvoTrtApi* TrtBackend::load_api(const fs::path& plugin_dir, void*& handle, std::string& reason, uint32_t version)
 {
     handle = open_plugin(plugin_dir);
     if (!handle)
@@ -135,10 +135,10 @@ const MvoTrtApi* TrtBackend::load_api(const fs::path& plugin_dir, void*& handle,
     }
     typedef const MvoTrtApi* (*GetApi)(uint32_t);
     GetApi get = (GetApi)plugin_symbol(handle, "mvo_trt_get_api");
-    const MvoTrtApi* api = get ? get(MVO_TRT_ABI_VERSION) : nullptr;
-    if (!api || api->abi_version != MVO_TRT_ABI_VERSION)
+    const MvoTrtApi* api = get ? get(version) : nullptr;
+    if (!api || api->abi_version != version)
     {
-        reason = "plugin incompatible avec cette version de muxiveo-rife (interface " + std::to_string(MVO_TRT_ABI_VERSION) + " attendue)";
+        reason = "plugin incompatible avec cette version de muxiveo-rife (interface " + std::to_string(version) + " attendue)";
         return nullptr;
     }
     return api;
@@ -208,7 +208,7 @@ int TrtBackend::cuda_ordinal(const ncnn::GpuInfo& info, std::string& reason)
     return ordinal;
 }
 
-bool TrtBackend::load(const fs::path& dir, const ncnn::VulkanDevice* device, bool quiet, std::string& reason)
+bool TrtBackend::load(const fs::path& dir, const ncnn::VulkanDevice* device, bool quiet, std::string& reason, bool graph)
 {
     vkdev = device;
     plugin_dir = dir;
@@ -226,7 +226,7 @@ bool TrtBackend::load(const fs::path& dir, const ncnn::VulkanDevice* device, boo
         reason = "export de mémoire Vulkan vers CUDA indisponible sur ce pilote";
         return false;
     }
-    api = load_api(dir, library, reason);
+    api = load_api(dir, library, reason, graph ? MVO_TRT_ABI_VERSION_GRAPH : MVO_TRT_ABI_VERSION);
     if (!api)
         return false;
     char err[512] = {0};
@@ -245,7 +245,7 @@ bool TrtBackend::load(const fs::path& dir, const ncnn::VulkanDevice* device, boo
     return true;
 }
 
-bool TrtBackend::create_slot(Slot& slot, size_t bytes, int width, int height, std::string& reason)
+bool TrtBackend::create_slot(Slot& slot, size_t bytes, int width, int height, int channels, std::string& reason)
 {
     VkDevice device = vkdev->vkdevice();
     ExternalMemoryBufferCreateInfo ext = {kSTypeExternalMemoryBufferCreateInfo, nullptr, kHandleType};
@@ -330,7 +330,7 @@ bool TrtBackend::create_slot(Slot& slot, size_t bytes, int width, int height, st
     slot.memory.stage_flags = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
     slot.memory.refcount = 0;
     // Mémoire externe (allocateur nul) : jamais libérée par ncnn ; NCHW contigu (cstep = largeur x hauteur).
-    slot.mat = ncnn::VkMat(width, height, 3, &slot.memory, 2u, 1, nullptr);
+    slot.mat = ncnn::VkMat(width, height, channels, &slot.memory, 2u, 1, nullptr);
     if ((int)slot.mat.cstep != width * height)
     {
         reason = "disposition des tampons incompatible avec TensorRT";
@@ -375,7 +375,7 @@ bool TrtBackend::open(const std::string& model, int width, int height, const fs:
     }
     const size_t bytes = (size_t)width * height * 3 * 2;
     for (Slot& slot : slots)
-        if (!create_slot(slot, bytes, width, height, reason))
+        if (!create_slot(slot, bytes, width, height, 3, reason))
             return false;
 
     const std::string model_utf8 = model_path.u8string();
@@ -451,4 +451,77 @@ TrtBackend::~TrtBackend()
     if (cuda_ctx)
         cuda.release_primary(cuda_ordinal_);
     // Plugin laissé chargé : TensorRT n'est pas conçu pour être déchargé avant la fin du processus.
+}
+
+bool TrtBackend::open_graph(const fs::path& model, const std::string& cache_name, int width, int height, const fs::path& cache_dir,
+                            std::string& reason)
+{
+    if (!api || !cuda_ctx || api->abi_version != MVO_TRT_ABI_VERSION_GRAPH)
+    {
+        reason = "plugin non chargé (interface 2 requise)";
+        return false;
+    }
+    const MvoTrtApi2* api2 = reinterpret_cast<const MvoTrtApi2*>(api);
+    const std::string model_utf8 = model.u8string();
+    const std::string cache_utf8 = cache_dir.u8string();
+    MvoTrtGraphParams params;
+    memset(&params, 0, sizeof params);
+    params.struct_size = sizeof params;
+    params.cuda_device = cuda_ordinal_;
+    params.model_path = model_utf8.c_str();
+    params.cache_name = cache_name.c_str();
+    params.cache_dir = cache_utf8.c_str();
+    params.width = width;
+    params.height = height;
+    params.log = log_quiet ? nullptr : log_to_stderr;
+    char err[512] = {0};
+    const CudaDriver& cuda = CudaDriver::get();
+    if (!cuda.push(cuda_ctx))
+    {
+        reason = "contexte CUDA indisponible";
+        return false;
+    }
+    session = api2->graph_create(&params, err, sizeof err);
+    int in_c[MVO_TRT_GRAPH_MAX_INPUTS] = {0};
+    int out_c = 0;
+    graph_in = session ? api2->graph_channels(session, in_c, MVO_TRT_GRAPH_MAX_INPUTS, &out_c) : 0;
+    cuda.pop();
+    if (!session)
+    {
+        reason = err;
+        return false;
+    }
+    if (graph_in < 1 || graph_in > 2 || out_c < 1)
+    {
+        reason = "graphe TensorRT inattendu (entrées ou sortie)";
+        return false;
+    }
+    for (int k = 0; k < graph_in; k++)
+        if (!create_slot(slots[k], (size_t)width * height * in_c[k] * 2, width, height, in_c[k], reason))
+            return false;
+    return create_slot(slots[2], (size_t)width * height * out_c * 2, width, height, out_c, reason);
+}
+
+bool TrtBackend::infer_graph(std::string& error)
+{
+    const MvoTrtApi2* api2 = reinterpret_cast<const MvoTrtApi2*>(api);
+    uint64_t inputs[2] = {slots[0].cuda_ptr, slots[1].cuda_ptr};
+    char err[512] = {0};
+    const CudaDriver& cuda = CudaDriver::get();
+    if (!cuda.push(cuda_ctx))
+    {
+        error = "contexte CUDA indisponible";
+        return false;
+    }
+    const bool ok = api2->graph_infer(session, inputs, graph_in, slots[2].cuda_ptr, err, sizeof err) != 0;
+    cuda.pop();
+    if (!ok)
+    {
+        error = err;
+        return false;
+    }
+    // Sortie écrite hors de Vulkan (inférence terminée) : prochaine lecture précédée d'une barrière complète.
+    slots[2].memory.access_flags = 0;
+    slots[2].memory.stage_flags = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
+    return true;
 }

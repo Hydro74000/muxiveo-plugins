@@ -1,0 +1,21 @@
+// Restauration (R2) : copie de c canaux (w × h, pas src_cstep) vers un tampon dense outw × outh (NCHW contigu, pas
+// outw × outh) ; au-delà de w × h, bords droit et bas répliqués (tampons TensorRT aux dimensions multiples de 4).
+#version 450
+#if NCNN_fp16_storage
+#extension GL_EXT_shader_16bit_storage: require
+#endif
+layout (binding = 0) readonly buffer src_blob { sfp src_data[]; };
+layout (binding = 1) writeonly buffer dst_blob { sfp dst_data[]; };
+layout (push_constant) uniform parameter { int w; int h; int c; int cstep; int outw; int outh; } p;
+
+void main()
+{
+    int gx = int(gl_GlobalInvocationID.x);
+    int gy = int(gl_GlobalInvocationID.y);
+    if (gx >= p.outw || gy >= p.outh || int(gl_GlobalInvocationID.z) >= 1)
+        return;
+    int si = min(gy, p.h - 1) * p.w + min(gx, p.w - 1);
+    int di = gy * p.outw + gx;
+    for (int k = 0; k < p.c; k++)
+        dst_data[k * p.outw * p.outh + di] = src_data[k * p.cstep + si];
+}
