@@ -1,12 +1,29 @@
-# mvo-rife — interpolation d'images (moteur muxiveo-rife)
+# mvo-rife — moteur vidéo MVO : débruitage et interpolation (muxiveo-rife)
 
-Interpolation d'images **RIFE v4** sur GPU (Vulkan via [ncnn](https://github.com/Tencent/ncnn)),
-en flux **y4m** : `stdin → stdout`. Utilisé par le workflow d'encodage de Muxiveo pour
-multiplier la cadence (ex. 29,97 → 59,94 fps).
+Moteur vidéo de Muxiveo sur GPU (Vulkan via [ncnn](https://github.com/Tencent/ncnn)), en flux **y4m** :
+`stdin → stdout`. Deux traitements, seuls ou enchaînés dans le même passage :
+
+- **débruitage MVO-R2** (`--restore`, 1.12.0) : filtre « Débruitage » par défaut du panneau Encodage ;
+- **interpolation d'images RIFE v4** : multiplication de la cadence (ex. 29,97 → 59,94 fps).
 
 Extension de Muxiveo : installée, mise à jour et supprimée par l'application (page Extensions), dans le dossier
 utilisateur. Le moteur, ses modèles, les poids de son sélecteur et ses préréglages évoluent sans release de
 Muxiveo : l'application retient la version la plus récente dont le contrat (`--capabilities`) lui est connu.
+
+## Nouveautés 1.12.0
+
+- **Débruitage MVO-R2** (`--restore auto|leger|moyen|fort`) : réseau appris qui débruite chaque image à partir
+  d'une fenêtre de 5 images recalées par son propre flux optique ; il retire le grain et le bruit en gardant le
+  détail que les images voisines confirment. Aucun modèle RIFE n'est chargé en débruitage seul (`--factor 1`).
+  Détails : [Débruitage MVO-R2](#débruitage-mvo-r2---restore-1120).
+- Débruitage puis interpolation dans le même processus (trames d'origine = trames débruitées).
+- Graphes livrés avec l'extension (`restore-models/r2`, `restore-models/r2q`, release `mvo-restore-models-v1.0.0`).
+- NVIDIA TensorRT : débruitage par `mvo-rife-trt` 1.3.0 ou plus récent (interface 2 : sessions de graphe
+  génériques), repli Vulkan au moindre problème ; avec `mvo-rife-trt` 1.2.0, l'interpolation TensorRT reste
+  inchangée et le débruitage passe en Vulkan.
+- Statistiques de lumière de chaque trame (`--frame-statistics`, `--source-statistics`, format
+  `mvo-fel-frame-statistics`) : MaxCLL / MaxFALL de l'image produite et de la source, comparés par Muxiveo.
+- Interpolation sans `--restore` : sorties identiques au bit près à la 1.11.0.
 
 ## Nouveautés 1.11.0
 
@@ -193,6 +210,31 @@ scènes de 5 titres SD / 720p natifs) :
 | Hybride v4.15-mvo1 + `--ultra` (Ultra) | +0,86 | +0,60 | +0,43 | +0,41 |
 | Qualité sans flux NVIDIA | +0,77 | +0,51 | +0,35 | +0,32 |
 | Hybride v4.6 (Équilibré), par rapport à RIFE v4.6 | +0,73 | +0,60 | +0,43 | +0,55 |
+
+## Débruitage MVO-R2 (`--restore`, 1.12.0)
+
+```
+muxiveo-rife --factor 1 --restore auto [--restore-fast] [--restore-animation] --transfer sdr|pq|hlg ...
+muxiveo-rife --factor 2 --restore moyen ...          # débruitage puis interpolation, même passage
+```
+
+- Réseau : flux optique entre l'image courante et ses 4 voisines (t ± 2), recalage, puis image débruitée ;
+  fenêtre glissante sans état (aucune image future au-delà de t + 2). Coupes de scène respectées.
+- **Dosage par plan** : le réseau rend l'estimation propre ; une part du résidu réel (source − sortie) est
+  réinjectée, égalisée par image sur le niveau du plan. `auto` dose d'après le grain mesuré du plan
+  (`--restore-animation` : un cran vers `fort`), `leger` / `moyen` / `fort` du plus au moins de texture gardée.
+  Une ligne `info` par plan donne le grain mesuré et la part réinjectée.
+- `--restore-fast` : graphes `r2q`, flux optique au quart de la définition au lieu de la moitié (plus rapide,
+  perte de qualité très faible).
+- Sortie : dosage en flottant à un seul arrondi, tramé ±1 code (`--restore-dither auto`, déterministe) ;
+  `--restore-dither 8` pour un encodeur 8 bits. `--transfer` indique la fonction de transfert de la source (PQ,
+  HLG ou SDR).
+- Mémoire GPU : tuiles de 512 avec marge miroir (`--restore-tile`), repli sur des tuiles plus petites au lieu d'un
+  échec. Avec TensorRT, image entière.
+- Déterministe : deux passes identiques.
+- Graphes : `<exe>/restore-models/<modèle>/r2_{flow,body}.ncnn.{param,bin}` (Vulkan) et `.onnx` (TensorRT) ;
+  `--restore-model <dossier>` pour d'autres graphes. `--capabilities` liste les niveaux, tramages et graphes
+  présents (`restore`).
 
 ## Accélération NVIDIA (TensorRT, 1.4.0)
 

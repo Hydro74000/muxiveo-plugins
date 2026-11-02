@@ -175,7 +175,7 @@ jobs:
           (cd assets && sha256sum -- * > SHA256SUMS)
           gh release create "$TAG" assets/* \
             --repo "$GITHUB_REPOSITORY" \
-            --title "mvo-rife ${TAG#mvo-rife-v} — Interpolation d'images pour Muxiveo" \
+            --title "mvo-rife ${TAG#mvo-rife-v} — Moteur vidéo MVO (débruitage, interpolation) pour Muxiveo" \
             --notes-file mvo-rife/README.md \
             --latest=false
       - name: Flux des extensions

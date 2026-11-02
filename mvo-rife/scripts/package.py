@@ -1,4 +1,5 @@
-"""Assemble l'extension mvo-rife : moteur muxiveo-rife, modèles, poids du sélecteur, préréglages, licences.
+"""Assemble l'extension mvo-rife : moteur muxiveo-rife, modèles, graphes du débruitage MVO-R2, poids du sélecteur,
+préréglages, licences.
 
 Usage : python package.py <plate-forme> <binaire muxiveo-rife> <sortie> [--moltenvk <libMoltenVK.dylib> <licence>]
 Produit <sortie>/mvo-rife-<version>-<plate-forme>/ et son archive (.zip sous Windows, sinon .tar.gz). Le
@@ -17,7 +18,7 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(HERE / "scripts"))
-from fetch_models import fetch  # noqa: E402
+from fetch_models import RESTORE_MANIFEST, fetch  # noqa: E402
 
 VERSION_RE = re.compile(r"project\(muxiveo-rife VERSION ([0-9.]+)")
 CONTRACT_RE = re.compile(r"#define MUXIVEO_RIFE_CONTRACT (\d+)")
@@ -70,6 +71,7 @@ def main() -> None:
     abi = int(search(ABI_RE, HERE / "src" / "trt_plugin_abi.h"))
     selector_format = int(search(FORMAT_RE, HERE / "src" / "selector_weights.h"))
     models = json.loads((HERE / "models.json").read_text(encoding="utf-8"))
+    restore_models = json.loads((HERE / "restore_models.json").read_text(encoding="utf-8"))
     presets = json.loads((HERE / "presets.json").read_text(encoding="utf-8"))
     check_presets(presets, models["models"])
 
@@ -82,8 +84,9 @@ def main() -> None:
     shutil.copy2(args.binary, dest / executable)
     (dest / executable).chmod(0o755)
     fetch(dest / "rife-models")
+    fetch(dest / "restore-models", manifest_path=RESTORE_MANIFEST)
     shutil.copy2(HERE / "selector" / "selector.txt", dest / "rife-models" / "selector.txt")
-    for doc in ("README.md", "UPSTREAM.md", "models.json", "presets.json"):
+    for doc in ("README.md", "UPSTREAM.md", "models.json", "restore_models.json", "presets.json"):
         shutil.copy2(HERE / doc, dest / doc)
     if (HERE / "docs").is_dir():
         shutil.copytree(HERE / "docs", dest / "docs")
@@ -105,6 +108,7 @@ def main() -> None:
         "trt_abi": abi,
         "selector_format": selector_format,
         "models": sorted(models["models"]),
+        "restore_models": sorted(restore_models["models"]),
         "presets": sorted(presets["presets"]),
         "files": files,
     }

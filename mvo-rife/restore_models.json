@@ -1,0 +1,80 @@
+{
+  "release": "mvo-restore-models-v1.0.0",
+  "license": "MIT (Muxiveo) — LICENSES/MIT-mvo-rife.txt",
+  "default": "r2",
+  "models": {
+    "r2": {
+      "files": {
+        "r2_body.ncnn.bin": {
+          "sha256": "9c4c7e15412d7d4eed1af8d48aeb702035b22c486eb8581ccddf120b07dbd569",
+          "size": 3885604,
+          "url": "https://github.com/Hydro74000/muxiveo-plugins/releases/download/mvo-restore-models-v1.0.0/r2-r2_body.ncnn.bin"
+        },
+        "r2_body.ncnn.param": {
+          "sha256": "1e1b056cac22392ab3b1f600d2a3289140581e266bff502fb03047bfa515bf5e",
+          "size": 4121,
+          "url": "https://github.com/Hydro74000/muxiveo-plugins/releases/download/mvo-restore-models-v1.0.0/r2-r2_body.ncnn.param"
+        },
+        "r2_body.onnx": {
+          "sha256": "80731095466ee861d0c8043cee33997336cbb674184053072577508956948551",
+          "size": 3886792,
+          "url": "https://github.com/Hydro74000/muxiveo-plugins/releases/download/mvo-restore-models-v1.0.0/r2-r2_body.onnx"
+        },
+        "r2_flow.ncnn.bin": {
+          "sha256": "a44ae1d0e91d0b15f7d4264e107e572fc21fc2481393a6e7a77dab618e48a28d",
+          "size": 2882496,
+          "url": "https://github.com/Hydro74000/muxiveo-plugins/releases/download/mvo-restore-models-v1.0.0/r2-r2_flow.ncnn.bin"
+        },
+        "r2_flow.ncnn.param": {
+          "sha256": "8e555c0a249eee19e6c75435303a6da8bff78f8224a2190c846758c15db66438",
+          "size": 8371,
+          "url": "https://github.com/Hydro74000/muxiveo-plugins/releases/download/mvo-restore-models-v1.0.0/r2-r2_flow.ncnn.param"
+        },
+        "r2_flow.onnx": {
+          "sha256": "f4d3769dc28b1cbe25ad601ffcbc2ed45789c7670e3c37bd90c87bf916e08f19",
+          "size": 2929983,
+          "url": "https://github.com/Hydro74000/muxiveo-plugins/releases/download/mvo-restore-models-v1.0.0/r2-r2_flow.onnx"
+        }
+      }
+    },
+    "r2q": {
+      "files": {
+        "model.json": {
+          "sha256": "e129cb3a35f60d35f9929ea1a9111dd3052e393456cc1e0e05504797cf70f5f1",
+          "size": 21,
+          "url": "https://github.com/Hydro74000/muxiveo-plugins/releases/download/mvo-restore-models-v1.0.0/r2q-model.json"
+        },
+        "r2_body.ncnn.bin": {
+          "sha256": "d8111664549af1141366f07d85dfb8d28c5600c6dde9dfc1a532373afa34f3ec",
+          "size": 3885604,
+          "url": "https://github.com/Hydro74000/muxiveo-plugins/releases/download/mvo-restore-models-v1.0.0/r2q-r2_body.ncnn.bin"
+        },
+        "r2_body.ncnn.param": {
+          "sha256": "1e1b056cac22392ab3b1f600d2a3289140581e266bff502fb03047bfa515bf5e",
+          "size": 4121,
+          "url": "https://github.com/Hydro74000/muxiveo-plugins/releases/download/mvo-restore-models-v1.0.0/r2q-r2_body.ncnn.param"
+        },
+        "r2_body.onnx": {
+          "sha256": "e4c202c2ee61a3708dfccac8f672b74ab8a1a54adec1ab04f3f8f8a93a882dc6",
+          "size": 3886792,
+          "url": "https://github.com/Hydro74000/muxiveo-plugins/releases/download/mvo-restore-models-v1.0.0/r2q-r2_body.onnx"
+        },
+        "r2_flow.ncnn.bin": {
+          "sha256": "8e60fdb6c5a4bcb42d68aea9f5f95c0cb4f23d8acae9bdce7c5542b57c7fc757",
+          "size": 2882496,
+          "url": "https://github.com/Hydro74000/muxiveo-plugins/releases/download/mvo-restore-models-v1.0.0/r2q-r2_flow.ncnn.bin"
+        },
+        "r2_flow.ncnn.param": {
+          "sha256": "8e555c0a249eee19e6c75435303a6da8bff78f8224a2190c846758c15db66438",
+          "size": 8371,
+          "url": "https://github.com/Hydro74000/muxiveo-plugins/releases/download/mvo-restore-models-v1.0.0/r2q-r2_flow.ncnn.param"
+        },
+        "r2_flow.onnx": {
+          "sha256": "d8c47b07215e750ec25410a7e95dad3fe6c384bf32f12d3192e722246ec45524",
+          "size": 2929983,
+          "url": "https://github.com/Hydro74000/muxiveo-plugins/releases/download/mvo-restore-models-v1.0.0/r2q-r2_flow.onnx"
+        }
+      }
+    }
+  }
+}

@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
-"""Télécharge les modèles RIFE épinglés dans models.json et vérifie leur sha256.
+"""Télécharge les modèles RIFE épinglés dans models.json (ou les graphes du débruitage MVO-R2 de
+restore_models.json, ``--restore``) et vérifie leur sha256.
 
 Usage :
-    python3 mvo-rife/scripts/fetch_models.py <dossier-destination> [--model NOM ...]
+    python3 mvo-rife/scripts/fetch_models.py <dossier-destination> [--model NOM ...] [--restore]
 
-Les modèles sont écrits sous ``<destination>/<nom>/flownet.{param,bin}``, disposition
-attendue par ``muxiveo-rife`` dans ``<dossier de l'exécutable>/rife-models``.
+Les modèles sont écrits sous ``<destination>/<nom>/flownet.{param,bin}`` (``r2_{flow,body}.*`` pour le
+débruitage), disposition attendue par ``muxiveo-rife`` dans ``<dossier de l'exécutable>/rife-models``
+(``restore-models``).
 """
 
 from __future__ import annotations
@@ -20,6 +22,7 @@ import urllib.request
 from pathlib import Path
 
 MANIFEST = Path(__file__).resolve().parent.parent / "models.json"
+RESTORE_MANIFEST = MANIFEST.with_name("restore_models.json")
 
 
 def _sha256(path: Path) -> str:
@@ -35,9 +38,9 @@ def _raw_url(source: str, commit: str, model: str, filename: str) -> str:
     return f"https://raw.githubusercontent.com/{repo}/{commit}/models/{model}/{filename}"
 
 
-def fetch(dest: Path, models: list[str] | None = None) -> int:
+def fetch(dest: Path, models: list[str] | None = None, manifest_path: Path = MANIFEST) -> int:
     """Télécharge (ou revalide) les modèles demandés ; retourne le nombre de fichiers écrits."""
-    manifest = json.loads(MANIFEST.read_text(encoding="utf-8"))
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     wanted = models or list(manifest["models"])
     written = 0
     for name in wanted:
@@ -79,8 +82,9 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Télécharge les modèles RIFE épinglés (models.json).")
     parser.add_argument("dest", type=Path)
     parser.add_argument("--model", action="append", dest="models")
+    parser.add_argument("--restore", action="store_true", help="graphes du débruitage MVO-R2 (restore_models.json)")
     args = parser.parse_args()
-    count = fetch(args.dest, args.models)
+    count = fetch(args.dest, args.models, RESTORE_MANIFEST if args.restore else MANIFEST)
     print(f"{count} fichier(s) écrit(s) dans {args.dest}", file=sys.stderr)
     return 0
 

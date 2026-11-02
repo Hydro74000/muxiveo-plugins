@@ -1,12 +1,19 @@
 # mvo-rife-trt — Accélération NVIDIA (TensorRT) pour Muxiveo
 
-Plugin facultatif de [Muxiveo](https://github.com/Hydro74000/muxiveo) : l'interpolation d'images MVO-RIFE
-(outil natif `muxiveo-rife`) exécute son réseau RIFE avec **NVIDIA TensorRT for RTX** sur les Tensor Cores des
-cartes NVIDIA, au lieu du calcul Vulkan générique. Les images interpolées sont les mêmes à l'œil ; le traitement
-est nettement plus rapide.
+Plugin facultatif de [Muxiveo](https://github.com/Hydro74000/muxiveo) : le moteur vidéo MVO (outil natif
+`muxiveo-rife`) exécute ses réseaux — interpolation RIFE et débruitage MVO-R2 — avec **NVIDIA TensorRT for RTX**
+sur les Tensor Cores des cartes NVIDIA, au lieu du calcul Vulkan générique. Les images sont les mêmes à l'œil ;
+le traitement est plus rapide.
 
 Muxiveo propose ce plugin uniquement sur les machines compatibles et l'installe, le met à jour et le supprime
-lui-même (page Extensions). Sans lui, ou au moindre problème, l'interpolation continue en Vulkan.
+lui-même (page Extensions). Sans lui, ou au moindre problème, le traitement continue en Vulkan.
+
+## Nouveautés 1.3.0
+
+- Débruitage MVO-R2 de Muxiveo par TensorRT (graphes `r2_flow` et `r2_body` livrés avec muxiveo-rife), avec
+  muxiveo-rife 1.12.0 ou plus récent : interface 2 du plugin (sessions de graphe génériques). Images identiques à
+  l'œil au calcul Vulkan ; au moindre problème, le débruitage continue en Vulkan.
+- Interpolation inchangée : le plugin répond toujours à l'interface 1 (muxiveo-rife 1.4.0 ou plus récent).
 
 ## Nouveautés 1.2.0
 
@@ -20,7 +27,8 @@ lui-même (page Extensions). Sans lui, ou au moindre problème, l'interpolation 
 
 - GPU NVIDIA **Turing (RTX 20xx, GTX 16xx) ou plus récent** ; pilote NVIDIA **575 ou plus récent**.
 - Linux x86-64 (glibc 2.28 ou plus récente) et Windows 10/11 x64.
-- muxiveo-rife 1.4.0 ou plus récent (interface 1).
+- muxiveo-rife 1.4.0 ou plus récent (interface 1) ; débruitage MVO-R2 : muxiveo-rife 1.12.0 ou plus récent
+  (interface 2).
 - Préréglages couverts : Rapide, Équilibré, Qualité, Ultra et Light (modèles RIFE v4.6, v4.15 et v4.15-lite, avec
   ou sans le mode Fast).
 

@@ -1,0 +1,97 @@
+{
+  "name": "mvo-restore-models",
+  "version": "1.0.0",
+  "licenses": [
+    "LICENSES/MIT-mvo-restore-models.txt"
+  ],
+  "models": {
+    "r2": {
+      "description": "MVO-R2 : débruitage temporel (fenêtre de 5 images recalées), flux optique à demi-définition",
+      "files": {
+        "r2_body.ncnn.bin": {
+          "asset": "r2-r2_body.ncnn.bin",
+          "format": "ncnn",
+          "size": 3885604,
+          "sha256": "9c4c7e15412d7d4eed1af8d48aeb702035b22c486eb8581ccddf120b07dbd569"
+        },
+        "r2_body.ncnn.param": {
+          "asset": "r2-r2_body.ncnn.param",
+          "format": "ncnn",
+          "size": 4121,
+          "sha256": "1e1b056cac22392ab3b1f600d2a3289140581e266bff502fb03047bfa515bf5e"
+        },
+        "r2_body.onnx": {
+          "asset": "r2-r2_body.onnx",
+          "format": "onnx",
+          "size": 3886792,
+          "sha256": "80731095466ee861d0c8043cee33997336cbb674184053072577508956948551"
+        },
+        "r2_flow.ncnn.bin": {
+          "asset": "r2-r2_flow.ncnn.bin",
+          "format": "ncnn",
+          "size": 2882496,
+          "sha256": "a44ae1d0e91d0b15f7d4264e107e572fc21fc2481393a6e7a77dab618e48a28d"
+        },
+        "r2_flow.ncnn.param": {
+          "asset": "r2-r2_flow.ncnn.param",
+          "format": "ncnn",
+          "size": 8371,
+          "sha256": "8e555c0a249eee19e6c75435303a6da8bff78f8224a2190c846758c15db66438"
+        },
+        "r2_flow.onnx": {
+          "asset": "r2-r2_flow.onnx",
+          "format": "onnx",
+          "size": 2929983,
+          "sha256": "f4d3769dc28b1cbe25ad601ffcbc2ed45789c7670e3c37bd90c87bf916e08f19"
+        }
+      }
+    },
+    "r2q": {
+      "description": "MVO-R2, mode rapide : mêmes réseaux, flux optique au quart de la définition (réappris)",
+      "files": {
+        "model.json": {
+          "asset": "r2q-model.json",
+          "format": "json",
+          "size": 21,
+          "sha256": "e129cb3a35f60d35f9929ea1a9111dd3052e393456cc1e0e05504797cf70f5f1"
+        },
+        "r2_body.ncnn.bin": {
+          "asset": "r2q-r2_body.ncnn.bin",
+          "format": "ncnn",
+          "size": 3885604,
+          "sha256": "d8111664549af1141366f07d85dfb8d28c5600c6dde9dfc1a532373afa34f3ec"
+        },
+        "r2_body.ncnn.param": {
+          "asset": "r2q-r2_body.ncnn.param",
+          "format": "ncnn",
+          "size": 4121,
+          "sha256": "1e1b056cac22392ab3b1f600d2a3289140581e266bff502fb03047bfa515bf5e"
+        },
+        "r2_body.onnx": {
+          "asset": "r2q-r2_body.onnx",
+          "format": "onnx",
+          "size": 3886792,
+          "sha256": "e4c202c2ee61a3708dfccac8f672b74ab8a1a54adec1ab04f3f8f8a93a882dc6"
+        },
+        "r2_flow.ncnn.bin": {
+          "asset": "r2q-r2_flow.ncnn.bin",
+          "format": "ncnn",
+          "size": 2882496,
+          "sha256": "8e60fdb6c5a4bcb42d68aea9f5f95c0cb4f23d8acae9bdce7c5542b57c7fc757"
+        },
+        "r2_flow.ncnn.param": {
+          "asset": "r2q-r2_flow.ncnn.param",
+          "format": "ncnn",
+          "size": 8371,
+          "sha256": "8e555c0a249eee19e6c75435303a6da8bff78f8224a2190c846758c15db66438"
+        },
+        "r2_flow.onnx": {
+          "asset": "r2q-r2_flow.onnx",
+          "format": "onnx",
+          "size": 2929983,
+          "sha256": "d8c47b07215e750ec25410a7e95dad3fe6c384bf32f12d3192e722246ec45524"
+        }
+      }
+    }
+  }
+}
