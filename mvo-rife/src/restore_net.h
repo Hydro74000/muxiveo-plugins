@@ -7,6 +7,7 @@
 // fenêtre de Hann, puis codes Y'CbCr flottants non arrondis (sous-échantillonnage chroma antirepliement du banc).
 // Les images converties sont gardées en mémoire GPU (chacune sert à 5 images) jusqu'à drop_frame().
 #pragma once
+#include <algorithm>
 #include <cstdint>
 #include <filesystem>
 #include <map>
@@ -51,6 +52,11 @@ public:
     bool process(int64_t t, const int64_t nb[4], const uint8_t* grain_map, std::vector<float>& yuv, const Crop* crop,
                  std::vector<float>* flows, std::string& error);
 
+    // Mémoire GPU épuisée lors du dernier appel (repli possible sur des tuiles plus petites).
+    bool out_of_memory() const { return oom; }
+    int tile_size() const { return tile; }
+    void set_tile(int size) { tile = std::max(64, size / 4 * 4); }
+
     int padded_width() const { return W; }
     int padded_height() const { return H; }
     int flow_width() const { return ws; }
@@ -91,5 +97,6 @@ private:
     int ws = 0, hs = 0;  // définition du flux
     int wu = 0, hu = 0;  // entrée du graphe de flux (multiple de 32)
     size_t elemsize = 4;
+    bool oom = false;
     std::map<int64_t, Cached> cache;
 };

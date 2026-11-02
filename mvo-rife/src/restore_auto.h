@@ -16,6 +16,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <map>
 #include <optional>
 #include <vector>
@@ -122,6 +123,8 @@ void set_threads(int n);
 // Outils exposés pour les tests.
 namespace detail
 {
+// Exécute fn(début, fin) sur des bandes de [0, n), en parallèle (fils de set_threads()).
+void for_rows(int n, const std::function<void(int, int)>& fn);
 double percentile(std::vector<float> v, double q);  // q en % (interpolation linéaire, NumPy)
 int gaussian_ksize(double sigma);                   // taille de noyau d'OpenCV pour une image flottante
 void gaussian_blur(const float* src, int w, int h, double sigma, float* dst);

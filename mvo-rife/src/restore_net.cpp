@@ -210,6 +210,7 @@ bool RestoreNet::resize(ncnn::VkCompute& cmd, const ncnn::VkMat& src, int inc, i
 
 bool RestoreNet::add_frame(int64_t index, const void* frame, std::string& error)
 {
+    oom = false;
     if (cache.count(index))
         return true;
     Cached& e = cache[index];
@@ -226,7 +227,8 @@ bool RestoreNet::add_frame(int64_t index, const void* frame, std::string& error)
     if (raw.empty() || e.rgb.empty() || small.empty())
     {
         cache.erase(index);
-        error = "allocation mémoire GPU impossible (restauration)";
+        oom = true;
+        error = "restauration : mémoire GPU insuffisante";
         return false;
     }
     const Scale s = code_scale(fmt, color.full_range);
@@ -261,7 +263,8 @@ bool RestoreNet::add_frame(int64_t index, const void* frame, std::string& error)
     if (!resize(cmd, small, 1, wu, hu, 3, 1.f, 1.f, e.flowin))
     {
         cache.erase(index);
-        error = "allocation mémoire GPU impossible (restauration)";
+        oom = true;
+        error = "restauration : mémoire GPU insuffisante";
         return false;
     }
     if (cmd.submit_and_wait() != 0)
@@ -278,8 +281,14 @@ void RestoreNet::drop_frame(int64_t index) { cache.erase(index); }
 bool RestoreNet::process(int64_t t, const int64_t nb[4], const uint8_t* grain_map, std::vector<float>& yuv, const Crop* crop,
                          std::vector<float>* flows, std::string& error)
 {
+    oom = false;
     auto fail = [&](const char* what) {
         error = std::string("restauration : ") + what;
+        return false;
+    };
+    auto fail_oom = [&]() {
+        oom = true;
+        error = "restauration : mémoire GPU insuffisante";
         return false;
     };
     if (!cache.count(t))
@@ -300,7 +309,10 @@ bool RestoreNet::process(int64_t t, const int64_t nb[4], const uint8_t* grain_ma
             ncnn::Extractor ex = flow_net.create_extractor();
             ex.input("in0", ct.flowin);
             ex.input("in1", cn.flowin);
-            if (ex.extract("out0", f, cmd) != 0)
+            const int r = ex.extract("out0", f, cmd);
+            if (r == -100)
+                return fail_oom();
+            if (r != 0)
                 return fail("graphe de flux en échec");
         }
         ncnn::VkMat f_pack1;
@@ -311,7 +323,7 @@ bool RestoreNet::process(int64_t t, const int64_t nb[4], const uint8_t* grain_ma
         ncnn::VkMat fs;
         if (!resize(cmd, f_pack1, 2, ws, hs, 2, (float)ws / wu, (float)hs / hu, fs)
                 || !resize(cmd, fs, 2, W, H, 2, (float)W / ws, (float)H / hs, full[j]))
-            return fail("allocation mémoire GPU impossible");
+            return fail_oom();
         std::vector<ncnn::VkMat> bottoms = {cn.rgb, full[j]};
         std::vector<ncnn::VkMat> tops(1);
         if (warp->forward(bottoms, tops, cmd, opt) != 0)
@@ -333,7 +345,7 @@ bool RestoreNet::process(int64_t t, const int64_t nb[4], const uint8_t* grain_ma
     }
     x.create(W, H, 17, elemsize, 1, blob_alloc);
     if (map_gpu.empty() || x.empty())
-        return fail("allocation mémoire GPU impossible");
+        return fail_oom();
     {
         std::vector<ncnn::vk_constant_type> k(8);
         k[0].i = W;
@@ -353,7 +365,7 @@ bool RestoreNet::process(int64_t t, const int64_t nb[4], const uint8_t* grain_ma
     wsum.create(W, H, 1, 4u, 1, blob_alloc);
     dummy.create(4, 1, 1, elemsize, 1, blob_alloc);
     if (acc.empty() || wsum.empty() || dummy.empty())
-        return fail("allocation mémoire GPU impossible");
+        return fail_oom();
     auto tile_constants = [&](int mode, int c, int x0, int y0, int tw, int th, int tcstep, int wx0, int wy0, int tpw, int tph) {
         std::vector<ncnn::vk_constant_type> k(16);
         k[0].i = mode;
@@ -384,13 +396,16 @@ bool RestoreNet::process(int64_t t, const int64_t nb[4], const uint8_t* grain_ma
             ncnn::VkMat tin, tout, tout1;
             tin.create(tpw, tph, 17, elemsize, 1, blob_alloc);
             if (tin.empty())
-                return fail("allocation mémoire GPU impossible");
+                return fail_oom();
             cmd.record_pipeline(p_tile, {x, tin, acc, wsum},
                                 tile_constants(0, 17, xa, ya, tw, th, (int)tin.cstep, 0, 0, tpw, tph), dispatch_of(tpw, tph, 1));
             {
                 ncnn::Extractor ex = body_net.create_extractor();
                 ex.input("in0", tin);
-                if (ex.extract("out0", tout, cmd) != 0)
+                const int r = ex.extract("out0", tout, cmd);
+                if (r == -100)
+                    return fail_oom();
+                if (r != 0)
                     return fail("corps du réseau en échec");
             }
             if (tout.elempack != 1)
@@ -411,7 +426,7 @@ bool RestoreNet::process(int64_t t, const int64_t nb[4], const uint8_t* grain_ma
     tmp.create(cwx * fmt.height * 2, (size_t)4u, 1, blob_alloc);
     out.create((int)(fmt.luma_samples() + 2 * fmt.chroma_samples()), (size_t)4u, 1, blob_alloc);
     if (tmp.empty() || out.empty())
-        return fail("allocation mémoire GPU impossible");
+        return fail_oom();
     const Scale s = code_scale(fmt, color.full_range);
     for (int pass = 0; pass < 2; pass++)
     {

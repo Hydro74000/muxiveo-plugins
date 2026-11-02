@@ -205,6 +205,8 @@ std::vector<float> luma_float(const uint16_t* y, int w, int h, std::ptrdiff_t st
 namespace detail
 {
 
+void for_rows(int n, const std::function<void(int, int)>& fn) { parallel_for(n, fn); }
+
 double percentile(std::vector<float> v, double q)
 {
     if (v.empty())
@@ -309,37 +311,52 @@ GrainCurve grain_curve(const uint16_t* y, int w, int h, std::ptrdiff_t stride)
     box_replicate(t.data(), w, h, 3, avg3.data());
     box_replicate(t.data(), w, h, 5, sm.data());
     // gradient |∂x| + |∂y| de la luma moyennée, intérieur (h − 2) × (w − 2), bords répliqués
-    for (int r = 0; r < h; r++)
-        for (int x = 0; x < w; x++)
-        {
-            const int ri = std::clamp(r, 1, std::max(1, h - 2)), xi = std::clamp(x, 1, std::max(1, w - 2));
-            const float gx = std::fabs(sm[(std::size_t)ri * w + xi + 1] - sm[(std::size_t)ri * w + xi - 1]);
-            const float gy = std::fabs(sm[(std::size_t)(ri + 1) * w + xi] - sm[(std::size_t)(ri - 1) * w + xi]);
-            grad[(std::size_t)r * w + x] = gx + gy;
-        }
+    parallel_for(h, [&](int r0, int r1) {
+        for (int r = r0; r < r1; r++)
+            for (int x = 0; x < w; x++)
+            {
+                const int ri = std::clamp(r, 1, std::max(1, h - 2)), xi = std::clamp(x, 1, std::max(1, w - 2));
+                const float gx = std::fabs(sm[(std::size_t)ri * w + xi + 1] - sm[(std::size_t)ri * w + xi - 1]);
+                const float gy = std::fabs(sm[(std::size_t)(ri + 1) * w + xi] - sm[(std::size_t)(ri - 1) * w + xi]);
+                grad[(std::size_t)r * w + x] = gx + gy;
+            }
+    });
     std::vector<float> sub;
     sub.reserve(n / 16 + 1);
     for (std::size_t i = 0; i < n; i += 16)
         sub.push_back(grad[i]);
     const double thr = detail::percentile(std::move(sub), 30.0);
-    std::array<std::vector<float>, GRAIN_BINS> vals;
     float edge[GRAIN_BINS + 1];
     for (int i = 0; i <= GRAIN_BINS; i++)
         edge[i] = (float)bin_edge(i);
-    for (std::size_t i = 0; i < n; i++)
-    {
-        if (!(grad[i] < thr))
-            continue;
-        const float s = sm[i];
-        if (s < edge[0] || s >= edge[GRAIN_BINS])
-            continue;
-        int b = std::min(GRAIN_BINS - 1, (int)((s - edge[0]) / (edge[1] - edge[0])));
-        while (b > 0 && s < edge[b])
-            b--;
-        while (b < GRAIN_BINS - 1 && s >= edge[b + 1])
-            b++;
-        vals[b].push_back(t[i] - avg3[i]);
-    }
+    // aplats répartis par tranche, par bandes de lignes en parallèle, puis réunis dans l'ordre des lignes (même ordre
+    // que le parcours séquentiel : le sous-échantillonnage des tranches en dépend)
+    const int bands = std::max(1, std::min(64, h / 16));
+    std::vector<std::array<std::vector<float>, GRAIN_BINS>> part(bands);
+    parallel_for(bands, [&](int b0, int b1) {
+        for (int band = b0; band < b1; band++)
+        {
+            const std::size_t i0 = (std::size_t)((int64_t)h * band / bands) * w, i1 = (std::size_t)((int64_t)h * (band + 1) / bands) * w;
+            for (std::size_t i = i0; i < i1; i++)
+            {
+                if (!(grad[i] < thr))
+                    continue;
+                const float s = sm[i];
+                if (s < edge[0] || s >= edge[GRAIN_BINS])
+                    continue;
+                int b = std::min(GRAIN_BINS - 1, (int)((s - edge[0]) / (edge[1] - edge[0])));
+                while (b > 0 && s < edge[b])
+                    b--;
+                while (b < GRAIN_BINS - 1 && s >= edge[b + 1])
+                    b++;
+                part[band][b].push_back(t[i] - avg3[i]);
+            }
+        }
+    });
+    std::array<std::vector<float>, GRAIN_BINS> vals;
+    for (int b = 0; b < GRAIN_BINS; b++)
+        for (int band = 0; band < bands; band++)
+            vals[b].insert(vals[b].end(), part[band][b].begin(), part[band][b].end());
     GrainCurve c;
     std::array<bool, GRAIN_BINS> ok{};
     for (int b = 0; b < GRAIN_BINS; b++)

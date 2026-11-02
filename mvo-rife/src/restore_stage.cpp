@@ -2,9 +2,16 @@
 #include "restore_stage.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 
 using namespace restore_auto;
+
+RestoreStage::~RestoreStage()
+{
+    if (job.valid())
+        job.wait();
+}
 
 bool RestoreStage::init(RestoreNet* n, const FrameFormat& f, const ColorParams& c, const RestoreOptions& opt, std::string& error)
 {
@@ -14,6 +21,11 @@ bool RestoreStage::init(RestoreNet* n, const FrameFormat& f, const ColorParams& 
     o = opt;
     k = auto_k(o.k, o.animation);
     cuts_ = CutDetector(48, o.cut_look);
+    if (fmt.bit_depth < 8 || fmt.bit_depth > 16)
+    {
+        error = "restauration : profondeur non prise en charge";
+        return false;
+    }
     const int shift = fmt.bit_depth - 8;
     if (color.full_range)
     {
@@ -25,29 +37,26 @@ bool RestoreStage::init(RestoreNet* n, const FrameFormat& f, const ColorParams& 
         lo = (uint16_t)(1 << shift);
         hi = (uint16_t)((254 << shift) + (1 << shift) - 1);
     }
+    fx_scale = (float)(1 << (16 - fmt.bit_depth));
+    tile = net->tile_size();
+    max_hold = (size_t)(o.look + o.cut_look + o.dose_look + 20);
     // recadrage central ≤ 1920 × 1080 de la mesure du rapport (r1_ab_render.auto_ratio)
     crop.w = std::min(1920, fmt.width) / 2 * 2;
     crop.h = std::min(1080, fmt.height) / 2 * 2;
     crop.x0 = (fmt.width - crop.w) / 4 * 2;
     crop.y0 = (fmt.height - crop.h) / 4 * 2;
-    if (fmt.bit_depth < 8 || fmt.bit_depth > 16)
-    {
-        error = "restauration : profondeur non prise en charge";
-        return false;
-    }
     return true;
 }
 
-void RestoreStage::samples(const std::vector<uint8_t>& frame, std::vector<uint16_t>& v) const
+void RestoreStage::samples(const uint8_t* frame, std::vector<uint16_t>& v) const
 {
     const size_t n = (size_t)fmt.total_samples();
     v.resize(n);
-    if (fmt.bytes_per_sample == 1)
-        for (size_t i = 0; i < n; i++)
-            v[i] = frame[i];
-    else
-        for (size_t i = 0; i < n; i++)
-            v[i] = (uint16_t)(frame[2 * i] | (frame[2 * i + 1] << 8));
+    const int rows = (int)((n + 65535) / 65536);
+    detail::for_rows(rows, [&](int r0, int r1) {
+        for (size_t i = (size_t)r0 * 65536; i < std::min(n, (size_t)r1 * 65536); i++)
+            v[i] = fmt.bytes_per_sample == 1 ? frame[i] : (uint16_t)(frame[2 * i] | (frame[2 * i + 1] << 8));
+    });
 }
 
 std::vector<uint16_t> RestoreStage::luma10(const std::vector<uint8_t>& frame) const
@@ -55,11 +64,13 @@ std::vector<uint16_t> RestoreStage::luma10(const std::vector<uint8_t>& frame) co
     // mesures (coupes, grain, rapport) sur l'échelle 10 bits du banc et du profil cible
     const size_t n = (size_t)fmt.luma_samples();
     std::vector<uint16_t> y(n);
-    for (size_t i = 0; i < n; i++)
-    {
-        const unsigned v = fmt.bytes_per_sample == 1 ? frame[i] : (unsigned)(frame[2 * i] | (frame[2 * i + 1] << 8));
-        y[i] = (uint16_t)(fmt.bit_depth <= 10 ? v << (10 - fmt.bit_depth) : v >> (fmt.bit_depth - 10));
-    }
+    detail::for_rows(fmt.height, [&](int r0, int r1) {
+        for (size_t i = (size_t)r0 * fmt.width; i < (size_t)r1 * fmt.width; i++)
+        {
+            const unsigned v = fmt.bytes_per_sample == 1 ? frame[i] : (unsigned)(frame[2 * i] | (frame[2 * i + 1] << 8));
+            y[i] = (uint16_t)(fmt.bit_depth <= 10 ? v << (10 - fmt.bit_depth) : v >> (fmt.bit_depth - 10));
+        }
+    });
     return y;
 }
 
@@ -73,7 +84,8 @@ bool RestoreStage::push(const uint8_t* frame)
     cuts_.push(y.data(), fmt.width, fmt.height, fmt.width);
     src[n_in] = std::move(buf);
     n_in++;
-    return pump();
+    // contre-pression : au-delà de max_hold trames tenues, attendre le GPU
+    return pump(src.size() > max_hold);
 }
 
 bool RestoreStage::finish()
@@ -82,7 +94,7 @@ bool RestoreStage::finish()
         return false;
     n_total = n_in;
     cuts_.finish();
-    if (!pump())
+    if (!pump(true))
         return false;
     if (next_out != n_in)
     {
@@ -144,9 +156,12 @@ bool RestoreStage::shot_curve(int s)
     return true;
 }
 
-bool RestoreStage::run_net()
+bool RestoreStage::prepare()
 {
+    // carte de grain et luma de mesure de la prochaine image à lancer, calculées d'avance (pendant le travail GPU)
     const int u = next_net;
+    if (prepared_u == u)
+        return false;
     const int lim = n_total ? std::min(u + 2, *n_total - 1) : u + 2;  // voisines t ± 2 lues et leurs coupes décidées
     if (u >= n_in || lim >= n_in || cuts_.decided() < lim)
         return false;
@@ -154,33 +169,91 @@ bool RestoreStage::run_net()
     if (!shot_curve(s))
         return false;
     const std::vector<uint16_t> y = luma10(src.at(u));
-    std::vector<uint8_t> map((size_t)fmt.width * fmt.height);
-    grain_map(y.data(), fmt.width, fmt.height, fmt.width, curves.at(s), map.data());
-    const int64_t nb[4] = {neighbour(u, -2), neighbour(u, -1), neighbour(u, 1), neighbour(u, 2)};
-    for (int64_t i : {(int64_t)u, nb[0], nb[1], nb[2], nb[3]})
-        if (!net->add_frame(i, src.at(i).data(), err))
-            return false;
-    const bool want = s <= u && u <= s + 10;  // images de mesure du rapport (plan court : à partir de s)
-    std::vector<float> yuv, flows;
-    if (!net->process(u, nb, map.data(), yuv, want ? &crop : nullptr, want ? &flows : nullptr, err))
-        return false;
-    // σ du résidu dans l'échelle de la trame (rapport d'écarts types : indépendant de la profondeur)
-    std::vector<uint16_t> sv;
-    samples(src.at(u), sv);
-    sig[u] = residual_sigma(sv.data(), fmt.width, yuv.data(), fmt.width, fmt.width, fmt.height);
-    out[u] = std::move(yuv);
-    if (want)
+    prepared_map = std::make_shared<std::vector<uint8_t>>((size_t)fmt.width * fmt.height);
+    grain_map(y.data(), fmt.width, fmt.height, fmt.width, curves.at(s), prepared_map->data());
+    if (s <= u && u <= s + 10)  // images de mesure du rapport (plan court : à partir de s)
     {
         std::vector<float> cl((size_t)crop.w * crop.h);
         for (int r = 0; r < crop.h; r++)
             for (int x = 0; x < crop.w; x++)
                 cl[(size_t)r * crop.w + x] = y[(size_t)(crop.y0 + r) * fmt.width + crop.x0 + x];
         ana_luma[u] = std::move(cl);
-        ana_flows[u] = std::move(flows);
     }
+    prepared_u = u;
+    return true;
+}
+
+bool RestoreStage::launch()
+{
+    if (job.valid())
+        return false;
+    const int u = next_net;
+    if (prepared_u != u && !prepare())
+        return false;
+    const int s = shot_start(u);
+    auto map = std::move(prepared_map);
+    prepared_u = -1;
+    const int64_t nb[4] = {neighbour(u, -2), neighbour(u, -1), neighbour(u, 1), neighbour(u, 2)};
+    const bool want = s <= u && u <= s + 10;
+    // trames tenues par le travail : pointeurs stables (aucune n'est retirée avant collect())
+    struct Input
+    {
+        int64_t index;
+        const uint8_t* data;
+    };
+    std::vector<Input> inputs;
+    for (int64_t i : {(int64_t)u, nb[0], nb[1], nb[2], nb[3]})
+        inputs.push_back({i, src.at(i).data()});
+    const std::array<int64_t, 4> nbs = {nb[0], nb[1], nb[2], nb[3]};
+    job_u = u;
+    job_want = want;
     next_net = u + 1;
-    for (auto it = src.begin(); it != src.end() && it->first < next_net - 2; ++it)
-        net->drop_frame(it->first);
+    job = std::async(std::launch::async, [this, u, nbs, inputs, map, want]() {
+        Job r;
+        for (const Input& in : inputs)
+            if (!net->add_frame(in.index, in.data, r.error))
+                return r;
+        std::vector<float> yuv;
+        // mémoire GPU insuffisante : repli sur des tuiles plus petites au lieu d'un échec
+        for (;;)
+        {
+            if (net->process(u, nbs.data(), map->data(), yuv, want ? &crop : nullptr, want ? &r.flows : nullptr, r.error))
+                break;
+            if (!net->out_of_memory() || net->tile_size() <= 128)
+                return r;
+            net->set_tile(net->tile_size() / 2);
+        }
+        r.tile = net->tile_size();
+        r.out.resize(yuv.size());
+        const float hi_fx = 65535.f;
+        detail::for_rows((int)((yuv.size() + 65535) / 65536), [&](int b0, int b1) {
+            for (size_t i = (size_t)b0 * 65536; i < std::min(yuv.size(), (size_t)b1 * 65536); i++)
+                r.out[i] = (uint16_t)std::clamp(std::nearbyint(yuv[i] * fx_scale), 0.f, hi_fx);
+        });
+        for (; net_low < u - 2; net_low++)  // trames dont le réseau n'a plus besoin
+            net->drop_frame(net_low);
+        r.ok = true;
+        return r;
+    });
+    return true;
+}
+
+bool RestoreStage::collect()
+{
+    Job r = job.get();
+    if (!r.ok)
+    {
+        err = r.error.empty() ? "restauration : échec du réseau" : r.error;
+        return false;
+    }
+    tile = r.tile;
+    // σ du résidu (luma de la sortie en virgule fixe, pas de 1/64 de code en 10 bits) : dans ce fil, pendant que le
+    // GPU calcule l'image suivante (lancée juste après)
+    out[job_u] = std::move(r.out);
+    pending_sig = job_u;
+    if (job_want)
+        ana_flows[job_u] = std::move(r.flows);
+    job_u = -1;
     return true;
 }
 
@@ -189,7 +262,7 @@ bool RestoreStage::shot_ratio(int s)
     if (ratios.count(s))
         return true;
     const std::optional<int> e = shot_end(s);
-    if (!e && next_net <= s + 10)
+    if (!e && done_net <= s + 10)
         return false;
     std::vector<int> centers;
     const int ln = e ? *e - s : 1 << 30;
@@ -203,14 +276,15 @@ bool RestoreStage::shot_ratio(int s)
         if (centers.empty() && ln >= 5)
             centers.push_back((s + 2 + *e - 3) / 2);
     }
-    if (!centers.empty() && next_net <= *std::max_element(centers.begin(), centers.end()) + 2)
+    if (!centers.empty() && done_net <= *std::max_element(centers.begin(), centers.end()) + 2)
         return false;
     std::optional<double> r;
     if (!centers.empty())
     {
         std::map<int, AnalysisFrame> frames;
         for (const auto& [t, l] : ana_luma)
-            frames[(int)t] = AnalysisFrame{l.data(), ana_flows.at(t).data()};
+            if (ana_flows.count(t))
+                frames[(int)t] = AnalysisFrame{l.data(), ana_flows.at(t).data()};
         r = ratio_from_sigma(sigma_bins(frames, centers, crop.w, crop.h, 1.0), fmt.width);
     }
     if (!r)
@@ -230,12 +304,12 @@ bool RestoreStage::shot_ratio(int s)
 bool RestoreStage::emit()
 {
     const int t = next_out;
-    if (t >= next_net)
+    if (t >= done_net)
         return false;
     const int s = shot_start(t);
     const std::optional<int> e = shot_end(s);
     const int hi_t = e ? std::min(*e - 1, t + o.dose_look) : t + o.dose_look;
-    if (next_net <= hi_t || !shot_ratio(s))
+    if (done_net <= hi_t || !shot_ratio(s))
         return false;
     const std::optional<double> r = ratios.at(s);
     std::vector<float> window;
@@ -245,48 +319,94 @@ bool RestoreStage::emit()
     const double part = auto_part(r, k);
     const double kk = part * eq;
     std::vector<uint16_t> sv, dv;
-    samples(src.at(t), sv);
+    samples(src.at(t).data(), sv);
+    const std::vector<uint16_t>& ofx = out.at(t);
+    std::vector<float> of(ofx.size());
+    const float inv = 1.f / fx_scale;
+    detail::for_rows((int)((of.size() + 65535) / 65536), [&](int b0, int b1) {
+        for (size_t i = (size_t)b0 * 65536; i < std::min(of.size(), (size_t)b1 * 65536); i++)
+            of[i] = ofx[i] * inv;
+    });
     dv.resize(sv.size());
-    dose(sv.data(), out.at(t).data(), sv.size(), kk, lo, hi, dv.data(), o.dither_step > 0 ? t : -1, 0, std::max(1, o.dither_step));
+    dose(sv.data(), of.data(), sv.size(), kk, lo, hi, dv.data(), o.dither_step > 0 ? t : -1, 0, std::max(1, o.dither_step));
     std::vector<uint8_t> frame(fmt.padded_frame_bytes(), 0);
-    if (fmt.bytes_per_sample == 1)
-        for (size_t i = 0; i < dv.size(); i++)
-            frame[i] = (uint8_t)dv[i];
-    else
-        for (size_t i = 0; i < dv.size(); i++)
-        {
-            frame[2 * i] = (uint8_t)(dv[i] & 0xff);
-            frame[2 * i + 1] = (uint8_t)(dv[i] >> 8);
-        }
+    detail::for_rows((int)((dv.size() + 65535) / 65536), [&](int b0, int b1) {
+        for (size_t i = (size_t)b0 * 65536; i < std::min(dv.size(), (size_t)b1 * 65536); i++)
+            if (fmt.bytes_per_sample == 1)
+                frame[i] = (uint8_t)dv[i];
+            else
+            {
+                frame[2 * i] = (uint8_t)(dv[i] & 0xff);
+                frame[2 * i + 1] = (uint8_t)(dv[i] >> 8);
+            }
+    });
     ready.push_back(std::move(frame));
     logs[t] = Log{r, part, kk};
     next_out = t + 1;
-    release_before(std::min(next_out, next_net - 2), next_out);
+    release();
     return true;
 }
 
-void RestoreStage::release_before(int64_t keep_src, int64_t keep_out)
+void RestoreStage::release()
 {
+    // sources : gardées pour le dosage (next_out) et pour les voisines du réseau (dernier lancé − 2)
+    const int64_t keep_src = std::min<int64_t>(next_out, (job.valid() ? job_u : next_net) - 2);
     for (auto it = src.begin(); it != src.end() && it->first < keep_src;)
         it = src.erase(it);
-    for (auto it = out.begin(); it != out.end() && it->first < keep_out;)
+    for (auto it = out.begin(); it != out.end() && it->first < next_out;)
         it = out.erase(it);
-    for (auto it = sig.begin(); it != sig.end() && it->first < keep_out - o.dose_look;)
+    for (auto it = sig.begin(); it != sig.end() && it->first < next_out - o.dose_look;)
         it = sig.erase(it);
 }
 
-bool RestoreStage::pump()
+bool RestoreStage::pump(bool block)
 {
     for (;;)
     {
         for (; cuts_scanned <= cuts_.decided() && cuts_scanned < cuts_.frames(); cuts_scanned++)  // débuts de plan décidés
             if (cuts_.is_cut(cuts_scanned))
                 cut_list.push_back(cuts_scanned);
-        const bool progressed = run_net() || emit();
+        bool progressed = false;
+        if (job.valid() && job.wait_for(std::chrono::seconds(0)) == std::future_status::ready)
+        {
+            if (!collect())
+                return false;
+            progressed = true;
+        }
+        if (launch())
+            progressed = true;
+        if (job.valid() && prepare())  // image suivante préparée pendant le travail GPU
+            progressed = true;
+        if (pending_sig >= 0)
+        {
+            const std::vector<uint16_t>& ofx = out.at(pending_sig);
+            const size_t n = (size_t)fmt.luma_samples();
+            std::vector<float> yf(n);
+            const float inv = 1.f / fx_scale;
+            detail::for_rows(fmt.height, [&](int r0, int r1) {
+                for (size_t i = (size_t)r0 * fmt.width; i < (size_t)r1 * fmt.width; i++)
+                    yf[i] = ofx[i] * inv;
+            });
+            std::vector<uint16_t> sv;
+            samples(src.at(pending_sig).data(), sv);
+            sig[pending_sig] = residual_sigma(sv.data(), fmt.width, yf.data(), fmt.width, fmt.width, fmt.height);
+            done_net = pending_sig + 1;
+            pending_sig = -1;
+            progressed = true;
+        }
+        while (emit())
+            progressed = true;
+        held_max = std::max(held_max, src.size() + out.size());
         if (!err.empty())
             return false;
-        held_max = std::max(held_max, src.size() + out.size());
-        if (!progressed)
-            return true;
+        if (progressed)
+            continue;
+        // rien d'autre à faire : attendre le GPU si l'appelant l'exige (fin du flux, contre-pression)
+        if (job.valid() && (block || src.size() > max_hold))
+        {
+            job.wait();
+            continue;
+        }
+        return true;
     }
 }
