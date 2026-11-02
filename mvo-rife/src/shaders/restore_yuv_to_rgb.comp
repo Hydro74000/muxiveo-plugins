@@ -1,0 +1,75 @@
+// Restauration (R2) : trame Y'CbCr brute (y4m) -> R'G'B' planaire sans écrêtage, entourée d'une marge miroir de
+// `edge` pixels (miroir sans répétition du bord, comme F.pad(mode="reflect") du banc). Conversion et
+// suréchantillonnage chroma identiques à yuv_to_rgb.comp.
+#version 450
+#if NCNN_fp16_storage
+#extension GL_EXT_shader_16bit_storage: require
+#endif
+layout (binding = 0) readonly buffer src_blob { uint src_data[]; };
+layout (binding = 1) writeonly buffer dst_blob { sfp dst_data[]; };
+layout (push_constant) uniform parameter
+{
+    int w; int h; int cw; int ch; int u_offset; int v_offset; int bytes_per_sample;
+    int outw; int outh; int outcstep; int cx_mode; int cy_mode; int edge;
+    float y_off; float y_scale; float c_off; float c_scale; float kr; float kb;
+} p;
+
+float fetch(int idx)
+{
+    if (p.bytes_per_sample == 2)
+    {
+        uint word = src_data[idx >> 1];
+        return float((idx & 1) == 0 ? (word & 0xffffu) : (word >> 16));
+    }
+    uint word = src_data[idx >> 2];
+    return float((word >> (8 * (idx & 3))) & 0xffu);
+}
+
+void chroma_axis(int x, int mode, int size, out int i0, out int i1, out float f)
+{
+    if (mode == 0) { i0 = min(x, size - 1); i1 = i0; f = 0.0; return; }
+    i0 = min(x / 2, size - 1);
+    if (mode == 2) { i1 = i0; f = 0.0; return; }
+    i1 = min(i0 + 1, size - 1);
+    f = (x & 1) == 1 ? 0.5 : 0.0;
+}
+
+float chroma(int base, int x, int y)
+{
+    int u0; int u1; int v0; int v1; float fu; float fv;
+    chroma_axis(x, p.cx_mode, p.cw, u0, u1, fu);
+    chroma_axis(y, p.cy_mode, p.ch, v0, v1, fv);
+    float a = fetch(base + v0 * p.cw + u0);
+    float b = fetch(base + v0 * p.cw + u1);
+    float c = fetch(base + v1 * p.cw + u0);
+    float d = fetch(base + v1 * p.cw + u1);
+    return mix(mix(a, b, fu), mix(c, d, fu), fv);
+}
+
+int reflect101(int i, int n)
+{
+    if (n == 1) return 0;
+    for (int k = 0; k < 4 && (i < 0 || i >= n); k++)
+        i = i < 0 ? -i : 2 * n - 2 - i;
+    return clamp(i, 0, n - 1);
+}
+
+void main()
+{
+    int gx = int(gl_GlobalInvocationID.x);
+    int gy = int(gl_GlobalInvocationID.y);
+    if (gx >= p.outw || gy >= p.outh || int(gl_GlobalInvocationID.z) >= 1)
+        return;
+    int x = reflect101(gx - p.edge, p.w);
+    int y = reflect101(gy - p.edge, p.h);
+    float Y = (fetch(y * p.w + x) - p.y_off) * p.y_scale;
+    float Cb = (chroma(p.u_offset, x, y) - p.c_off) * p.c_scale;
+    float Cr = (chroma(p.v_offset, x, y) - p.c_off) * p.c_scale;
+    float R = Y + 2.0 * (1.0 - p.kr) * Cr;
+    float B = Y + 2.0 * (1.0 - p.kb) * Cb;
+    float G = (Y - p.kr * R - p.kb * B) / (1.0 - p.kr - p.kb);
+    int o = gy * p.outw + gx;
+    dst_data[o] = sfp(R);
+    dst_data[p.outcstep + o] = sfp(G);
+    dst_data[p.outcstep * 2 + o] = sfp(B);
+}

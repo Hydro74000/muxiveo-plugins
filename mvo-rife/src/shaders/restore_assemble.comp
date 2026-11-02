@@ -1,0 +1,43 @@
+// Restauration (R2) : entrée du corps, 17 canaux sur l'image avec marge (W × H) : image t (3), 4 voisines recalées
+// (4 × 3, ordre t − 2, t − 1, t + 1, t + 2), carte de grain (octet / 20 / 16, marge miroir), canal PQ (constante).
+#version 450
+#if NCNN_fp16_storage
+#extension GL_EXT_shader_16bit_storage: require
+#endif
+layout (binding = 0) readonly buffer t_blob { sfp t_data[]; };
+layout (binding = 1) readonly buffer w0_blob { sfp w0_data[]; };
+layout (binding = 2) readonly buffer w1_blob { sfp w1_data[]; };
+layout (binding = 3) readonly buffer w2_blob { sfp w2_data[]; };
+layout (binding = 4) readonly buffer w3_blob { sfp w3_data[]; };
+layout (binding = 5) readonly buffer map_blob { uint map_data[]; };
+layout (binding = 6) writeonly buffer dst_blob { sfp dst_data[]; };
+layout (push_constant) uniform parameter { int W; int H; int cstep; int w; int h; int edge; int outcstep; float pq; } p;
+
+int reflect101(int i, int n)
+{
+    if (n == 1) return 0;
+    for (int k = 0; k < 4 && (i < 0 || i >= n); k++)
+        i = i < 0 ? -i : 2 * n - 2 - i;
+    return clamp(i, 0, n - 1);
+}
+
+void main()
+{
+    int gx = int(gl_GlobalInvocationID.x);
+    int gy = int(gl_GlobalInvocationID.y);
+    if (gx >= p.W || gy >= p.H || int(gl_GlobalInvocationID.z) >= 1)
+        return;
+    int i = gy * p.W + gx;
+    for (int c = 0; c < 3; c++)
+    {
+        dst_data[c * p.outcstep + i] = t_data[c * p.cstep + i];
+        dst_data[(3 + c) * p.outcstep + i] = w0_data[c * p.cstep + i];
+        dst_data[(6 + c) * p.outcstep + i] = w1_data[c * p.cstep + i];
+        dst_data[(9 + c) * p.outcstep + i] = w2_data[c * p.cstep + i];
+        dst_data[(12 + c) * p.outcstep + i] = w3_data[c * p.cstep + i];
+    }
+    int mi = reflect101(gy - p.edge, p.h) * p.w + reflect101(gx - p.edge, p.w);
+    float m = float((map_data[mi >> 2] >> (8 * (mi & 3))) & 0xffu) / 20.0 / 16.0;
+    dst_data[15 * p.outcstep + i] = sfp(m);
+    dst_data[16 * p.outcstep + i] = sfp(p.pq);
+}

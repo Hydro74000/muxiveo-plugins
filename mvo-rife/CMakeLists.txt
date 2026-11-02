@@ -92,6 +92,7 @@ set(MUXIVEO_RIFE_SHADERS
     mc_luma mc_down mc_blur mc_search mc_median mc_recon mc_filter mc_region mc_blend mc_motion
     nv_flow nv_splat nv_warp sel_stats sel_weights sel_blend
     trt_pack residual_add
+    restore_yuv_to_rgb restore_luma_area restore_resize restore_assemble restore_tile restore_rgb_to_yuv_aa
 )
 set(SHADER_HEADERS)
 foreach(shader ${MUXIVEO_RIFE_SHADERS})
@@ -123,6 +124,7 @@ add_executable(muxiveo-rife
     src/trt_backend.cpp
     src/selector_weights.cpp
     src/restore_auto.cpp
+    src/restore_net.cpp
     ${SHADER_HEADERS}
 )
 target_include_directories(muxiveo-rife PRIVATE ${CMAKE_CURRENT_BINARY_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/src)

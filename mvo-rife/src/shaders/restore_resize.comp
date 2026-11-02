@@ -1,0 +1,42 @@
+// Restauration (R2) : redimensionnement bilinéaire (F.interpolate(mode="bilinear", align_corners=False) : centres de
+// pixels, source négative ramenée à 0), canal c multiplié par mul[c] (mise à l'échelle des flux) ; entrée à un canal
+// répliquée sur `outc` canaux si `inc` vaut 1.
+#version 450
+#if NCNN_fp16_storage
+#extension GL_EXT_shader_16bit_storage: require
+#endif
+layout (binding = 0) readonly buffer src_blob { sfp src_data[]; };
+layout (binding = 1) writeonly buffer dst_blob { sfp dst_data[]; };
+layout (push_constant) uniform parameter
+{
+    int w; int h; int inc; int cstep; int outw; int outh; int outc; int outcstep; float mul0; float mul1;
+} p;
+
+void axis(int o, int n, int m, out int i0, out int i1, out float f)
+{
+    float src = max((float(o) + 0.5) * (float(n) / float(m)) - 0.5, 0.0);
+    i0 = min(int(src), n - 1);
+    i1 = min(i0 + 1, n - 1);
+    f = src - float(i0);
+}
+
+void main()
+{
+    int gx = int(gl_GlobalInvocationID.x);
+    int gy = int(gl_GlobalInvocationID.y);
+    int gc = int(gl_GlobalInvocationID.z);
+    if (gx >= p.outw || gy >= p.outh || gc >= p.outc)
+        return;
+    int x0; int x1; int y0; int y1; float fx; float fy;
+    axis(gx, p.w, p.outw, x0, x1, fx);
+    axis(gy, p.h, p.outh, y0, y1, fy);
+    int base = (p.inc == 1 ? 0 : gc) * p.cstep;
+    float a = float(src_data[base + y0 * p.w + x0]);
+    float b = float(src_data[base + y0 * p.w + x1]);
+    float c = float(src_data[base + y1 * p.w + x0]);
+    float d = float(src_data[base + y1 * p.w + x1]);
+    float v = (1.0 - fy) * ((1.0 - fx) * a + fx * b) + fy * ((1.0 - fx) * c + fx * d);
+    v = float(sfp(v));  // résultat du redimensionnement au format de stockage, puis mise à l'échelle
+    v *= gc == 0 ? p.mul0 : (gc == 1 ? p.mul1 : 1.0);
+    dst_data[gc * p.outcstep + gy * p.outw + gx] = sfp(v);
+}

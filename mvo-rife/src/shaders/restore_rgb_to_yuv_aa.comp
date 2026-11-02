@@ -1,0 +1,97 @@
+// Restauration (R2) : sortie du corps -> codes Y'CbCr flottants non arrondis, sous-échantillonnage chroma
+// antirepliement du banc (color_harness, chroma="aa" : Lanczos 3 à demi-bande, 13 prises, bords répliqués,
+// échantillons pairs ; noyau centré sur l'échantillon (co-situé) ou décalé d'un demi-pas (centré)).
+// pass 0 : R'G'B' = acc / wsum sur la région utile (marge `edge` retirée) ; Y en codes, Cb / Cr pleine
+//          définition sous-échantillonnés horizontalement -> tmp (2 plans cwx × h).
+// pass 1 : sous-échantillonnage vertical de tmp -> Cb / Cr en codes.
+// Sortie : [Y (w × h) | Cb (cw × ch) | Cr (cw × ch)] en flottants 32 bits.
+#version 450
+layout (binding = 0) readonly buffer acc_blob { float acc_data[]; };
+layout (binding = 1) readonly buffer wsum_blob { float wsum_data[]; };
+layout (binding = 2) buffer tmp_blob { float tmp_data[]; };
+layout (binding = 3) buffer out_blob { float out_data[]; };
+layout (push_constant) uniform parameter
+{
+    int pass; int W; int acstep; int edge; int w; int h; int cw; int ch; int cx_mode; int cy_mode;
+    float y_off; float y_rng; float c_off; float c_rng; float kr; float kb;
+} p;
+
+float lanczos_tap(int i, int mode)
+{
+    float x = float(i - 6) - (mode == 2 ? 0.5 : 0.0);
+    float a = abs(x) < 1e-6 ? 1.0 : sin(3.141592653589793 * x / 2.0) / (3.141592653589793 * x / 2.0);
+    float b = abs(x) < 1e-6 ? 1.0 : sin(3.141592653589793 * x / 6.0) / (3.141592653589793 * x / 6.0);
+    return a * b;
+}
+
+float lanczos_norm(int mode)
+{
+    float s = 0.0;
+    for (int i = 0; i < 13; i++) s += lanczos_tap(i, mode);
+    return s;
+}
+
+vec3 rgb_at(int x, int y)
+{
+    int i = (p.edge + y) * p.W + (p.edge + x);
+    float ws = wsum_data[i];
+    return vec3(acc_data[i], acc_data[p.acstep + i], acc_data[2 * p.acstep + i]) / ws;
+}
+
+vec2 cbcr_full(int x, int y)
+{
+    vec3 c = rgb_at(x, y);
+    float kg = 1.0 - p.kr - p.kb;
+    float Y = p.kr * c.r + kg * c.g + p.kb * c.b;
+    return vec2((c.b - Y) / (2.0 * (1.0 - p.kb)), (c.r - Y) / (2.0 * (1.0 - p.kr)));
+}
+
+void main()
+{
+    int gx = int(gl_GlobalInvocationID.x);
+    int gy = int(gl_GlobalInvocationID.y);
+    if (int(gl_GlobalInvocationID.z) >= 1)
+        return;
+    int cwx = p.cx_mode == 0 ? p.w : p.cw;
+    if (p.pass == 0)
+    {
+        if (gy >= p.h)
+            return;
+        if (gx < p.w)
+        {
+            vec3 c = rgb_at(gx, gy);
+            float Y = p.kr * c.r + (1.0 - p.kr - p.kb) * c.g + p.kb * c.b;
+            out_data[gy * p.w + gx] = Y * p.y_rng + p.y_off;
+        }
+        if (gx >= cwx)
+            return;
+        vec2 v = vec2(0.0);
+        if (p.cx_mode == 0)
+            v = cbcr_full(gx, gy);
+        else
+        {
+            float norm = lanczos_norm(p.cx_mode);
+            for (int i = 0; i < 13; i++)
+                v += lanczos_tap(i, p.cx_mode) / norm * cbcr_full(clamp(2 * gx + i - 6, 0, p.w - 1), gy);
+        }
+        tmp_data[gy * cwx + gx] = v.x;
+        tmp_data[cwx * p.h + gy * cwx + gx] = v.y;
+        return;
+    }
+    if (gx >= p.cw || gy >= p.ch)
+        return;
+    vec2 v = vec2(0.0);
+    if (p.cy_mode == 0)
+        v = vec2(tmp_data[gy * cwx + gx], tmp_data[cwx * p.h + gy * cwx + gx]);
+    else
+    {
+        float norm = lanczos_norm(p.cy_mode);
+        for (int i = 0; i < 13; i++)
+        {
+            int y = clamp(2 * gy + i - 6, 0, p.h - 1);
+            v += lanczos_tap(i, p.cy_mode) / norm * vec2(tmp_data[y * cwx + gx], tmp_data[cwx * p.h + y * cwx + gx]);
+        }
+    }
+    out_data[p.w * p.h + gy * p.cw + gx] = v.x * p.c_rng + p.c_off;
+    out_data[p.w * p.h + p.cw * p.ch + gy * p.cw + gx] = v.y * p.c_rng + p.c_off;
+}
