@@ -59,6 +59,8 @@ public:
     };
     const std::map<int64_t, Log>& log() const { return logs; }
     const std::vector<int>& cuts() const { return cut_list; }
+    // Vrai si la trame t (déjà sortie de l'étage) commence un plan.
+    bool shot_starts_at(int t) const { return shot_start(t) == t; }
 
 private:
     struct Job

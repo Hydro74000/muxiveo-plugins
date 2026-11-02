@@ -108,3 +108,31 @@ def test_restore_tensorrt_matches_vulkan(tmp_path):
     assert "TensorRT" in log and len(trt) == N
     y = np.stack([f[: W * H] for f in trt]).astype(np.float64) - np.stack([f[: W * H] for f in vk])
     assert 10 * np.log10(1023 ** 2 / max(np.mean(y ** 2), 1e-9)) > 60  # mêmes graphes : écarts d'arrondi fp16 seulement
+
+
+def _two_shots() -> bytes:
+    """Deux plans : le dégradé granuleux, puis le même nettement plus clair et inversé (coupe à l'image N // 2)."""
+    src = _source()
+    i = src.index(b"\n") + 1
+    size = (W * H + 2 * (W // 2) * (H // 2)) * 2
+    out = [src[:i]]
+    for t in range(N):
+        j = i + t * (size + 6)
+        frame = np.frombuffer(src[j + 6:j + 6 + size], "<u2").copy()
+        if t >= N // 2:
+            frame[: W * H] = np.clip(1004 - frame[: W * H] + 150, 64, 940)
+        out.append(b"FRAME\n" + frame.tobytes())
+    return b"".join(out)
+
+
+def test_frame_statistics_follow_restoration_cuts(tmp_path):
+    src = _two_shots()
+    for factor, cut in (("1", N // 2), ("2", N)):
+        stats = tmp_path / f"s{factor}.jsonl"
+        frames, log = _run(src, "--factor", factor, "--restore", "auto", "--transfer", "pq", "--frame-statistics", str(stats))
+        lines = [json.loads(line) for line in stats.read_text().splitlines()]
+        records = [line for line in lines if "frame" in line]
+        assert len(records) == len(frames) == N * int(factor)
+        assert [r["frame"] for r in records if r["scene_start"]] == [0, cut]
+        assert [(s["scene_first"], s["frames"]) for s in lines if "scene_first" in s] == [(0, cut), (cut, len(frames) - cut)]
+        assert "2 plan(s)" in log

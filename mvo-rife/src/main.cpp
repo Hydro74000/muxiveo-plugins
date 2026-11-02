@@ -43,6 +43,7 @@
 #include "cuda_driver.h"
 #include "trt_backend.h"
 #include "restore_stage.h"
+#include "frame_stats.h"
 #include "numparse.h"
 #include <limits>
 #include "y4m.h"
@@ -377,6 +378,7 @@ struct Options
     std::string restore_dither = "auto";  // auto (±1 code) | off | 8 (±1 pas 8 bits : sortie 10 bits vers un encodeur 8 bits)
     std::string transfer;                 // sdr | pq | hlg : canal de transfert du réseau (PQ ou non)
     int restore_tile = 512;               // côté des tuiles du réseau de restauration
+    std::string frame_statistics;         // statistiques de chaque trame produite (JSON Lines, sources PQ)
 };
 
 static void print_usage(FILE* fp)
@@ -427,6 +429,8 @@ static void print_usage(FILE* fp)
             "                          10 bits destinée à un encodeur 8 bits)\n"
             "  --transfer <t>          sdr | pq | hlg : fonction de transfert de la source (Restauration ; défaut : sdr)\n"
             "  --restore-tile <n>      côté des tuiles du réseau de restauration (défaut : 512)\n"
+            "  --frame-statistics <f>  statistiques de chaque trame produite (MaxCLL / MaxFALL, format mvo-fel-frame-\n"
+            "                          statistics) ; exige --transfer pq\n"
             "  --progress-interval <s> intervalle des lignes de progression (défaut : 1)\n"
             "  --quiet                 pas de ligne de progression\n"
             "  --verbose               affiche les diagnostics Vulkan de ncnn\n"
@@ -579,6 +583,7 @@ static bool parse_args(const std::vector<std::string>& args, Options& o, std::st
             }
             o.transfer = v;
         }
+        else if (a == "--frame-statistics") { if (!value(o.frame_statistics)) return false; }
         else if (a == "--restore-tile")
         {
             if (!value(v) || !parse_int_option(a, v, 64, 8192, o.restore_tile, error)) return false;
@@ -760,7 +765,7 @@ static int print_capabilities(const Options& o, const fs::path& exe_dir)
         "fp32", "feature-cache", "feature-cache-reserve", "tta", "engine", "trt-plugin", "trt-cache", "backend", "nvof", "large-motion", "selector",
         "selector-weights", "ultra", "padding", "threads", "allow-interlaced", "progress-interval", "quiet", "verbose",
         "list-gpus", "capabilities", "version", "restore", "restore-animation", "restore-fast", "restore-model",
-        "restore-dither", "transfer", "restore-tile"};
+        "restore-dither", "transfer", "restore-tile", "frame-statistics"};
     std::vector<std::string> models;
     std::error_code ec;
     for (fs::directory_iterator it(exe_dir / "rife-models", ec), end; !ec && it != end; it.increment(ec))
@@ -956,6 +961,7 @@ struct SourceFrame
     GpuFrame gpu;
     int64_t index = -1;
     int slot = -1;   // tampon de l'anneau d'entrée du moteur (copie de data), -1 : aucun
+    bool cut = false;  // première trame d'un plan (coupes de la Restauration)
 };
 
 // trame lue et son tampon d'entrée
@@ -963,6 +969,14 @@ struct InFrame
 {
     FrameBuffer buf;
     int slot = -1;
+    bool cut = false;
+};
+
+// trame à écrire ; scene : première trame produite d'un plan (statistiques des trames)
+struct OutFrame
+{
+    FrameBuffer buf;
+    bool scene = false;
 };
 
 static int run(const Options& o, const fs::path& exe_dir)
@@ -1050,6 +1064,20 @@ static int run(const Options& o, const fs::path& exe_dir)
     {
         fprintf(stderr, "error: %s\n", error.c_str());
         return EXIT_USAGE;
+    }
+
+    // Statistiques des trames produites : codes PQ (MaxCLL / MaxFALL de la sortie)
+    FrameStatsWriter frame_stats;
+    const bool measuring = !o.frame_statistics.empty();
+    if (measuring && o.transfer != "pq")
+    {
+        fprintf(stderr, "error: --frame-statistics exige --transfer pq\n");
+        return EXIT_USAGE;
+    }
+    if (measuring && !frame_stats.open(o.frame_statistics, fmt, color, error))
+    {
+        fprintf(stderr, "error: %s\n", error.c_str());
+        return EXIT_IO;
     }
 
     // Restauration (R2) : étage en flux exécuté dans le fil de lecture, avant l'interpolation (restaurée seule si facteur 1)
@@ -1314,17 +1342,20 @@ static int run(const Options& o, const fs::path& exe_dir)
     BoundedQueue<int> free_in(IN_SLOTS);
     for (int k = 0; k < IN_SLOTS; k++)
         free_in.push(k);
-    BoundedQueue<FrameBuffer> write_queue(4);
+    BoundedQueue<OutFrame> write_queue(4);
     std::atomic<bool> read_failed(false);
     std::atomic<bool> write_failed(false);
     std::string read_error;
 
     std::atomic<bool> restore_failed(false);
+    std::atomic<bool> stats_failed(false);
+    std::string stats_error;
     std::thread reader_thread([&] {
         if (restoring)
         {
             // trames lues -> étage de Restauration -> trames restaurées, dans l'ordre, vers le pipeline
             std::vector<uint8_t> raw(fmt.padded_frame_bytes()), restored;
+            int restored_index = 0;
             for (;;)
             {
                 std::string err;
@@ -1356,7 +1387,7 @@ static int run(const Options& o, const fs::path& exe_dir)
                         }
                         memcpy(engine.input_slot(slot), buf->data(), fmt.padded_frame_bytes());
                     }
-                    closed = !read_queue.push(InFrame{buf, slot});
+                    closed = !read_queue.push(InFrame{buf, slot, restore_stage.shot_starts_at(restored_index++)});
                 }
                 if (r == 0 || closed)
                     break;
@@ -1392,18 +1423,27 @@ static int run(const Options& o, const fs::path& exe_dir)
     });
 
     std::thread writer_thread([&] {
-        FrameBuffer buf;
-        while (write_queue.pop(buf))
+        OutFrame frame;
+        while (write_queue.pop(frame))
         {
-            if (!write_failed && !writer.write_frame((const uint8_t*)buf->data(), frame_bytes))
+            const uint8_t* data = (const uint8_t*)frame.buf->data();
+            if (measuring && !stats_failed && !frame_stats.add(data, frame.scene, stats_error))
+            {
+                stats_failed = true;
+                write_failed = true;
+                write_queue.close();
+            }
+            if (!write_failed && !writer.write_frame(data, frame_bytes))
             {
                 write_failed = true;
                 write_queue.close();
             }
-            buf.reset();
+            frame.buf.reset();
         }
         if (!write_failed && !writer.flush())
             write_failed = true;
+        if (measuring && !stats_failed && !frame_stats.finish(stats_error))
+            stats_failed = true;
     });
 
     // sortie différée : images interpolées recopiées depuis l'anneau du moteur, puis toutes les trames (sources comprises)
@@ -1412,6 +1452,7 @@ static int run(const Options& o, const fs::path& exe_dir)
     {
         FrameBuffer buf;
         int slot;   // tampon de l'anneau à recopier dans buf, -1 : trame déjà prête
+        bool scene = false;
     };
     BoundedQueue<OutTask> copy_queue(OUT_SLOTS + 1);
     BoundedQueue<int> free_slots(OUT_SLOTS);
@@ -1426,7 +1467,7 @@ static int run(const Options& o, const fs::path& exe_dir)
                 memcpy(task.buf->data(), engine.output_slot(task.slot), fmt.padded_frame_bytes());
                 free_slots.push(task.slot);
             }
-            if (write_failed || !write_queue.push(task.buf))
+            if (write_failed || !write_queue.push(OutFrame{task.buf, task.scene}))
                 write_failed = true;
             task.buf.reset();
         }
@@ -1459,6 +1500,7 @@ static int run(const Options& o, const fs::path& exe_dir)
             return false;
         nxt.data = in.buf;
         nxt.slot = in.slot;
+        nxt.cut = in.cut;
         nxt.gpu.reset();
         nxt.index = frames_in++;
         return true;
@@ -1523,8 +1565,11 @@ static int run(const Options& o, const fs::path& exe_dir)
             scene_cuts++;
     };
 
+    int64_t emitted_source = -1;  // trame source de la dernière trame produite
     auto emit = [&](const FrameBuffer& buf, int slot = -1) -> bool {
-        if (write_failed || !(async_out ? copy_queue.push(OutTask{buf, slot}) : write_queue.push(buf)))
+        const bool scene = cur.cut && cur.index != emitted_source;  // première trame produite d'une coupe
+        emitted_source = cur.index;
+        if (write_failed || !(async_out ? copy_queue.push(OutTask{buf, slot, scene}) : write_queue.push(OutFrame{buf, scene})))
             return false;
         frames_out++;
         return true;
@@ -1743,6 +1788,11 @@ static int run(const Options& o, const fs::path& exe_dir)
         }
         fprintf(stderr, "info: restauration : %zu plan(s) [%s], %zu trame(s) tenues au plus\n", restore_stage.cuts().size(),
                 shots.c_str(), restore_stage.max_held());
+    }
+    if (exit_code == EXIT_OK && stats_failed)
+    {
+        fprintf(stderr, "error: %s\n", stats_error.c_str());
+        exit_code = EXIT_IO;
     }
     if (exit_code == EXIT_OK && write_failed)
     {
