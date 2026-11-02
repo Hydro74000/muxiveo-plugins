@@ -379,6 +379,7 @@ struct Options
     std::string transfer;                 // sdr | pq | hlg : canal de transfert du réseau (PQ ou non)
     int restore_tile = 512;               // côté des tuiles du réseau de restauration
     std::string frame_statistics;         // statistiques de chaque trame produite (JSON Lines, sources PQ)
+    std::string source_statistics;        // mêmes statistiques des trames lues, avant la Restauration
 };
 
 static void print_usage(FILE* fp)
@@ -431,6 +432,7 @@ static void print_usage(FILE* fp)
             "  --restore-tile <n>      côté des tuiles du réseau de restauration (défaut : 512)\n"
             "  --frame-statistics <f>  statistiques de chaque trame produite (MaxCLL / MaxFALL, format mvo-fel-frame-\n"
             "                          statistics) ; exige --transfer pq\n"
+            "  --source-statistics <f> mêmes statistiques des trames lues, avant la Restauration ; exige --transfer pq\n"
             "  --progress-interval <s> intervalle des lignes de progression (défaut : 1)\n"
             "  --quiet                 pas de ligne de progression\n"
             "  --verbose               affiche les diagnostics Vulkan de ncnn\n"
@@ -584,6 +586,7 @@ static bool parse_args(const std::vector<std::string>& args, Options& o, std::st
             o.transfer = v;
         }
         else if (a == "--frame-statistics") { if (!value(o.frame_statistics)) return false; }
+        else if (a == "--source-statistics") { if (!value(o.source_statistics)) return false; }
         else if (a == "--restore-tile")
         {
             if (!value(v) || !parse_int_option(a, v, 64, 8192, o.restore_tile, error)) return false;
@@ -765,7 +768,7 @@ static int print_capabilities(const Options& o, const fs::path& exe_dir)
         "fp32", "feature-cache", "feature-cache-reserve", "tta", "engine", "trt-plugin", "trt-cache", "backend", "nvof", "large-motion", "selector",
         "selector-weights", "ultra", "padding", "threads", "allow-interlaced", "progress-interval", "quiet", "verbose",
         "list-gpus", "capabilities", "version", "restore", "restore-animation", "restore-fast", "restore-model",
-        "restore-dither", "transfer", "restore-tile", "frame-statistics"};
+        "restore-dither", "transfer", "restore-tile", "frame-statistics", "source-statistics"};
     std::vector<std::string> models;
     std::error_code ec;
     for (fs::directory_iterator it(exe_dir / "rife-models", ec), end; !ec && it != end; it.increment(ec))
@@ -1067,14 +1070,16 @@ static int run(const Options& o, const fs::path& exe_dir)
     }
 
     // Statistiques des trames produites : codes PQ (MaxCLL / MaxFALL de la sortie)
-    FrameStatsWriter frame_stats;
+    FrameStatsWriter frame_stats, source_stats;
     const bool measuring = !o.frame_statistics.empty();
-    if (measuring && o.transfer != "pq")
+    const bool measuring_source = !o.source_statistics.empty();
+    if ((measuring || measuring_source) && o.transfer != "pq")
     {
-        fprintf(stderr, "error: --frame-statistics exige --transfer pq\n");
+        fprintf(stderr, "error: --frame-statistics et --source-statistics exigent --transfer pq\n");
         return EXIT_USAGE;
     }
-    if (measuring && !frame_stats.open(o.frame_statistics, fmt, color, error))
+    if ((measuring && !frame_stats.open(o.frame_statistics, fmt, color, error))
+        || (measuring_source && !source_stats.open(o.source_statistics, fmt, color, error)))
     {
         fprintf(stderr, "error: %s\n", error.c_str());
         return EXIT_IO;
@@ -1350,6 +1355,16 @@ static int run(const Options& o, const fs::path& exe_dir)
     std::atomic<bool> restore_failed(false);
     std::atomic<bool> stats_failed(false);
     std::string stats_error;
+    std::atomic<bool> source_stats_failed(false);
+    std::string source_stats_error;
+    // trame lue mesurée (fil de lecture) ; data nul : fin du flux
+    auto measure_source = [&](const uint8_t* data) -> bool {
+        if (!measuring_source || source_stats_failed)
+            return !source_stats_failed;
+        if (!(data ? source_stats.add(data, false, source_stats_error) : source_stats.finish(source_stats_error)))
+            source_stats_failed = true;
+        return !source_stats_failed;
+    };
     std::thread reader_thread([&] {
         if (restoring)
         {
@@ -1366,6 +1381,8 @@ static int run(const Options& o, const fs::path& exe_dir)
                     read_failed = true;
                     break;
                 }
+                if (!measure_source(r > 0 ? raw.data() : nullptr))
+                    break;
                 if (!(r > 0 ? restore_stage.push(raw.data()) : restore_stage.finish()))
                 {
                     read_error = restore_stage.error();
@@ -1407,8 +1424,12 @@ static int run(const Options& o, const fs::path& exe_dir)
                     read_error = err;
                     read_failed = true;
                 }
+                else
+                    measure_source(nullptr);
                 break;
             }
+            if (!measure_source((const uint8_t*)buf->data()))
+                break;
             int slot = -1;
             if (async_in)
             {
@@ -1789,9 +1810,9 @@ static int run(const Options& o, const fs::path& exe_dir)
         fprintf(stderr, "info: restauration : %zu plan(s) [%s], %zu trame(s) tenues au plus\n", restore_stage.cuts().size(),
                 shots.c_str(), restore_stage.max_held());
     }
-    if (exit_code == EXIT_OK && stats_failed)
+    if (exit_code == EXIT_OK && (stats_failed || source_stats_failed))
     {
-        fprintf(stderr, "error: %s\n", stats_error.c_str());
+        fprintf(stderr, "error: %s\n", (stats_failed ? stats_error : source_stats_error).c_str());
         exit_code = EXIT_IO;
     }
     if (exit_code == EXIT_OK && write_failed)

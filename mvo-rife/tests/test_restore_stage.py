@@ -136,3 +136,15 @@ def test_frame_statistics_follow_restoration_cuts(tmp_path):
         assert [r["frame"] for r in records if r["scene_start"]] == [0, cut]
         assert [(s["scene_first"], s["frames"]) for s in lines if "scene_first" in s] == [(0, cut), (cut, len(frames) - cut)]
         assert "2 plan(s)" in log
+
+
+def test_source_statistics_precede_restoration(tmp_path):
+    src = _source()
+    restored, source, plain = tmp_path / "r.jsonl", tmp_path / "s.jsonl", tmp_path / "p.jsonl"
+    _run(src, "--factor", "1", "--restore", "fort", "--transfer", "pq", "--frame-statistics", str(restored),
+         "--source-statistics", str(source))
+    subprocess.run([RIFE_BIN, "--factor", "1", "--matrix", "bt709", "--chroma-loc", "left", "--transfer", "pq", "--quiet",
+                    "--frame-statistics", str(plain)], input=src, capture_output=True, check=True, timeout=120)
+    frames = lambda path: [json.loads(line) for line in path.read_text().splitlines() if '"frame"' in line]  # noqa: E731
+    assert [f["max_nits"] for f in frames(source)] == [f["max_nits"] for f in frames(plain)]
+    assert max(max(f["max_nits"]) for f in frames(restored)) < max(max(f["max_nits"]) for f in frames(source))

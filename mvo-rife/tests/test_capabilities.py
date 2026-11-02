@@ -74,7 +74,7 @@ def _has_restore() -> bool:
 def test_capabilities_describe_restore():
     caps = _capabilities()
     assert {"restore", "restore-animation", "restore-fast", "restore-model", "restore-dither", "transfer",
-            "restore-tile", "frame-statistics"} <= set(caps["options"])
+            "restore-tile", "frame-statistics", "source-statistics"} <= set(caps["options"])
     restore = caps["restore"]
     assert restore["levels"] == ["auto", "leger", "moyen", "fort"] and restore["dither"] == ["auto", "off", "8"]
     models_dir = Path(RIFE_BIN).resolve().parent / "restore-models"

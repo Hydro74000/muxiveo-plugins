@@ -78,3 +78,12 @@ def test_values_and_format(tmp_path):
 def test_requires_pq(tmp_path):
     r = _run(_y4m([512]), tmp_path / "s.jsonl")
     assert r.returncode != 0 and b"--transfer pq" in r.stderr
+
+
+def test_source_statistics_measure_the_frames_read(tmp_path):
+    produced, source = tmp_path / "out.jsonl", tmp_path / "in.jsonl"
+    r = _run(_y4m([100, 600, 900, 300]), produced, "--transfer", "pq", "--source-statistics", str(source))
+    assert r.returncode == 0, r.stderr.decode()
+    assert source.read_text() == produced.read_text()  # recopie : trames lues = trames produites
+    r = _run(_y4m([512]), produced, "--transfer", "pq", "--factor", "2", "--source-statistics", str(source))
+    assert r.returncode == 0 and len([line for line in source.read_text().splitlines() if '"frame"' in line]) == 1
