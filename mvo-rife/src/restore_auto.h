@@ -116,6 +116,9 @@ double auto_part(std::optional<double> ratio, double k);
 void dose(const uint16_t* src, const float* out, std::size_t n, double kk, uint16_t lo, uint16_t hi, uint16_t* dst,
           long long dither_frame = -1, std::size_t dither_offset = 0, int dither_step = 1);
 
+// Fils processeur des calculs par image (0 : selon le processeur ; résultats identiques quel que soit le nombre).
+void set_threads(int n);
+
 // Outils exposés pour les tests.
 namespace detail
 {

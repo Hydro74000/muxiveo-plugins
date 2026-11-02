@@ -2,7 +2,10 @@
 #include "restore_auto.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
+#include <cstring>
+#include <thread>
 
 namespace restore_auto
 {
@@ -28,33 +31,117 @@ int reflect101(int i, int n)
 
 int clampi(int i, int n) { return i < 0 ? 0 : (i >= n ? n - 1 : i); }
 
+int g_threads = 0;  // 0 : selon le processeur
+
+// Exécute fn(début, fin) sur des bandes de [0, n), en parallèle ; chaque élément ne dépend que de lui-même : résultats
+// identiques quel que soit le découpage.
+template <class F>
+void parallel_for(int n, F&& fn)
+{
+    const int hw = g_threads > 0 ? g_threads : (int)std::thread::hardware_concurrency();
+    const int t = std::min(std::clamp(hw, 1, 32), std::max(1, n / 16));
+    if (t <= 1)
+    {
+        fn(0, n);
+        return;
+    }
+    std::vector<std::thread> pool;
+    for (int i = 0; i < t; i++)
+    {
+        const int a = (int)((int64_t)n * i / t), b = (int)((int64_t)n * (i + 1) / t);
+        pool.emplace_back([a, b, &fn] { fn(a, b); });
+    }
+    for (std::thread& th : pool)
+        th.join();
+}
+
+// Clé ordonnée d'un flottant (ordre des entiers non signés = ordre des flottants).
+inline uint32_t float_key(float f)
+{
+    uint32_t u;
+    std::memcpy(&u, &f, 4);
+    return (u & 0x80000000u) ? ~u : (u | 0x80000000u);
+}
+
+// Élément de rang r (0 = plus petit) : sélection exacte par histogramme des 16 bits de tête (parallèle), puis
+// sélection dans la case retenue.
+float select_rank(const std::vector<float>& v, size_t r)
+{
+    const int n = (int)v.size();
+    const int hw = g_threads > 0 ? g_threads : (int)std::thread::hardware_concurrency();
+    const int t = std::min(std::clamp(hw, 1, 32), std::max(1, n / 65536));
+    std::vector<std::array<uint32_t, 65536>> hist(t);
+    {
+        std::vector<std::thread> pool;
+        for (int i = 0; i < t; i++)
+            pool.emplace_back([&, i] {
+                hist[i].fill(0);
+                const int a = (int)((int64_t)n * i / t), b = (int)((int64_t)n * (i + 1) / t);
+                for (int j = a; j < b; j++)
+                    hist[i][float_key(v[j]) >> 16]++;
+            });
+        for (std::thread& th : pool)
+            th.join();
+    }
+    size_t cum = 0;
+    uint32_t bin = 0;
+    for (; bin < 65536; bin++)
+    {
+        size_t c = 0;
+        for (int i = 0; i < t; i++)
+            c += hist[i][bin];
+        if (cum + c > r)
+            break;
+        cum += c;
+    }
+    std::vector<float> sub;
+    for (int j = 0; j < n; j++)
+        if ((float_key(v[j]) >> 16) == bin)
+            sub.push_back(v[j]);
+    std::nth_element(sub.begin(), sub.begin() + (r - cum), sub.end());
+    return sub[r - cum];
+}
+
+// Médiane (centile 50 à interpolation linéaire, comme numpy.median).
+double median_exact(const std::vector<float>& v)
+{
+    const size_t lo = (v.size() - 1) / 2;
+    const double a = select_rank(v, lo);
+    return (v.size() - 1) % 2 ? 0.5 * (a + select_rank(v, lo + 1)) : a;
+}
+
 // Moyenne k × k, bords répliqués (avg_pool2d après F.pad(..., mode="replicate")).
 void box_replicate(const float* src, int w, int h, int k, float* dst)
 {
     const int r = k / 2;
     std::vector<float> tmp((std::size_t)w * h);
-    for (int y = 0; y < h; y++)
-        for (int x = 0; x < w; x++)
-        {
-            double s = 0.0;
-            for (int d = -r; d <= r; d++)
-                s += src[(std::size_t)y * w + clampi(x + d, w)];
-            tmp[(std::size_t)y * w + x] = (float)(s / k);
-        }
-    for (int y = 0; y < h; y++)
-        for (int x = 0; x < w; x++)
-        {
-            double s = 0.0;
-            for (int d = -r; d <= r; d++)
-                s += tmp[(std::size_t)clampi(y + d, h) * w + x];
-            dst[(std::size_t)y * w + x] = (float)(s / k);
-        }
+    parallel_for(h, [&](int y0, int y1) {
+        for (int y = y0; y < y1; y++)
+            for (int x = 0; x < w; x++)
+            {
+                double s = 0.0;
+                for (int d = -r; d <= r; d++)
+                    s += src[(std::size_t)y * w + clampi(x + d, w)];
+                tmp[(std::size_t)y * w + x] = (float)(s / k);
+            }
+    });
+    parallel_for(h, [&](int y0, int y1) {
+        for (int y = y0; y < y1; y++)
+            for (int x = 0; x < w; x++)
+            {
+                double s = 0.0;
+                for (int d = -r; d <= r; d++)
+                    s += tmp[(std::size_t)clampi(y + d, h) * w + x];
+                dst[(std::size_t)y * w + x] = (float)(s / k);
+            }
+    });
 }
 
 // Sobel 3 × 3 (dérivée en x ou en y), bords en miroir sans répétition.
 void sobel(const float* src, int w, int h, bool dx, float* dst)
 {
-    for (int y = 0; y < h; y++)
+    parallel_for(h, [&](int ya, int yb) {
+    for (int y = ya; y < yb; y++)
     {
         const float* rm = src + (std::size_t)reflect101(y - 1, h) * w;
         const float* r0 = src + (std::size_t)y * w;
@@ -66,6 +153,7 @@ void sobel(const float* src, int w, int h, bool dx, float* dst)
                                              : (rp[xm] - rm[xm]) + 2.f * (rp[x] - rm[x]) + (rp[xp] - rm[xp]);
         }
     }
+    });
 }
 
 // Lecture bilinéaire comme cv2.remap(INTER_LINEAR, BORDER_REPLICATE) : coordonnée au 1/32 de pixel.
@@ -104,9 +192,11 @@ inline uint64_t mix64(uint64_t z)
 std::vector<float> luma_float(const uint16_t* y, int w, int h, std::ptrdiff_t stride)
 {
     std::vector<float> f((std::size_t)w * h);
-    for (int r = 0; r < h; r++)
-        for (int x = 0; x < w; x++)
-            f[(std::size_t)r * w + x] = y[r * stride + x];
+    parallel_for(h, [&](int r0, int r1) {
+        for (int r = r0; r < r1; r++)
+            for (int x = 0; x < w; x++)
+                f[(std::size_t)r * w + x] = y[r * stride + x];
+    });
     return f;
 }
 
@@ -146,22 +236,26 @@ void gaussian_blur(const float* src, int w, int h, double sigma, float* dst)
     for (float& v : k)
         v = (float)(v / sum);
     std::vector<float> tmp((std::size_t)w * h);
-    for (int y = 0; y < h; y++)
-        for (int x = 0; x < w; x++)
-        {
-            float s = 0.f;
-            for (int i = -r; i <= r; i++)
-                s += k[i + r] * src[(std::size_t)y * w + reflect101(x + i, w)];
-            tmp[(std::size_t)y * w + x] = s;
-        }
-    for (int y = 0; y < h; y++)
-        for (int x = 0; x < w; x++)
-        {
-            float s = 0.f;
-            for (int i = -r; i <= r; i++)
-                s += k[i + r] * tmp[(std::size_t)reflect101(y + i, h) * w + x];
-            dst[(std::size_t)y * w + x] = s;
-        }
+    parallel_for(h, [&](int y0, int y1) {
+        for (int y = y0; y < y1; y++)
+            for (int x = 0; x < w; x++)
+            {
+                float s = 0.f;
+                for (int i = -r; i <= r; i++)
+                    s += k[i + r] * src[(std::size_t)y * w + reflect101(x + i, w)];
+                tmp[(std::size_t)y * w + x] = s;
+            }
+    });
+    parallel_for(h, [&](int y0, int y1) {
+        for (int y = y0; y < y1; y++)
+            for (int x = 0; x < w; x++)
+            {
+                float s = 0.f;
+                for (int i = -r; i <= r; i++)
+                    s += k[i + r] * tmp[(std::size_t)reflect101(y + i, h) * w + x];
+                dst[(std::size_t)y * w + x] = s;
+            }
+    });
 }
 
 void area_resize(const float* src, int w, int h, int dw, int dh, float* dst)
@@ -300,7 +394,8 @@ void grain_map(const uint16_t* y, int w, int h, std::ptrdiff_t stride, const Gra
     const std::vector<float> t = luma_float(y, w, h, stride);
     std::vector<float> lum(t.size());
     detail::gaussian_blur(t.data(), w, h, 2.0, lum.data());
-    for (std::size_t i = 0; i < lum.size(); i++)
+    parallel_for(h, [&](int r0, int r1) {
+    for (std::size_t i = (std::size_t)r0 * w; i < (std::size_t)r1 * w; i++)
     {
         const float v = lum[i];
         float s;
@@ -318,22 +413,29 @@ void grain_map(const uint16_t* y, int w, int h, std::ptrdiff_t stride, const Gra
         }
         map[i] = (uint8_t)std::clamp(std::nearbyint(s * 20.f), 0.f, 255.f);
     }
+    });
 }
 
 float residual_sigma(const uint16_t* src_y, std::ptrdiff_t src_stride, const float* out_y, std::ptrdiff_t out_stride, int w, int h)
 {
     const std::size_t n = (std::size_t)w * h;
     std::vector<float> d(n), blur(n);
-    for (int r = 0; r < h; r++)
-        for (int x = 0; x < w; x++)
-            d[(std::size_t)r * w + x] = (float)src_y[r * src_stride + x] - out_y[r * out_stride + x];
+    parallel_for(h, [&](int r0, int r1) {
+        for (int r = r0; r < r1; r++)
+            for (int x = 0; x < w; x++)
+                d[(std::size_t)r * w + x] = (float)src_y[r * src_stride + x] - out_y[r * out_stride + x];
+    });
     detail::gaussian_blur(d.data(), w, h, 1.2, blur.data());
-    for (std::size_t i = 0; i < n; i++)
-        d[i] -= blur[i];
-    const double med = detail::percentile(d, 50.0);
-    for (float& v : d)
-        v = std::fabs(v - (float)med);
-    return (float)std::max(1.4826 * detail::percentile(std::move(d), 50.0), 1e-3);
+    parallel_for(h, [&](int r0, int r1) {
+        for (std::size_t i = (std::size_t)r0 * w; i < (std::size_t)r1 * w; i++)
+            d[i] -= blur[i];
+    });
+    const float med = (float)median_exact(d);
+    parallel_for(h, [&](int r0, int r1) {
+        for (std::size_t i = (std::size_t)r0 * w; i < (std::size_t)r1 * w; i++)
+            d[i] = std::fabs(d[i] - med);
+    });
+    return (float)std::max(1.4826 * median_exact(d), 1e-3);
 }
 
 CutDetector::CutDetector(int past, int look, double factor, double floor) : past_(past), look_(look), factor_(factor), floor_(floor) {}
@@ -508,7 +610,9 @@ void dose(const uint16_t* src, const float* out, std::size_t n, double kk, uint1
 {
     const float k = (float)kk;
     const float step = (float)std::max(1, dither_step);
-    for (std::size_t i = 0; i < n; i++)
+    const int blocks = (int)((n + 65535) / 65536);
+    parallel_for(blocks, [&](int b0, int b1) {
+    for (std::size_t i = (std::size_t)b0 * 65536; i < std::min(n, (std::size_t)b1 * 65536); i++)
     {
         float v = out[i] + k * ((float)src[i] - out[i]);
         if (dither_frame >= 0)
@@ -526,6 +630,9 @@ void dose(const uint16_t* src, const float* out, std::size_t n, double kk, uint1
         }
         dst[i] = (uint16_t)std::clamp(std::nearbyint(v), (float)lo, (float)hi);
     }
+    });
 }
+
+void set_threads(int n) { g_threads = std::max(0, n); }
 
 }  // namespace restore_auto
