@@ -85,9 +85,10 @@ double ra_ratio(const double* sigma, const double* pixels, int width)
     return r ? *r : NAN;
 }
 
-void ra_dose(const uint16_t* src, const float* out, std::size_t n, double kk, uint16_t lo, uint16_t hi, uint16_t* dst, long long dither_frame)
+void ra_dose(const uint16_t* src, const float* out, std::size_t n, double kk, uint16_t lo, uint16_t hi, uint16_t* dst, long long dither_frame,
+             int dither_step)
 {
-    dose(src, out, n, kk, lo, hi, dst, dither_frame, 0);
+    dose(src, out, n, kk, lo, hi, dst, dither_frame, 0, dither_step);
 }
 
 double ra_percentile(const float* v, std::size_t n, double q) { return detail::percentile(std::vector<float>(v, v + n), q); }

@@ -504,16 +504,25 @@ std::optional<double> ratio_from_sigma(const GrainBins& bins, int width)
 double auto_part(std::optional<double> ratio, double k) { return ratio ? std::min(1.0, k / std::max(*ratio, 1e-3)) : 0.25 * k; }
 
 void dose(const uint16_t* src, const float* out, std::size_t n, double kk, uint16_t lo, uint16_t hi, uint16_t* dst,
-          long long dither_frame, std::size_t dither_offset)
+          long long dither_frame, std::size_t dither_offset, int dither_step)
 {
     const float k = (float)kk;
+    const float step = (float)std::max(1, dither_step);
     for (std::size_t i = 0; i < n; i++)
     {
         float v = out[i] + k * ((float)src[i] - out[i]);
         if (dither_frame >= 0)
         {
             const uint64_t z = mix64(((uint64_t)dither_frame << 40) ^ (uint64_t)(dither_offset + i));
-            v += (float)((z >> 40) * (1.0 / 16777216.0)) + (float)((z & 0xFFFFFFull) * (1.0 / 16777216.0)) - 1.f;
+            const float nz = (float)((z >> 40) * (1.0 / 16777216.0)) + (float)((z & 0xFFFFFFull) * (1.0 / 16777216.0)) - 1.f;
+            if (step > 1.f)
+            {
+                // pas 8 bits : arrondi au multiple de `step` le plus proche, bornes ramenées au multiple intérieur
+                const float q = std::clamp(std::nearbyint(v / step + nz), std::ceil(lo / step), std::floor(hi / step));
+                dst[i] = (uint16_t)(q * step);
+                continue;
+            }
+            v += nz;
         }
         dst[i] = (uint16_t)std::clamp(std::nearbyint(v), (float)lo, (float)hi);
     }

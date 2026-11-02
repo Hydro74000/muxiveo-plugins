@@ -110,9 +110,11 @@ inline double auto_k(double k, bool animation) { return animation ? k * 0.5 : k;
 double auto_part(std::optional<double> ratio, double k);
 
 // Dosage d'un plan (codes planaires, n valeurs) : dst = arrondi(sortie + kk × (source − sortie)) borné à [lo, hi].
-// `dither_frame` ≥ 0 : arrondi tramé (bruit triangulaire ±1 code, déterministe d'après le numéro d'image et la position).
+// `dither_frame` ≥ 0 : arrondi tramé (bruit triangulaire ±1 pas, déterministe d'après le numéro d'image et la position) ;
+// `dither_step` : pas du tramage en codes (1 ; 4 = pas 8 bits d'une sortie 10 bits destinée à un encodeur 8 bits : codes
+// multiples de 4, conversion exacte en aval).
 void dose(const uint16_t* src, const float* out, std::size_t n, double kk, uint16_t lo, uint16_t hi, uint16_t* dst,
-          long long dither_frame = -1, std::size_t dither_offset = 0);
+          long long dither_frame = -1, std::size_t dither_offset = 0, int dither_step = 1);
 
 // Outils exposés pour les tests.
 namespace detail

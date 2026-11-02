@@ -36,7 +36,7 @@ def lib(tmp_path_factory):
     lib.ra_sigma_bins.argtypes = [f32p, f32p, C.c_int, C.c_int, i32p, C.c_int, C.c_int, C.c_int, C.c_double, f64p, f64p]
     lib.ra_ratio.argtypes = [f64p, f64p, C.c_int]
     lib.ra_ratio.restype = C.c_double
-    lib.ra_dose.argtypes = [u16p, f32p, C.c_size_t, C.c_double, C.c_uint16, C.c_uint16, u16p, C.c_longlong]
+    lib.ra_dose.argtypes = [u16p, f32p, C.c_size_t, C.c_double, C.c_uint16, C.c_uint16, u16p, C.c_longlong, C.c_int]
     lib.ra_percentile.argtypes = [f32p, C.c_size_t, C.c_double]
     lib.ra_percentile.restype = C.c_double
     lib.ra_gaussian_blur.argtypes = [f32p, C.c_int, C.c_int, C.c_double, f32p]
@@ -256,15 +256,27 @@ def test_dose_rounding_and_dither(lib):
     src = rng.integers(4, 1020, 50000).astype(np.uint16)
     out = (src + rng.normal(0, 4, src.size)).astype(np.float32)
     dst = np.zeros_like(src)
-    lib.ra_dose(src, out, src.size, 0.37, 4, 1019, dst, -1)
+    lib.ra_dose(src, out, src.size, 0.37, 4, 1019, dst, -1, 1)
     ref = np.clip(np.rint(out + np.float32(0.37) * (src.astype(np.float32) - out)), 4, 1019)
     assert np.array_equal(dst, ref.astype(np.uint16))
     a, b, c = (np.zeros_like(src) for _ in range(3))
-    lib.ra_dose(src, out, src.size, 0.37, 4, 1019, a, 3)
-    lib.ra_dose(src, out, src.size, 0.37, 4, 1019, b, 3)
-    lib.ra_dose(src, out, src.size, 0.37, 4, 1019, c, 4)
+    lib.ra_dose(src, out, src.size, 0.37, 4, 1019, a, 3, 1)
+    lib.ra_dose(src, out, src.size, 0.37, 4, 1019, b, 3, 1)
+    lib.ra_dose(src, out, src.size, 0.37, 4, 1019, c, 4, 1)
     assert np.array_equal(a, b) and not np.array_equal(a, c)  # déterministe, propre à chaque image
     err = a.astype(np.float64) - (out + np.float32(0.37) * (src.astype(np.float32) - out))
     inner = (a > 4) & (a < 1019)
     assert abs(err[inner].mean()) < 0.02 and 0.45 < err[inner].std() < 0.55  # triangulaire ±1 + arrondi
     assert np.abs(err[inner]).max() <= 1.5
+
+
+def test_dose_dither_8bit_step(lib):
+    rng = np.random.default_rng(7)
+    src = rng.integers(64, 941, 40000).astype(np.uint16)
+    out = (src + rng.normal(0, 3, src.size)).astype(np.float32)
+    dst = np.zeros_like(src)
+    lib.ra_dose(src, out, src.size, 0.3, 4, 1019, dst, 5, 4)
+    assert np.all(dst % 4 == 0) and dst.min() >= 4 and dst.max() <= 1016  # codes 8 bits exacts (× 4)
+    exact = out + np.float32(0.3) * (src.astype(np.float32) - out)
+    err = (dst.astype(np.float64) - exact) / 4
+    assert abs(err.mean()) < 0.02 and 0.45 < err.std() < 0.55  # triangulaire ±1 pas 8 bits + arrondi
