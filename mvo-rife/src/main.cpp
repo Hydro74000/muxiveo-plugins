@@ -1284,7 +1284,10 @@ static int run(const Options& o, const fs::path& exe_dir)
     // déclaré après les tampons qu'il utilise : détruit (donc attendu) avant eux
     std::future<bool> nvof_job;
 
-    if (!o.quiet)
+    if (!o.quiet && !needs_gpu)  // facteur 1 (Restauration seule, recopie) : aucun réseau d'interpolation chargé
+        fprintf(stderr, "info: %dx%d %d bits sous-échantillonnage %d:%d | %lld/%lld fps | sans interpolation\n",
+                fmt.width, fmt.height, fmt.bit_depth, fmt.sub_x, fmt.sub_y, (long long)fmt.fps_num, (long long)fmt.fps_den);
+    else if (!o.quiet)
     {
         fprintf(stderr,
                 "info: %dx%d %d bits sous-échantillonnage %d:%d | %lld/%lld -> %lld/%lld fps | modèle %s%s%s | GPU %s (%s)\n",
@@ -1293,8 +1296,7 @@ static int run(const Options& o, const fs::path& exe_dir)
                 (long long)out_fmt.fps_num, (long long)out_fmt.fps_den,
                 model_name.c_str(), o.uhd ? " (uhd)" : "",
                 o.tta > 1 ? (" (tta x" + std::to_string(o.tta) + ")").c_str() : "",
-                needs_gpu ? engine.device_name().c_str() : "-",
-                engine.uses_fp16() ? "fp16" : "fp32");
+                engine.device_name().c_str(), engine.uses_fp16() ? "fp16" : "fp32");
     }
 
     Y4mWriter writer(out);
