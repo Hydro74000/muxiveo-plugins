@@ -127,6 +127,7 @@ add_executable(muxiveo-rife
     src/restore_net.cpp
     src/restore_stage.cpp
     src/frame_stats.cpp
+    src/gpu_watchdog.cpp
     ${SHADER_HEADERS}
 )
 target_include_directories(muxiveo-rife PRIVATE ${CMAKE_CURRENT_BINARY_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/src)

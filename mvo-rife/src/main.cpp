@@ -39,6 +39,7 @@
 #endif
 
 #include "engine.h"
+#include "gpu_watchdog.h"
 #include "nvof.h"
 #include "cuda_driver.h"
 #include "trt_backend.h"
@@ -370,6 +371,7 @@ struct Options
     bool allow_interlaced = false;
     bool roundtrip = false;
     double progress_interval = 1.0;
+    int watchdog = 600;  // secondes sans progrès avant d'arrêter (0 : pas de détection de blocage)
     // Restauration (R2), étage avant l'interpolation
     std::string restore;                  // vide : désactivée | auto | leger | moyen | fort
     bool restore_animation = false;       // contenu animé (niveau auto : un cran vers fort)
@@ -434,6 +436,8 @@ static void print_usage(FILE* fp)
             "                          statistics) ; exige --transfer pq\n"
             "  --source-statistics <f> mêmes statistiques des trames lues, avant la Restauration ; exige --transfer pq\n"
             "  --progress-interval <s> intervalle des lignes de progression (défaut : 1)\n"
+            "  --watchdog <s>          arrêt (code 3) après <s> secondes sans aucune trame traitée, hors attente de l'entrée ou\n"
+            "                          de la sortie (défaut : 600 ; 0 : désactivé) ; perte du GPU toujours détectée\n"
             "  --quiet                 pas de ligne de progression\n"
             "  --verbose               affiche les diagnostics Vulkan de ncnn\n"
             "  --list-gpus             liste les GPU Vulkan (JSON, disponibilité du flux NVIDIA) et quitte\n"
@@ -547,6 +551,10 @@ static bool parse_args(const std::vector<std::string>& args, Options& o, std::st
         else if (a == "--scene-threshold")
         {
             if (!value(v) || !parse_double_option(a, v, 0.0, std::numeric_limits<double>::max(), o.scene_threshold, error)) return false;
+        }
+        else if (a == "--watchdog")
+        {
+            if (!value(v) || !parse_int_option(a, v, 0, 86400, o.watchdog, error)) return false;
         }
         else if (a == "--progress-interval")
         {
@@ -768,7 +776,7 @@ static int print_capabilities(const Options& o, const fs::path& exe_dir)
         "fp32", "feature-cache", "feature-cache-reserve", "tta", "engine", "trt-plugin", "trt-cache", "backend", "nvof", "large-motion", "selector",
         "selector-weights", "ultra", "padding", "threads", "allow-interlaced", "progress-interval", "quiet", "verbose",
         "list-gpus", "capabilities", "version", "restore", "restore-animation", "restore-fast", "restore-model",
-        "restore-dither", "transfer", "restore-tile", "frame-statistics", "source-statistics"};
+        "restore-dither", "transfer", "restore-tile", "frame-statistics", "source-statistics", "watchdog"};
     std::vector<std::string> models;
     std::error_code ec;
     for (fs::directory_iterator it(exe_dir / "rife-models", ec), end; !ec && it != end; it.increment(ec))
@@ -1387,6 +1395,12 @@ static int run(const Options& o, const fs::path& exe_dir)
         source_stats_queue.push(std::move(b));
         return !source_stats_failed;
     };
+    // garde-fou : perte du GPU, blocage, sortie forcée après une erreur fatale (voir gpu_watchdog.h)
+    watchdog::start(o.watchdog, EXIT_GPU);
+    if (needs_gpu)
+        watchdog::watch_device(engine.device());
+    if (restoring)
+        watchdog::watch_device(ncnn::get_gpu_device(o.gpu >= 0 ? o.gpu : ncnn::get_default_gpu_index()));
     std::thread reader_thread([&] {
         if (restoring)
         {
@@ -1422,7 +1436,9 @@ static int run(const Options& o, const fs::path& exe_dir)
             for (;;)
             {
                 std::string err;
+                watchdog::io_begin();
                 const int r = reader.read_frame(raw.data(), err);
+                watchdog::io_end();
                 if (r < 0)
                 {
                     read_error = err;
@@ -1435,6 +1451,8 @@ static int run(const Options& o, const fs::path& exe_dir)
                 {
                     read_error = restore_stage.error();
                     restore_failed = true;
+                    // fil GPU de l'étage possiblement bloqué dans le pilote : sortie forcée s'il ne rend pas la main
+                    watchdog::fatal(EXIT_GPU, nullptr);
                     break;
                 }
                 bool closed = false;
@@ -1455,7 +1473,9 @@ static int run(const Options& o, const fs::path& exe_dir)
         {
             FrameBuffer buf = pool.acquire();
             std::string err;
+            watchdog::io_begin();
             int r = reader.read_frame((uint8_t*)buf->data(), err);
+            watchdog::io_end();
             if (r <= 0)
             {
                 if (r < 0)
@@ -1493,7 +1513,10 @@ static int run(const Options& o, const fs::path& exe_dir)
                 write_failed = true;
                 write_queue.close();
             }
-            if (!write_failed && !writer.write_frame(data, frame_bytes))
+            watchdog::io_begin();
+            const bool written = write_failed || writer.write_frame(data, frame_bytes);
+            watchdog::io_end();
+            if (!written)
             {
                 write_failed = true;
                 write_queue.close();
@@ -1632,6 +1655,7 @@ static int run(const Options& o, const fs::path& exe_dir)
         if (write_failed || !(async_out ? copy_queue.push(OutTask{buf, slot, scene}) : write_queue.push(OutFrame{buf, scene})))
             return false;
         frames_out++;
+        watchdog::progress();
         return true;
     };
 
@@ -1651,6 +1675,7 @@ static int run(const Options& o, const fs::path& exe_dir)
             fprintf(stderr, "error: %s\n", err.c_str());
             exit_code = EXIT_GPU;
         }
+        watchdog::fatal(exit_code, nullptr);
     };
 
     const auto t_start = std::chrono::steady_clock::now();
@@ -1884,6 +1909,13 @@ static int run(const Options& o, const fs::path& exe_dir)
         fclose(in);
     if (out != stdout)
         fclose(out);
+    if (watchdog::failed())
+    {
+        // fils GPU possiblement bloqués : pas de destructeurs (attente sans fin), sortie immédiate
+        fflush(stderr);
+        std::_Exit(exit_code != EXIT_OK ? exit_code : EXIT_GPU);
+    }
+    watchdog::stop();
     return exit_code;
 }
 

@@ -1,6 +1,8 @@
 // Restauration (R2) : étage en flux (voir restore_stage.h).
 #include "restore_stage.h"
 
+#include "gpu_watchdog.h"
+
 #include <algorithm>
 #include <cmath>
 
@@ -58,6 +60,7 @@ void RestoreStage::run_item(const Item& it, Job& r)
     for (; net_low < it.u - 2; net_low++)  // trames dont le réseau n'a plus besoin
         net->drop_frame(net_low);
     r.ok = true;
+    watchdog::progress();
 }
 
 bool RestoreStage::init(RestoreNet* n, const FrameFormat& f, const ColorParams& c, const RestoreOptions& opt, std::string& error)
