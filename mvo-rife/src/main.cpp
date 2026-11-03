@@ -367,6 +367,7 @@ struct Options
     bool capabilities = false;
     bool version = false;
     bool quiet = false;
+    bool scene_marks = false;  // débuts de plan marqués dans les en-têtes de trame y4m (moteur aval)
     bool verbose = false;
     bool allow_interlaced = false;
     bool roundtrip = false;
@@ -439,6 +440,8 @@ static void print_usage(FILE* fp)
             "  --watchdog <s>          arrêt (code 3) après <s> secondes sans aucune trame traitée, hors attente de l'entrée ou\n"
             "                          de la sortie (défaut : 600 ; 0 : désactivé) ; perte du GPU toujours détectée\n"
             "  --quiet                 pas de ligne de progression\n"
+            "  --scene-marks           marque les débuts de plan dans les en-têtes de trame (« FRAME XMVOCUT ») pour un\n"
+            "                          moteur muxiveo-rife en aval (débruitage et interpolation dans deux processus)\n"
             "  --verbose               affiche les diagnostics Vulkan de ncnn\n"
             "  --list-gpus             liste les GPU Vulkan (JSON, disponibilité du flux NVIDIA) et quitte\n"
             "  --capabilities          capacités (JSON : contrat, options, modèles, sélecteur) et quitte\n"
@@ -609,6 +612,7 @@ static bool parse_args(const std::vector<std::string>& args, Options& o, std::st
         else if (a == "--allow-interlaced") o.allow_interlaced = true;
         else if (a == "--debug-roundtrip") o.roundtrip = true;
         else if (a == "--quiet") o.quiet = true;
+        else if (a == "--scene-marks") o.scene_marks = true;
         else if (a == "--verbose") o.verbose = true;
         else if (a == "--list-gpus") o.list_gpus = true;
         else if (a == "--capabilities") o.capabilities = true;
@@ -776,7 +780,7 @@ static int print_capabilities(const Options& o, const fs::path& exe_dir)
         "fp32", "feature-cache", "feature-cache-reserve", "tta", "engine", "trt-plugin", "trt-cache", "backend", "nvof", "large-motion", "selector",
         "selector-weights", "ultra", "padding", "threads", "allow-interlaced", "progress-interval", "quiet", "verbose",
         "list-gpus", "capabilities", "version", "restore", "restore-animation", "restore-fast", "restore-model",
-        "restore-dither", "transfer", "restore-tile", "frame-statistics", "source-statistics", "watchdog"};
+        "restore-dither", "transfer", "restore-tile", "frame-statistics", "source-statistics", "watchdog", "scene-marks"};
     std::vector<std::string> models;
     std::error_code ec;
     for (fs::directory_iterator it(exe_dir / "rife-models", ec), end; !ec && it != end; it.increment(ec))
@@ -1341,6 +1345,7 @@ static int run(const Options& o, const fs::path& exe_dir)
     }
 
     Y4mWriter writer(out);
+    writer.set_scene_marks(o.scene_marks);
     if (!writer.write_header(out_fmt, reader.passthrough_tokens()))
     {
         fprintf(stderr, "error: écriture de l'en-tête impossible\n");
@@ -1496,7 +1501,8 @@ static int run(const Options& o, const fs::path& exe_dir)
                     break;
                 memcpy(engine.input_slot(slot), buf->data(), fmt.padded_frame_bytes());
             }
-            if (!read_queue.push(InFrame{buf, slot}))
+            // débuts de plan d'un moteur amont (--scene-marks) : statistiques groupées par plan comme en un seul moteur
+            if (!read_queue.push(InFrame{buf, slot, reader.last_frame_cut()}))
                 break;
         }
         read_queue.close();
@@ -1514,7 +1520,7 @@ static int run(const Options& o, const fs::path& exe_dir)
                 write_queue.close();
             }
             watchdog::io_begin();
-            const bool written = write_failed || writer.write_frame(data, frame_bytes);
+            const bool written = write_failed || writer.write_frame(data, frame_bytes, frame.scene);
             watchdog::io_end();
             if (!written)
             {

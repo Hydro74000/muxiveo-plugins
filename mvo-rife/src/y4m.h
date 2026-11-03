@@ -73,12 +73,17 @@ public:
     // Jetons d'en-tête autres que W/H/F (réémis tels quels en sortie).
     const std::vector<std::string>& passthrough_tokens() const { return tokens; }
 
+    // Vrai si la dernière trame lue porte la marque de début de plan (paramètre de trame « XMVOCUT », écrit par un
+    // moteur amont avec --scene-marks : débruitage et interpolation dans deux processus enchaînés).
+    bool last_frame_cut() const { return frame_cut; }
+
 private:
     bool read_line(std::string& line, size_t max_len);
 
     FILE* fp;
     FrameFormat fmt;
     std::vector<std::string> tokens;
+    bool frame_cut = false;
 };
 
 class Y4mWriter
@@ -87,11 +92,14 @@ public:
     explicit Y4mWriter(FILE* fp);
 
     bool write_header(const FrameFormat& fmt, const std::vector<std::string>& passthrough_tokens);
-    bool write_frame(const uint8_t* data, size_t size);
+    // scene : la trame commence un plan ; marque écrite (« FRAME XMVOCUT ») seulement si set_scene_marks(true).
+    bool write_frame(const uint8_t* data, size_t size, bool scene = false);
     bool flush();
+    void set_scene_marks(bool on) { scene_marks = on; }
 
 private:
     FILE* fp;
+    bool scene_marks = false;
 };
 
 #endif // MUXIVEO_RIFE_Y4M_H

@@ -196,6 +196,11 @@ int Y4mReader::read_frame(uint8_t* dst, std::string& error)
         error = "marqueur FRAME attendu, reçu : " + line.substr(0, 32);
         return -1;
     }
+    // paramètres de trame : seule la marque de début de plan d'un moteur amont est lue, les autres sont ignorés
+    frame_cut = false;
+    for (size_t pos = line.find(' '); pos != std::string::npos; pos = line.find(' ', pos + 1))
+        if (line.compare(pos + 1, 7, "XMVOCUT") == 0 && (pos + 8 >= line.size() || line[pos + 8] == ' ' || line[pos + 8] == '\n'))
+            frame_cut = true;
 
     const size_t size = fmt.frame_bytes();
     size_t got = 0;
@@ -226,10 +231,16 @@ bool Y4mWriter::write_header(const FrameFormat& fmt, const std::vector<std::stri
     return fwrite(header.data(), 1, header.size(), fp) == header.size();
 }
 
-bool Y4mWriter::write_frame(const uint8_t* data, size_t size)
+bool Y4mWriter::write_frame(const uint8_t* data, size_t size, bool scene)
 {
     static const char marker[] = "FRAME\n";
-    if (fwrite(marker, 1, 6, fp) != 6)
+    static const char marked[] = "FRAME XMVOCUT\n";
+    if (scene_marks && scene)
+    {
+        if (fwrite(marked, 1, sizeof marked - 1, fp) != sizeof marked - 1)
+            return false;
+    }
+    else if (fwrite(marker, 1, 6, fp) != 6)
         return false;
     return fwrite(data, 1, size, fp) == size;
 }
