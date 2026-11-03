@@ -1357,12 +1357,34 @@ static int run(const Options& o, const fs::path& exe_dir)
     std::string stats_error;
     std::atomic<bool> source_stats_failed(false);
     std::string source_stats_error;
-    // trame lue mesurée (fil de lecture) ; data nul : fin du flux
+    // statistiques de la source mesurées dans un fil dédié, dans l'ordre (hors du chemin critique de la lecture et de
+    // l'étage de Restauration) ; trame recopiée dans un tampon de la réserve
+    BoundedQueue<FrameBuffer> source_stats_queue(4);
+    std::thread source_stats_thread;
+    if (measuring_source)
+        source_stats_thread = std::thread([&] {
+            FrameBuffer b;
+            while (source_stats_queue.pop(b))
+            {
+                if (!source_stats_failed && !source_stats.add((const uint8_t*)b->data(), false, source_stats_error))
+                    source_stats_failed = true;
+                b.reset();
+            }
+            if (!source_stats_failed && !source_stats.finish(source_stats_error))
+                source_stats_failed = true;
+        });
+    // trame lue confiée à la mesure (fil de lecture) ; data nul : fin du flux
     auto measure_source = [&](const uint8_t* data) -> bool {
         if (!measuring_source || source_stats_failed)
             return !source_stats_failed;
-        if (!(data ? source_stats.add(data, false, source_stats_error) : source_stats.finish(source_stats_error)))
-            source_stats_failed = true;
+        if (!data)
+        {
+            source_stats_queue.close();
+            return true;
+        }
+        FrameBuffer b = pool.acquire();
+        memcpy(b->data(), data, fmt.padded_frame_bytes());
+        source_stats_queue.push(std::move(b));
         return !source_stats_failed;
     };
     std::thread reader_thread([&] {
@@ -1800,6 +1822,9 @@ static int run(const Options& o, const fs::path& exe_dir)
     write_queue.close();
     reader_thread.join();
     writer_thread.join();
+    source_stats_queue.close();
+    if (source_stats_thread.joinable())
+        source_stats_thread.join();
 
     if (read_failed)
     {

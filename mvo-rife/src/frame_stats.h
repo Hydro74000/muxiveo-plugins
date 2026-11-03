@@ -47,6 +47,7 @@ private:
     ColorParams color;
     FILE* file = nullptr;
     std::vector<float> eotf, edges;
+    std::vector<uint16_t> ybin_start;  // case de départ de Y d'après les 16 bits de tête du flottant
     int64_t frame_index = 0, scene_first = -1, scene_frames = 0;
     std::array<uint64_t, BINS> scene_hist{};
 };

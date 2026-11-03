@@ -75,6 +75,19 @@ bool FrameStatsWriter::open(const std::string& path, const FrameFormat& f, const
     edges.resize(BINS + 1);
     for (int i = 0; i <= BINS; i++)
         edges[(size_t)i] = i < BINS ? eotf[(size_t)64 * i] : 10000.f;
+    // case de Y d'après les 16 bits de tête du flottant : plus grande borne ≤ plus petite valeur de ce préfixe ; la
+    // mesure avance ensuite case par case (0 à 2 pas), même résultat que la dichotomie sur les bornes
+    ybin_start.assign((size_t)1 << 15, 0);
+    int b = 0;
+    for (uint32_t key = 0; key < ((uint32_t)1 << 15); key++)
+    {
+        float lo_val;
+        const uint32_t bits = key << 16;
+        std::memcpy(&lo_val, &bits, 4);
+        while (b + 1 < BINS && edges[(size_t)b + 1] <= lo_val)
+            b++;
+        ybin_start[key] = (uint16_t)b;
+    }
     file = fopen(path.c_str(), "wb");
     if (!file)
     {
@@ -120,6 +133,7 @@ void FrameStatsWriter::measure(const uint8_t* frame, Frame& out) const
     const std::vector<Tap> ty = taps(h, ch, fmt.sub_y, cosited_y);
     const float* table = eotf.data();
     const float* bounds = edges.data();
+    const uint16_t* start = ybin_start.data();
     std::vector<float> sums((size_t)h);  // somme de maxRGB de chaque ligne
 
     out = Frame();
@@ -158,16 +172,12 @@ void FrameStatsWriter::measure(const uint8_t* frame, Frame& out) const
                 sum += table[m];
                 const float lum = 0.2627f * table[qr] + 0.678f * table[qg] + 0.0593f * table[qb];
                 le += lum <= 100.f;
-                // plus grande borne ≤ Y
-                uint32_t lo = 0, hi = BINS;
-                while (hi - lo > 1)
-                {
-                    const uint32_t mid = (lo + hi) >> 1;
-                    if (bounds[mid] <= lum)
-                        lo = mid;
-                    else
-                        hi = mid;
-                }
+                // plus grande borne ≤ Y (Y ≥ 0) : départ par les 16 bits de tête, puis case par case
+                uint32_t lbits;
+                std::memcpy(&lbits, &lum, 4);
+                uint32_t lo = lbits >> 16 < ((uint32_t)1 << 15) ? start[lbits >> 16] : (uint32_t)BINS - 1;
+                while (lo + 1 < (uint32_t)BINS && bounds[lo + 1] <= lum)
+                    lo++;
                 hy[lo]++;
             }
             sums[(size_t)y] = sum;
