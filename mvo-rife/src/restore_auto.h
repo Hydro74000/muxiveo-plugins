@@ -49,6 +49,10 @@ void grain_map(const uint16_t* y, int w, int h, std::ptrdiff_t stride, const Gra
 // σ robuste (1,4826 × MAD, au moins 1e-3) du passe-haut (x − gaussienne σ 1,2) de la luma du résidu source − sortie.
 float residual_sigma(const uint16_t* src_y, std::ptrdiff_t src_stride, const float* out_y, std::ptrdiff_t out_stride, int w, int h);
 
+// residual_sigma à partir des octets de la trame source (luma en tête, 1 ou 2 octets par échantillon, petit-boutiste) et
+// de la sortie du réseau en virgule fixe (luma = out_fx × inv_fx) : mêmes calculs flottants, sans copie intermédiaire.
+float residual_sigma_fx(const uint8_t* src, int bytes_per_sample, const uint16_t* out_fx, float inv_fx, int w, int h);
+
 // Coupes de plan en flux. push() une image après l'autre, finish() à la fin du flux ; decided() = dernière image dont
 // la coupe est décidée (une coupe en t est décidée dès que l'écart de t + look est connu, ou à la fin).
 class CutDetector
@@ -116,6 +120,11 @@ double auto_part(std::optional<double> ratio, double k);
 // multiples de 4, conversion exacte en aval).
 void dose(const uint16_t* src, const float* out, std::size_t n, double kk, uint16_t lo, uint16_t hi, uint16_t* dst,
           long long dither_frame = -1, std::size_t dither_offset = 0, int dither_step = 1);
+
+// dose() sur une trame entière (n échantillons) lue dans les octets de la source et la sortie en virgule fixe, écrite
+// dans les octets de la trame de sortie (même disposition, petit-boutiste) : mêmes calculs, sans copie intermédiaire.
+void dose_frame(const uint8_t* src, int bytes_per_sample, const uint16_t* out_fx, float inv_fx, std::size_t n, double kk,
+                uint16_t lo, uint16_t hi, uint8_t* dst, long long dither_frame, int dither_step);
 
 // Fils processeur des calculs par image (0 : selon le processeur ; résultats identiques quel que soit le nombre).
 void set_threads(int n);

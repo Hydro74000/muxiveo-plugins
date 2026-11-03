@@ -50,8 +50,9 @@ public:
     };
 
     // Image t : voisines nb[4] (déjà ajoutées), carte de grain (w × h octets, σ × 20). Sortie : codes Y'CbCr flottants
-    // [Y (w × h) | Cb (cw × ch) | Cr (cw × ch)] ; flux recadrés si `crop` et `flows` non nuls.
-    bool process(int64_t t, const int64_t nb[4], const uint8_t* grain_map, std::vector<float>& yuv, const Crop* crop,
+    // [Y (w × h) | Cb (cw × ch) | Cr (cw × ch)] dans le tampon rapatrié lui-même (yuv.w valeurs, aucune copie) ; flux
+    // recadrés si `crop` et `flows` non nuls.
+    bool process(int64_t t, const int64_t nb[4], const uint8_t* grain_map, ncnn::Mat& yuv, const Crop* crop,
                  std::vector<float>* flows, std::string& error);
 
     // Inférence par le plugin TensorRT (interface 2) : graphes <onnx_dir>/r2_flow.onnx et r2_body.onnx, moteurs en cache
@@ -91,7 +92,7 @@ private:
                                                        int th, int tcstep, int wx0, int wy0, int tpw, int tph) const;
     void crop_flows(const ncnn::Mat host_flows[4], const Crop& crop, std::vector<float>& flows) const;
     void copy_dense(ncnn::VkCompute& cmd, const ncnn::VkMat& src, int c, const ncnn::VkMat& dst);
-    bool process_trt(int64_t t, const int64_t nb[4], const uint8_t* grain_map, std::vector<float>& yuv, const Crop* crop,
+    bool process_trt(int64_t t, const int64_t nb[4], const uint8_t* grain_map, ncnn::Mat& yuv, const Crop* crop,
                      std::vector<float>* flows, std::string& error);
     void release();
 

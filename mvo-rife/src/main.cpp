@@ -1368,7 +1368,33 @@ static int run(const Options& o, const fs::path& exe_dir)
     std::thread reader_thread([&] {
         if (restoring)
         {
-            // trames lues -> étage de Restauration -> trames restaurées, dans l'ordre, vers le pipeline
+            // trames lues -> étage de Restauration -> trames restaurées, dans l'ordre, vers le pipeline ; la livraison
+            // (place dans l'anneau d'entrée, file de lecture) passe par un fil dédié : l'étage continue d'alimenter le
+            // réseau pendant que l'interpolation consomme
+            struct Restored
+            {
+                FrameBuffer buf;
+                bool cut = false;
+            };
+            BoundedQueue<Restored> restored_queue(4);
+            std::thread delivery_thread([&] {
+                Restored rf;
+                while (restored_queue.pop(rf))
+                {
+                    int slot = -1;
+                    if (async_in)
+                    {
+                        if (!free_in.pop(slot))
+                            break;
+                        memcpy(engine.input_slot(slot), rf.buf->data(), fmt.padded_frame_bytes());
+                    }
+                    if (!read_queue.push(InFrame{rf.buf, slot, rf.cut}))
+                        break;
+                    rf = Restored();
+                }
+                restored_queue.close();
+                read_queue.close();
+            });
             std::vector<uint8_t> raw(fmt.padded_frame_bytes()), restored;
             int restored_index = 0;
             for (;;)
@@ -1394,22 +1420,13 @@ static int run(const Options& o, const fs::path& exe_dir)
                 {
                     FrameBuffer buf = pool.acquire();
                     memcpy(buf->data(), restored.data(), fmt.padded_frame_bytes());
-                    int slot = -1;
-                    if (async_in)
-                    {
-                        if (!free_in.pop(slot))
-                        {
-                            closed = true;
-                            break;
-                        }
-                        memcpy(engine.input_slot(slot), buf->data(), fmt.padded_frame_bytes());
-                    }
-                    closed = !read_queue.push(InFrame{buf, slot, restore_stage.shot_starts_at(restored_index++)});
+                    closed = !restored_queue.push(Restored{buf, restore_stage.shot_starts_at(restored_index++)});
                 }
                 if (r == 0 || closed)
                     break;
             }
-            read_queue.close();
+            restored_queue.close();
+            delivery_thread.join();
             return;
         }
         for (;;)

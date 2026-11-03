@@ -392,7 +392,7 @@ void RestoreNet::crop_flows(const ncnn::Mat host_flows[4], const Crop& crop, std
     }
 }
 
-bool RestoreNet::process(int64_t t, const int64_t nb[4], const uint8_t* grain_map, std::vector<float>& yuv, const Crop* crop,
+bool RestoreNet::process(int64_t t, const int64_t nb[4], const uint8_t* grain_map, ncnn::Mat& yuv, const Crop* crop,
                          std::vector<float>* flows, std::string& error)
 {
     oom = false;
@@ -492,7 +492,7 @@ bool RestoreNet::process(int64_t t, const int64_t nb[4], const uint8_t* grain_ma
             cmd.record_clone(full[j], host_flows[j], opt);
     if (cmd.submit_and_wait() != 0)
         return fail("exécution GPU en échec");
-    yuv.assign((const float*)host_out.data, (const float*)host_out.data + host_out.w);
+    yuv = host_out;
     if (want_flows)
         crop_flows(host_flows, *crop, *flows);
     return true;
@@ -563,7 +563,7 @@ bool RestoreNet::enable_trt(const std::filesystem::path& plugin_dir, const std::
     return true;
 }
 
-bool RestoreNet::process_trt(int64_t t, const int64_t nb[4], const uint8_t* grain_map, std::vector<float>& yuv, const Crop* crop,
+bool RestoreNet::process_trt(int64_t t, const int64_t nb[4], const uint8_t* grain_map, ncnn::Mat& yuv, const Crop* crop,
                              std::vector<float>* flows, std::string& error)
 {
     // TensorRT (plugin mvo-rife-trt, interface 2) : graphes exécutés dans des tampons partagés Vulkan / CUDA, chaque
@@ -626,7 +626,7 @@ bool RestoreNet::process_trt(int64_t t, const int64_t nb[4], const uint8_t* grai
             cmd->record_clone(full[j], host_flows[j], opt);
     if (cmd->submit_and_wait() != 0)
         return fail("exécution GPU en échec");
-    yuv.assign((const float*)host_out.data, (const float*)host_out.data + host_out.w);
+    yuv = host_out;
     if (want_flows)
         crop_flows(host_flows, *crop, *flows);
     return true;

@@ -8,18 +8,21 @@
 // formule bornée, biais selon la largeur) → dosage de t (égalisation sur [t − dose_look, t + dose_look] ∩ plan, un seul
 // arrondi, tramage). Trames de sortie au format d'entrée, dans l'ordre.
 //
-// Recouvrement : le travail GPU d'une image (envoi, réseau, rapatriement, σ du résidu) tourne dans un fil dédié, un seul
-// à la fois, pendant que l'étage prépare la carte de grain suivante et dose les images précédentes ; seul ce fil
-// utilise le réseau. Sorties du réseau gardées en virgule fixe 16 bits (2^(16 − profondeur) pas par code).
+// Recouvrement : le travail GPU des images (envoi, réseau, rapatriement) tourne dans un fil GPU persistant, alimenté par
+// une file de deux images d'avance ; seul ce fil utilise le réseau. Pendant ce temps, l'étage prépare les cartes de grain,
+// convertit les résultats, calcule le σ du résidu et dose (calculs processeur sur une réserve de fils commune). Sorties
+// du réseau gardées en virgule fixe 16 bits (2^(16 − profondeur) pas par code).
 #pragma once
 #include <array>
+#include <condition_variable>
 #include <cstdint>
 #include <deque>
 #include <memory>
-#include <future>
 #include <map>
+#include <mutex>
 #include <optional>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "restore_auto.h"
@@ -63,18 +66,32 @@ public:
     bool shot_starts_at(int t) const { return shot_start(t) == t; }
 
 private:
+    // Image confiée au fil GPU : voisines, trames tenues par l'étage jusqu'à la collecte du résultat, carte de grain.
+    struct Item
+    {
+        int u = 0;
+        std::array<int64_t, 4> nb{};
+        std::vector<std::pair<int64_t, const uint8_t*>> inputs;
+        std::shared_ptr<std::vector<uint8_t>> map;
+        bool want = false;
+    };
+    // Résultat brut du fil GPU.
     struct Job
     {
+        int u = -1;
+        bool want = false;
         bool ok = false;
         std::string error;
-        std::vector<uint16_t> out;  // virgule fixe
+        ncnn::Mat yuv;  // codes Y'CbCr flottants rapatriés
         std::vector<float> flows;
         int tile = 0;
     };
     bool pump(bool block);
     bool prepare();
     bool launch();
-    bool collect();
+    int collect(bool block);  // 1 : résultat collecté ; 0 : aucun ; −1 : erreur
+    void gpu_worker();
+    void run_item(const Item& it, Job& r);
     bool emit();
     bool shot_curve(int s);
     bool shot_ratio(int s);
@@ -83,7 +100,8 @@ private:
     bool same_shot(int t, int u) const;
     int neighbour(int t, int d) const;
     std::vector<uint16_t> luma10(const std::vector<uint8_t>& frame) const;
-    void samples(const uint8_t* frame, std::vector<uint16_t>& out) const;
+    // Tampon de trame (padded_frame_bytes) : recyclé, marge de fin à zéro, ou neuf.
+    std::vector<uint8_t> take_buffer(std::vector<std::vector<uint8_t>>& spare) const;
     void release();
 
     RestoreNet* net = nullptr;
@@ -101,12 +119,18 @@ private:
     int cuts_scanned = 0;
     std::optional<int> n_total;
     int n_in = 0, next_net = 0, done_net = 0, next_out = 0;
-    std::future<Job> job;
-    int job_u = -1;
+    static constexpr int MAX_IN_FLIGHT = 2;  // images confiées au fil GPU au plus (une en calcul, une prête)
+    std::thread worker;
+    std::mutex wm;
+    std::condition_variable wcv;
+    std::deque<Item> todo;
+    std::deque<Job> results;
+    bool worker_stop = false;
+    int in_flight = 0;     // images confiées au fil GPU dont le résultat n'est pas collecté
+    int next_collect = 0;  // prochaine image attendue du fil GPU
     int pending_sig = -1;  // image collectée dont le σ du résidu reste à calculer
     int prepared_u = -1;   // image dont la carte de grain est prête (prepared_map)
     std::shared_ptr<std::vector<uint8_t>> prepared_map;
-    bool job_want = false;
     int64_t net_low = 0;  // trames déjà retirées du cache du réseau (fil GPU seulement)
     std::map<int64_t, std::vector<uint8_t>> src;
     std::map<int64_t, std::vector<uint16_t>> out;
@@ -116,6 +140,7 @@ private:
     std::map<int, std::optional<double>> ratios;
     std::optional<double> last_ratio;
     std::deque<std::vector<uint8_t>> ready;
+    std::vector<std::vector<uint8_t>> spare_src, spare_out;  // tampons de trame recyclés
     std::map<int64_t, Log> logs;
     size_t held_max = 0;
     std::string err;
