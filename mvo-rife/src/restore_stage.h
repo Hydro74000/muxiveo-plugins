@@ -82,7 +82,7 @@ private:
         bool want = false;
         bool ok = false;
         std::string error;
-        ncnn::Mat yuv;  // codes Y'CbCr flottants rapatriés
+        ncnn::Mat yuv;  // codes Y'CbCr en virgule fixe 16 bits, rapatriés
         std::vector<float> flows;
         int tile = 0;
     };
@@ -133,7 +133,7 @@ private:
     std::shared_ptr<std::vector<uint8_t>> prepared_map;
     int64_t net_low = 0;  // trames déjà retirées du cache du réseau (fil GPU seulement)
     std::map<int64_t, std::vector<uint8_t>> src;
-    std::map<int64_t, std::vector<uint16_t>> out;
+    std::map<int64_t, ncnn::Mat> out;  // sorties du réseau en virgule fixe 16 bits (tampons rapatriés)
     std::map<int64_t, float> sig;
     std::map<int, restore_auto::GrainCurve> curves;
     std::map<int64_t, std::vector<float>> ana_luma, ana_flows;

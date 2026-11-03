@@ -49,9 +49,10 @@ public:
         int x0 = 0, y0 = 0, w = 0, h = 0;
     };
 
-    // Image t : voisines nb[4] (déjà ajoutées), carte de grain (w × h octets, σ × 20). Sortie : codes Y'CbCr flottants
-    // [Y (w × h) | Cb (cw × ch) | Cr (cw × ch)] dans le tampon rapatrié lui-même (yuv.w valeurs, aucune copie) ; flux
-    // recadrés si `crop` et `flows` non nuls.
+    // Image t : voisines nb[4] (déjà ajoutées), carte de grain (w × h octets, σ × 20). Sortie : codes Y'CbCr
+    // [Y (w × h) | Cb (cw × ch) | Cr (cw × ch)] en virgule fixe 16 bits (code × fixed_scale(), arrondi pair, converti sur
+    // le GPU), deux valeurs par mot de 32 bits, dans le tampon rapatrié lui-même ; flux recadrés si `crop` et `flows`
+    // non nuls.
     bool process(int64_t t, const int64_t nb[4], const uint8_t* grain_map, ncnn::Mat& yuv, const Crop* crop,
                  std::vector<float>* flows, std::string& error);
 
@@ -67,6 +68,7 @@ public:
     int tile_size() const { return tile; }
     void set_tile(int size) { tile = std::max(64, size / 4 * 4); }
 
+    float fixed_scale() const { return fx_scale; }  // pas de la virgule fixe par code : 2^(16 − profondeur)
     int padded_width() const { return W; }
     int padded_height() const { return H; }
     int flow_width() const { return ws; }
@@ -88,6 +90,7 @@ private:
                         std::string& error);
     bool assemble(ncnn::VkCompute& cmd, const ncnn::VkMat& rgb, const ncnn::VkMat warped[4], const uint8_t* grain_map, ncnn::VkMat& x);
     bool to_yuv(ncnn::VkCompute& cmd, const ncnn::VkMat& acc, const ncnn::VkMat& wsum, ncnn::VkMat& out);
+    bool to_fixed16(ncnn::VkCompute& cmd, const ncnn::VkMat& yuv, ncnn::VkMat& packed);
     std::vector<ncnn::vk_constant_type> tile_constants(int mode, const ncnn::VkMat& x, const ncnn::VkMat& acc, int c, int x0, int y0, int tw,
                                                        int th, int tcstep, int wx0, int wy0, int tpw, int tph) const;
     void crop_flows(const ncnn::Mat host_flows[4], const Crop& crop, std::vector<float>& flows) const;
@@ -109,6 +112,7 @@ private:
     ncnn::Pipeline* p_tile = nullptr;
     ncnn::Pipeline* p_rgb_to_yuv = nullptr;
     ncnn::Pipeline* p_copy = nullptr;
+    ncnn::Pipeline* p_fixed16 = nullptr;
     std::unique_ptr<TrtBackend> trt_flow, trt_body;
     bool trt_on = false;
     std::string trt_summary;
@@ -116,6 +120,7 @@ private:
     FrameFormat fmt;
     ColorParams color;
     float pq = 0.f;
+    float fx_scale = 64.f;
     int tile = 512;
     int W = 0, H = 0;    // image avec marge
     int ws = 0, hs = 0;  // définition du flux

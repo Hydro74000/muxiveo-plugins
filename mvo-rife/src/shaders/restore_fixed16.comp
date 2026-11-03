@@ -1,0 +1,23 @@
+// Restauration (R2) : codes Y'CbCr flottants -> virgule fixe 16 bits (arrondi pair, bornée à [0, 65535]), deux valeurs
+// par mot de 32 bits (petit-boutiste) : rapatriement deux fois plus léger, même résultat que la conversion processeur
+// (multiplication exacte par une puissance de deux, puis arrondi au plus proche pair).
+#version 450
+layout (binding = 0) readonly buffer src_blob { float src_data[]; };
+layout (binding = 1) writeonly buffer dst_blob { uint dst_data[]; };
+layout (push_constant) uniform parameter { int n; float scale; } p;
+
+uint fixed16(int i)
+{
+    if (i >= p.n)
+        return 0u;
+    precise float v = src_data[i] * p.scale;
+    return uint(clamp(roundEven(v), 0.0, 65535.0));
+}
+
+void main()
+{
+    int g = int(gl_GlobalInvocationID.x);
+    if (2 * g >= p.n || int(gl_GlobalInvocationID.y) >= 1 || int(gl_GlobalInvocationID.z) >= 1)
+        return;
+    dst_data[g] = fixed16(2 * g) | (fixed16(2 * g + 1) << 16);
+}

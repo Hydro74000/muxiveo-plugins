@@ -282,16 +282,9 @@ int RestoreStage::collect(bool block)
         return -1;
     }
     tile = r.tile;
-    // virgule fixe ; σ du résidu ensuite, dans ce fil, pendant que le fil GPU calcule les images suivantes
-    const float* yuv = (const float*)r.yuv.data;
-    const size_t n = (size_t)r.yuv.w;
-    std::vector<uint16_t> fx(n);
-    const float hi_fx = 65535.f;
-    detail::for_rows((int)((n + 65535) / 65536), [&](int b0, int b1) {
-        for (size_t i = (size_t)b0 * 65536; i < std::min(n, (size_t)b1 * 65536); i++)
-            fx[i] = (uint16_t)std::clamp(std::nearbyint(yuv[i] * fx_scale), 0.f, hi_fx);
-    });
-    out[r.u] = std::move(fx);
+    // sortie déjà en virgule fixe (convertie sur le GPU) ; σ du résidu ensuite, dans ce fil, pendant que le fil GPU
+    // calcule les images suivantes
+    out[r.u] = r.yuv;
     pending_sig = r.u;
     if (r.want)
         ana_flows[r.u] = std::move(r.flows);
@@ -360,7 +353,7 @@ bool RestoreStage::emit()
     const double part = auto_part(r, k);
     const double kk = part * eq;
     std::vector<uint8_t> frame = take_buffer(spare_out);
-    dose_frame(src.at(t).data(), fmt.bytes_per_sample, out.at(t).data(), 1.f / fx_scale, (size_t)fmt.total_samples(), kk, lo, hi,
+    dose_frame(src.at(t).data(), fmt.bytes_per_sample, (const uint16_t*)out.at(t).data, 1.f / fx_scale, (size_t)fmt.total_samples(), kk, lo, hi,
                frame.data(), o.dither_step > 0 ? t : -1, std::max(1, o.dither_step));
     ready.push_back(std::move(frame));
     logs[t] = Log{r, part, kk};
@@ -404,7 +397,7 @@ bool RestoreStage::pump(bool block)
             progressed = true;
         if (pending_sig >= 0)
         {
-            sig[pending_sig] = residual_sigma_fx(src.at(pending_sig).data(), fmt.bytes_per_sample, out.at(pending_sig).data(),
+            sig[pending_sig] = residual_sigma_fx(src.at(pending_sig).data(), fmt.bytes_per_sample, (const uint16_t*)out.at(pending_sig).data,
                                                  1.f / fx_scale, fmt.width, fmt.height);
             done_net = pending_sig + 1;
             pending_sig = -1;

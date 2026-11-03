@@ -12,6 +12,7 @@
 
 #include "restore_assemble.comp.hex.h"
 #include "restore_copy.comp.hex.h"
+#include "restore_fixed16.comp.hex.h"
 #include "restore_luma_area.comp.hex.h"
 #include "restore_resize.comp.hex.h"
 #include "restore_rgb_to_yuv_aa.comp.hex.h"
@@ -98,7 +99,7 @@ void RestoreNet::release()
     trt_flow.reset();
     trt_body.reset();
     trt_on = false;
-    for (ncnn::Pipeline** p : {&p_yuv_to_rgb, &p_luma_area, &p_resize, &p_assemble, &p_tile, &p_rgb_to_yuv, &p_copy})
+    for (ncnn::Pipeline** p : {&p_yuv_to_rgb, &p_luma_area, &p_resize, &p_assemble, &p_tile, &p_rgb_to_yuv, &p_copy, &p_fixed16})
     {
         delete *p;
         *p = nullptr;
@@ -162,7 +163,8 @@ bool RestoreNet::init(ncnn::VulkanDevice* dev, const ncnn::Option& base, const s
     p_tile = make_pipeline(restore_tile_comp_data, sizeof(restore_tile_comp_data), 8, 8, 1);
     p_rgb_to_yuv = make_pipeline(restore_rgb_to_yuv_aa_comp_data, sizeof(restore_rgb_to_yuv_aa_comp_data), 8, 8, 1);
     p_copy = make_pipeline(restore_copy_comp_data, sizeof(restore_copy_comp_data), 8, 8, 1);
-    if (!p_yuv_to_rgb || !p_luma_area || !p_resize || !p_assemble || !p_tile || !p_rgb_to_yuv || !p_copy)
+    p_fixed16 = make_pipeline(restore_fixed16_comp_data, sizeof(restore_fixed16_comp_data), 256, 1, 1);
+    if (!p_yuv_to_rgb || !p_luma_area || !p_resize || !p_assemble || !p_tile || !p_rgb_to_yuv || !p_copy || !p_fixed16)
     {
         error = "compilation des shaders de restauration impossible";
         return false;
@@ -172,6 +174,7 @@ bool RestoreNet::init(ncnn::VulkanDevice* dev, const ncnn::Option& base, const s
 
 bool RestoreNet::configure(const FrameFormat& f, const ColorParams& c, bool pq_transfer, int tile_size, std::string& error)
 {
+    fx_scale = (float)(1 << (16 - f.bit_depth));
     fmt = f;
     color = c;
     pq = pq_transfer ? 1.f : 0.f;
@@ -333,6 +336,19 @@ std::vector<ncnn::vk_constant_type> RestoreNet::tile_constants(int mode, const n
     return k;
 }
 
+bool RestoreNet::to_fixed16(ncnn::VkCompute& cmd, const ncnn::VkMat& yuv, ncnn::VkMat& packed)
+{
+    const int n = yuv.w;
+    packed.create((n + 1) / 2, (size_t)4u, 1, blob_alloc);
+    if (packed.empty())
+        return false;
+    std::vector<ncnn::vk_constant_type> k(2);
+    k[0].i = n;
+    k[1].f = fx_scale;
+    cmd.record_pipeline(p_fixed16, {yuv, packed}, k, dispatch_of((n + 1) / 2, 1, 1));
+    return true;
+}
+
 bool RestoreNet::to_yuv(ncnn::VkCompute& cmd, const ncnn::VkMat& acc, const ncnn::VkMat& wsum, ncnn::VkMat& out)
 {
     const int cw = fmt.chroma_width(), ch = fmt.chroma_height();
@@ -481,11 +497,11 @@ bool RestoreNet::process(int64_t t, const int64_t nb[4], const uint8_t* grain_ma
         }
 
     // codes Y'CbCr flottants (sous-échantillonnage chroma antirepliement) ; copies brutes, flux fp16 convertis ensuite
-    ncnn::VkMat out;
-    if (!to_yuv(cmd, acc, wsum, out))
+    ncnn::VkMat out, packed;
+    if (!to_yuv(cmd, acc, wsum, out) || !to_fixed16(cmd, out, packed))
         return fail_oom();
     ncnn::Mat host_out, host_flows[4];
-    cmd.record_clone(out, host_out, opt);
+    cmd.record_clone(packed, host_out, opt);
     const bool want_flows = crop && flows;
     if (want_flows)
         for (int j = 0; j < 4; j++)
@@ -615,11 +631,11 @@ bool RestoreNet::process_trt(int64_t t, const int64_t nb[4], const uint8_t* grai
     const ncnn::VkMat& o = trt_body->output();
     cmd->record_pipeline(p_tile, {o, dummy, acc, wsum}, tile_constants(3, x, acc, 3, 0, 0, W, H, o.w * o.h, 0, 0, o.w, o.h),
                          dispatch_of(W, H, 1));
-    ncnn::VkMat out;
-    if (!to_yuv(*cmd, acc, wsum, out))
+    ncnn::VkMat out, packed;
+    if (!to_yuv(*cmd, acc, wsum, out) || !to_fixed16(*cmd, out, packed))
         return fail_oom();
     ncnn::Mat host_out, host_flows[4];
-    cmd->record_clone(out, host_out, opt);
+    cmd->record_clone(packed, host_out, opt);
     const bool want_flows = crop && flows;
     if (want_flows)
         for (int j = 0; j < 4; j++)
