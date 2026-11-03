@@ -175,7 +175,7 @@ void FrameStatsWriter::measure(const uint8_t* frame, Frame& out) const
                 // plus grande borne ≤ Y (Y ≥ 0) : départ par les 16 bits de tête, puis case par case
                 uint32_t lbits;
                 std::memcpy(&lbits, &lum, 4);
-                uint32_t lo = lbits >> 16 < ((uint32_t)1 << 15) ? start[lbits >> 16] : (uint32_t)BINS - 1;
+                uint32_t lo = lbits >> 31 ? 0u : start[lbits >> 16];  // Y négatif impossible (table ≥ 0) : case 0 comme la dichotomie
                 while (lo + 1 < (uint32_t)BINS && bounds[lo + 1] <= lum)
                     lo++;
                 hy[lo]++;

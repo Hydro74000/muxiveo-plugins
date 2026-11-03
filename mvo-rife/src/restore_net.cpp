@@ -452,6 +452,8 @@ bool RestoreNet::process(int64_t t, const int64_t nb[4], const uint8_t* grain_ma
             vkdev->convert_packing(f, f_pack1, 1, cmd, opt);
         else
             f_pack1 = f;
+        if (f_pack1.empty())  // allocation refusée : jamais de tampon vide lié à un shader
+            return fail_oom();
         if (!warp_from_flow(cmd, f_pack1, cn.rgb, full[j], warped[j], error))
             return oom ? false : fail("recalage en échec");
     }
@@ -491,6 +493,8 @@ bool RestoreNet::process(int64_t t, const int64_t nb[4], const uint8_t* grain_ma
                 vkdev->convert_packing(tout, tout1, 1, cmd, opt);
             else
                 tout1 = tout;
+            if (tout1.empty())
+                return fail_oom();
             cmd.record_pipeline(p_tile, {tout1, dummy, acc, wsum},
                                 tile_constants(1, x, acc, 3, xa, ya, tw, th, (int)tout1.cstep, xa - (tx - PAD), ya - (ty - PAD), tpw, tph),
                                 dispatch_of(tw, th, 1));
@@ -527,13 +531,19 @@ bool RestoreNet::warp_from_flow(ncnn::VkCompute& cmd, const ncnn::VkMat& f, cons
     }
     std::vector<ncnn::VkMat> bottoms = {rgb, full};
     std::vector<ncnn::VkMat> tops(1);
-    if (warp->forward(bottoms, tops, cmd, opt) != 0)
-        return false;
-    if (tops[0].elempack != 1)
+    const int r = warp->forward(bottoms, tops, cmd, opt);
+    if (r == 0 && tops[0].elempack != 1)
         vkdev->convert_packing(tops[0], warped, 1, cmd, opt);
-    else
+    else if (r == 0)
         warped = tops[0];
-    return true;
+    // allocation refusée (-100 de la couche, ou tampon vide après conversion) : repli sur des tuiles plus petites
+    if (r == -100 || (r == 0 && warped.empty()))
+    {
+        oom = true;
+        error = "restauration : mémoire GPU insuffisante";
+        return false;
+    }
+    return r == 0;
 }
 
 void RestoreNet::copy_dense(ncnn::VkCompute& cmd, const ncnn::VkMat& src, int c, const ncnn::VkMat& dst)
