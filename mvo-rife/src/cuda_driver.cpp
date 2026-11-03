@@ -97,6 +97,8 @@ CudaDriver::CudaDriver()
     LOAD(cuDestroyExternalMemory, "cuDestroyExternalMemory");
     LOAD(cuMemFree, "cuMemFree_v2");
 #undef LOAD
+    // attente bloquante des synchronisations (au lieu d'une boucle active qui occupe un cœur par fil en attente)
+    cuDevicePrimaryCtxSetFlags = (decltype(cuDevicePrimaryCtxSetFlags))find_sym(lib, "cuDevicePrimaryCtxSetFlags_v2");
     if (!all)
     {
         load_error = "pilote NVIDIA trop ancien (fonctions CUDA manquantes)";
@@ -141,7 +143,13 @@ std::vector<CudaDeviceInfo> CudaDriver::devices() const
 bool CudaDriver::retain_primary(int ordinal, CUcontext& ctx) const
 {
     CUdevice dev;
-    return loaded && cuDeviceGet(&dev, ordinal) == 0 && cuDevicePrimaryCtxRetain(&ctx, dev) == 0;
+    if (!loaded || cuDeviceGet(&dev, ordinal) != 0)
+        return false;
+    // synchronisations bloquantes (CU_CTX_SCHED_BLOCKING_SYNC) : un fil qui attend TensorRT rend son cœur au processeur
+    // (encodeur logiciel en aval) ; sans effet sur les calculs ; refus éventuel du pilote ignoré
+    if (cuDevicePrimaryCtxSetFlags)
+        cuDevicePrimaryCtxSetFlags(dev, 0x04);
+    return cuDevicePrimaryCtxRetain(&ctx, dev) == 0;
 }
 
 void CudaDriver::release_primary(int ordinal) const

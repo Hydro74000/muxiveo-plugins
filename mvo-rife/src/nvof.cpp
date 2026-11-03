@@ -269,7 +269,7 @@ bool NvofFlow::init(int width, int height, const std::string& device_name, int r
         error = "GPU Vulkan « " + device_name + " » introuvable côté CUDA";
         return false;
     }
-    if (d->cuCtxCreate(&d->ctx, 0, chosen) != 0)
+    if (d->cuCtxCreate(&d->ctx, 0x04 /* CU_CTX_SCHED_BLOCKING_SYNC : attente sans boucle active */, chosen) != 0)
     {
         error = "création du contexte CUDA impossible";
         return false;

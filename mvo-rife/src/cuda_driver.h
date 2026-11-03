@@ -62,6 +62,7 @@ private:
     CUresult (*cuDeviceGetAttribute)(int*, int, CUdevice) = nullptr;
     CUresult (*cuDevicePrimaryCtxRetain)(CUcontext*, CUdevice) = nullptr;
     CUresult (*cuDevicePrimaryCtxRelease)(CUdevice) = nullptr;
+    CUresult (*cuDevicePrimaryCtxSetFlags)(CUdevice, unsigned) = nullptr;  // facultative
     CUresult (*cuCtxPushCurrent)(CUcontext) = nullptr;
     CUresult (*cuCtxPopCurrent)(CUcontext*) = nullptr;
     CUresult (*cuImportExternalMemory)(CUexternalMemory*, const void*) = nullptr;
