@@ -1,19 +1,45 @@
-# Muxiveo — correctif ncnn (idempotent) : active VK_KHR_external_memory_fd / _win32 quand le GPU les propose,
-# pour partager des tampons Vulkan avec CUDA (plugin TensorRT de muxiveo-rife). Aucun effet sans plugin.
+# Muxiveo — correctifs ncnn (idempotents) :
+# - active VK_KHR_external_memory_fd / _win32 quand le GPU les propose, pour partager des tampons Vulkan avec CUDA
+#   (plugin TensorRT de muxiveo-rife) ; aucun effet sans plugin ;
+# - sérialise l'exécution des lots de commandes entre les fils d'un même processus (VkCompute::submit_and_wait) :
+#   deux files de calcul d'un même périphérique exécutées en même temps (interpolation hybride et débruitage MVO-R2,
+#   chacun dans son fil) font perdre le périphérique sur les GPU NVIDIA (Xid 13 « dependence counter underflow »,
+#   VK_ERROR_DEVICE_LOST) ; exécution sérialisée : aucune perte, sans coût mesuré (bancs du 2026-11-04).
 function(muxiveo_patch_ncnn ncnn_dir)
     set(target "${ncnn_dir}/src/gpu.cpp")
     file(READ "${target}" content)
     string(FIND "${content}" "MUXIVEO_EXTERNAL_MEMORY_EXPORT" marker)
-    if(marker GREATER -1)
-        return()
+    if(marker EQUAL -1)
+        set(anchor "        enabledExtensions.push_back(\"VK_KHR_external_memory\");\n")
+        string(FIND "${content}" "${anchor}" position)
+        if(position EQUAL -1)
+            message(FATAL_ERROR "Correctif ncnn : ancre VK_KHR_external_memory introuvable dans ${target} (ncnn modifié ?)")
+        endif()
+        file(READ "${CMAKE_CURRENT_LIST_DIR}/cmake/ncnn_external_memory.inc" addition)
+        string(REPLACE "${anchor}" "${anchor}${addition}" content "${content}")
+        file(WRITE "${target}" "${content}")
+        message(STATUS "ncnn : export de mémoire Vulkan activé (correctif muxiveo-rife)")
     endif()
-    set(anchor "        enabledExtensions.push_back(\"VK_KHR_external_memory\");\n")
-    string(FIND "${content}" "${anchor}" position)
-    if(position EQUAL -1)
-        message(FATAL_ERROR "Correctif ncnn : ancre VK_KHR_external_memory introuvable dans ${target} (ncnn modifié ?)")
+
+    set(target "${ncnn_dir}/src/command.cpp")
+    file(READ "${target}" content)
+    string(FIND "${content}" "MUXIVEO_GPU_EXECUTION_SERIAL" marker)
+    if(marker EQUAL -1)
+        set(include_anchor "#include \"command.h\"\n")
+        set(lock_anchor "    // acquire queue and reclaim on return\n    VkQueue compute_queue = vkdev->acquire_queue(vkdev->info.compute_queue_family_index());\n")
+        set(unlock_anchor "    // handle delayed post records\n")
+        foreach(anchor IN ITEMS "${include_anchor}" "${lock_anchor}" "${unlock_anchor}")
+            string(FIND "${content}" "${anchor}" first)
+            string(FIND "${content}" "${anchor}" last REVERSE)
+            if(first EQUAL -1 OR NOT first EQUAL last)
+                message(FATAL_ERROR "Correctif ncnn : ancre absente ou ambiguë dans ${target} (ncnn modifié ?) : ${anchor}")
+            endif()
+        endforeach()
+        file(READ "${CMAKE_CURRENT_LIST_DIR}/cmake/ncnn_gpu_execution_lock.inc" lock)
+        string(REPLACE "${include_anchor}" "${include_anchor}\n#include <mutex>\n" content "${content}")
+        string(REPLACE "${lock_anchor}" "${lock}${lock_anchor}" content "${content}")
+        string(REPLACE "${unlock_anchor}" "    muxiveo_gpu_lock.unlock();\n\n${unlock_anchor}" content "${content}")
+        file(WRITE "${target}" "${content}")
+        message(STATUS "ncnn : exécution GPU sérialisée entre fils (correctif muxiveo-rife)")
     endif()
-    file(READ "${CMAKE_CURRENT_LIST_DIR}/cmake/ncnn_external_memory.inc" addition)
-    string(REPLACE "${anchor}" "${anchor}${addition}" content "${content}")
-    file(WRITE "${target}" "${content}")
-    message(STATUS "ncnn : export de mémoire Vulkan activé (correctif muxiveo-rife)")
 endfunction()
