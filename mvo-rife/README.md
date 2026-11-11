@@ -38,6 +38,8 @@ Première version publiée avec le débruitage (la 1.12.0, interne, n'a pas ét�
   ce qui supprime une perte du périphérique NVIDIA ; `--watchdog` (perte du GPU détectée, blocage, sortie code 3
   au lieu d'une attente sans fin) ; `--scene-marks` (débuts de plan transmis à un moteur en aval).
 - Interpolation sans `--restore` : calculs inchangés depuis la 1.11.0.
+- macOS en machine virtuelle (GPU Metal paravirtuel) : périphérique écarté de `--list-gpus` et refusé proprement
+  (code 3) au lieu d'un plantage de MoltenVK.
 
 ## Nouveautés 1.11.0
 
