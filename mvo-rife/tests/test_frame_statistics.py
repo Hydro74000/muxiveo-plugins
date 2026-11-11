@@ -85,6 +85,9 @@ def test_source_statistics_measure_the_frames_read(tmp_path):
     r = _run(_y4m([100, 600, 900, 300]), produced, "--transfer", "pq", "--source-statistics", str(source))
     assert r.returncode == 0, r.stderr.decode()
     assert source.read_text() == produced.read_text()  # recopie : trames lues = trames produites
+    gpus = subprocess.run([RIFE_BIN, "--list-gpus"], capture_output=True, text=True, timeout=60)
+    if gpus.returncode != 0 or not json.loads(gpus.stdout or "{}").get("gpus"):
+        pytest.skip("interpolation : aucun périphérique Vulkan utilisable")
     r = _run(_y4m([512]), produced, "--transfer", "pq", "--factor", "2", "--source-statistics", str(source))
     assert r.returncode == 0 and len([line for line in source.read_text().splitlines() if '"frame"' in line]) == 1
 
