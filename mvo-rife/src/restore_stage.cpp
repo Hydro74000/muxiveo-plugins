@@ -354,7 +354,10 @@ bool RestoreStage::emit()
         window.push_back(sig.at(u));
     const double eq = detail::percentile(window, 50.0) / sig.at(t);  // égalisation sur le plan
     const double part = auto_part(r, k);
-    const double kk = part * eq;
+    // part réinjectée plafonnée à 1 : la sortie reste entre l'image débruitée et la source. Sans plafond, une image dont le
+    // résidu est bien plus faible que celui du plan (σ 0,08 face à 0,48 : fin d'un plan, image presque propre) recevait
+    // 6,8 fois l'écart source − sortie : points saturés (10 000 nits en PQ), MaxCLL mesuré faussé (2026-11-11)
+    const double kk = std::min(1.0, part * eq);
     std::vector<uint8_t> frame = take_buffer(spare_out);
     dose_frame(src.at(t).data(), fmt.bytes_per_sample, (const uint16_t*)out.at(t).data, 1.f / fx_scale, (size_t)fmt.total_samples(), kk, lo, hi,
                frame.data(), o.dither_step > 0 ? t : -1, std::max(1, o.dither_step));

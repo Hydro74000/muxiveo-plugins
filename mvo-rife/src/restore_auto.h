@@ -7,7 +7,8 @@
 // - rapport de grain d'un plan face au profil cible : résidu face à la médiane recalée t ± 2 par les flux du réseau,
 //   sur les aplats où l'aller-retour des flux tient ; formule bornée contre le surnettoyage ;
 // - σ du résidu (source − sortie) pour l'égalisation du dosage par plan ;
-// - dosage : sortie + part × égalisation × (source − sortie), un seul arrondi, tramage triangulaire en option.
+// - dosage : sortie + min(1, part × égalisation) × (source − sortie) (jamais au-delà de la source ; écart au banc, dont
+//   la formule n'était pas plafonnée), un seul arrondi, tramage triangulaire en option.
 //
 // Conventions : luma en codes 10 bits ; flous gaussiens et Sobel comme OpenCV (taille de noyau d'après σ, bords en
 // miroir sans répétition du bord) ; centiles à interpolation linéaire (NumPy) ; recalage bilinéaire, bords répliqués,

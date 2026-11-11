@@ -148,3 +148,39 @@ def test_source_statistics_precede_restoration(tmp_path):
     frames = lambda path: [json.loads(line) for line in path.read_text().splitlines() if '"frame"' in line]  # noqa: E731
     assert [f["max_nits"] for f in frames(source)] == [f["max_nits"] for f in frames(plain)]
     assert max(max(f["max_nits"]) for f in frames(restored)) < max(max(f["max_nits"]) for f in frames(source))
+
+
+def _grain_then_clean(grain: float, clean: int) -> bytes:
+    """Un seul plan : dégradé et damier qui défilent, grain gaussien puis `clean` dernières images sans grain (fin de plan
+    propre)."""
+    rng = np.random.default_rng(9)
+    yy, xx = np.mgrid[0:H, 0:W]
+    out = [b"YUV4MPEG2 W%d H%d F24:1 Ip A1:1 C420p10 XYSCSS=420P10\n" % (W, H)]
+    for t in range(N):
+        # moitié gauche : dégradé lent (aplats où se mesure le grain) ; moitié droite : damier fin (détail)
+        base = np.where(xx < W // 2, 200 + 500 * (xx + 2 * t) / W + 60 * np.sin(yy / 17.0),
+                        400 + 120 * (((xx + t) // 3 + yy // 3) % 2))
+        sigma = grain if t < N - clean else 0.0
+        y = np.clip(np.rint(base + rng.normal(0, sigma, base.shape)), 64, 940).astype("<u2")
+        c = np.full((H // 2, W // 2), 512, "<u2")
+        out.append(b"FRAME\n" + y.tobytes() + c.tobytes() + c.tobytes())
+    return b"".join(out)
+
+
+def test_restore_never_goes_beyond_the_source():
+    # égalisation par image : une image au résidu bien plus faible que le plan recevait plus que l'écart source − sortie
+    # (part × égalisation jusqu'à 6,8 sur un film réel : points saturés). Plafonnée à 1, chaque pixel reste entre l'image
+    # débruitée et la source : à même sortie du réseau, un niveau plus léger ne s'écarte jamais plus de la source qu'un
+    # niveau plus fort (écart = (1 − part) × |source − sortie|, part croissante avec le niveau)
+    src = _grain_then_clean(3.0, 8)
+    leger, _ = _run(src, "--factor", "1", "--restore", "leger", "--restore-dither", "off")
+    fort, _ = _run(src, "--factor", "1", "--restore", "fort", "--restore-dither", "off")
+    raw = []
+    i = src.index(b"\n") + 1
+    size = (W * H + 2 * (W // 2) * (H // 2)) * 2
+    while i < len(src):
+        j = src.index(b"\n", i) + 1
+        raw.append(np.frombuffer(src[j:j + size], "<u2").astype(np.int32))
+        i = j + size
+    for a, b, r in zip(leger, fort, raw):
+        assert np.all(np.abs(a - r) <= np.abs(b - r) + 1)  # arrondis
