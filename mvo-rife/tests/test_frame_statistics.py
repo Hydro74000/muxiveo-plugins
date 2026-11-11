@@ -26,10 +26,13 @@ def _supported() -> bool:
 
 
 def _vulkan() -> bool:
-    """Chargeur Vulkan présent (le moteur l'exige même sans GPU utilisé) : faux sur les runners Windows hébergés."""
-    if not RIFE_BIN:
+    """Chargeur Vulkan présent (le moteur l'exige même sans GPU utilisé, --list-gpus non) : faux sur les runners Windows
+    hébergés."""
+    if not RIFE_BIN or not Path(RIFE_BIN).is_file():
         return False
-    return subprocess.run([RIFE_BIN, "--list-gpus"], capture_output=True, timeout=60).returncode == 0
+    frame = b"YUV4MPEG2 W16 H16 F24:1 Ip A1:1 C420p10\n" + b"FRAME\n" + bytes(16 * 16 * 3)
+    r = subprocess.run([RIFE_BIN, "--factor", "1", "--matrix", "bt709"], input=frame, capture_output=True, timeout=60)
+    return b"Vulkan indisponible" not in r.stderr
 
 
 pytestmark = pytest.mark.skipif(not _supported() or not _vulkan(), reason="muxiveo-rife avec --frame-statistics et Vulkan requis")
