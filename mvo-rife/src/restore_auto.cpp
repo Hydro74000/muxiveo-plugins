@@ -44,10 +44,12 @@ thread_local bool tl_pool_worker = false;
 class Pool
 {
 public:
+    // Jamais détruite : à la fin d'un processus Windows, les fils de la réserve sont déjà arrêtés quand les destructeurs
+    // statiques d'une DLL s'exécutent, et les attendre bloquerait la sortie (winpthreads ; DLL de test des tests natifs).
     static Pool& instance()
     {
-        static Pool pool;
-        return pool;
+        static Pool* pool = new Pool;
+        return *pool;
     }
 
     // fn(i) pour i ∈ [0, n), réparti sur les fils de la réserve et le fil appelant ; rend la main quand tout est fait.

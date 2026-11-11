@@ -25,7 +25,14 @@ def _supported() -> bool:
     return "frame-statistics" in json.loads(caps.stdout or "{}").get("options", [])
 
 
-pytestmark = pytest.mark.skipif(not _supported(), reason="muxiveo-rife avec --frame-statistics requis")
+def _vulkan() -> bool:
+    """Chargeur Vulkan présent (le moteur l'exige même sans GPU utilisé) : faux sur les runners Windows hébergés."""
+    if not RIFE_BIN:
+        return False
+    return subprocess.run([RIFE_BIN, "--list-gpus"], capture_output=True, timeout=60).returncode == 0
+
+
+pytestmark = pytest.mark.skipif(not _supported() or not _vulkan(), reason="muxiveo-rife avec --frame-statistics et Vulkan requis")
 W, H = 64, 32
 M1, M2 = 2610 / 16384, 2523 / 4096 * 128
 C1, C2, C3 = 3424 / 4096, 2413 / 4096 * 32, 2392 / 4096 * 32
