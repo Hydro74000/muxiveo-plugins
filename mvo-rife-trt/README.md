@@ -11,7 +11,7 @@ lui-même (page Extensions). Sans lui, ou au moindre problème, le traitement co
 ## Nouveautés 1.3.0
 
 - Débruitage MVO-R2 de Muxiveo par TensorRT (graphes `r2_flow` et `r2_body` livrés avec muxiveo-rife), avec
-  muxiveo-rife 1.12.0 ou plus récent : interface 2 du plugin (sessions de graphe génériques). Images identiques à
+  muxiveo-rife 1.13.0 ou plus récent : interface 2 du plugin (sessions de graphe génériques). Images identiques à
   l'œil au calcul Vulkan ; au moindre problème, le débruitage continue en Vulkan.
 - Interpolation inchangée : le plugin répond toujours à l'interface 1 (muxiveo-rife 1.4.0 ou plus récent).
 
@@ -27,7 +27,7 @@ lui-même (page Extensions). Sans lui, ou au moindre problème, le traitement co
 
 - GPU NVIDIA **Turing (RTX 20xx, GTX 16xx) ou plus récent** ; pilote NVIDIA **575 ou plus récent**.
 - Linux x86-64 (glibc 2.28 ou plus récente) et Windows 10/11 x64.
-- muxiveo-rife 1.4.0 ou plus récent (interface 1) ; débruitage MVO-R2 : muxiveo-rife 1.12.0 ou plus récent
+- muxiveo-rife 1.4.0 ou plus récent (interface 1) ; débruitage MVO-R2 : muxiveo-rife 1.13.0 ou plus récent
   (interface 2).
 - Préréglages couverts : Rapide, Équilibré, Qualité, Ultra et Light (modèles RIFE v4.6, v4.15 et v4.15-lite, avec
   ou sans le mode Fast).
