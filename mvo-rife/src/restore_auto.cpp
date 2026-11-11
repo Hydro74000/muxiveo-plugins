@@ -871,18 +871,173 @@ void dose(const uint16_t* src, const float* out, std::size_t n, double kk, uint1
     });
 }
 
-void dose_frame(const uint8_t* src, int bytes_per_sample, const uint16_t* out_fx, float inv_fx, std::size_t n, double kk,
-                uint16_t lo, uint16_t hi, uint8_t* dst, long long dither_frame, int dither_step)
+namespace
 {
-    // mêmes opérations flottantes que dose() sur of = out_fx × inv_fx et la source en codes
+// Flou binomial 3 × 3 ([1 2 1] séparable, / 16), bords répliqués.
+void blur121(const float* src, int w, int h, float* dst)
+{
+    std::vector<float> tmp((std::size_t)w * h);
+    parallel_for(h, [&](int y0, int y1) {
+        for (int y = y0; y < y1; y++)
+        {
+            const float* r = src + (std::size_t)y * w;
+            float* o = tmp.data() + (std::size_t)y * w;
+            for (int x = 0; x < w; x++)
+                o[x] = 0.25f * r[clampi(x - 1, w)] + 0.5f * r[x] + 0.25f * r[clampi(x + 1, w)];
+        }
+    });
+    parallel_for(h, [&](int y0, int y1) {
+        for (int y = y0; y < y1; y++)
+        {
+            const float* a = tmp.data() + (std::size_t)clampi(y - 1, h) * w;
+            const float* c = tmp.data() + (std::size_t)y * w;
+            const float* b2 = tmp.data() + (std::size_t)clampi(y + 1, h) * w;
+            float* o = dst + (std::size_t)y * w;
+            for (int x = 0; x < w; x++)
+                o[x] = 0.25f * a[x] + 0.5f * c[x] + 0.25f * b2[x];
+        }
+    });
+}
+
+// Minimum et maximum 3 × 3 (séparables), bords répliqués.
+void minmax3(const float* src, int w, int h, float* mn, float* mx)
+{
+    std::vector<float> tmn((std::size_t)w * h), tmx((std::size_t)w * h);
+    parallel_for(h, [&](int y0, int y1) {
+        for (int y = y0; y < y1; y++)
+        {
+            const float* r = src + (std::size_t)y * w;
+            for (int x = 0; x < w; x++)
+            {
+                const float a = r[clampi(x - 1, w)], c = r[x], b2 = r[clampi(x + 1, w)];
+                tmn[(std::size_t)y * w + x] = std::min(a, std::min(c, b2));
+                tmx[(std::size_t)y * w + x] = std::max(a, std::max(c, b2));
+            }
+        }
+    });
+    parallel_for(h, [&](int y0, int y1) {
+        for (int y = y0; y < y1; y++)
+        {
+            const std::size_t ia = (std::size_t)clampi(y - 1, h) * w, ic = (std::size_t)y * w, ib = (std::size_t)clampi(y + 1, h) * w;
+            for (int x = 0; x < w; x++)
+            {
+                mn[ic + x] = std::min(tmn[ia + x], std::min(tmn[ic + x], tmn[ib + x]));
+                mx[ic + x] = std::max(tmx[ia + x], std::max(tmx[ic + x], tmx[ib + x]));
+            }
+        }
+    });
+}
+
+// Contre-accentuage temporel d'un plan de luma dosé `d` (en place) : voir SharpenParams.
+void contrasharpen(float* d, const uint8_t* src, int bytes_per_sample, const SharpenParams& sp)
+{
+    const int w = sp.width, h = sp.height;
+    const std::size_t nl = (std::size_t)w * h;
+    const float scale = std::ldexp(1.f, sp.bit_depth - 10);  // codes natifs par code 10 bits
+    std::vector<float> ref(nl), s(nl), mn(nl), mx(nl), e(nl), mn2(nl), mx2(nl);
+    parallel_for(h, [&](int r0, int r1) {
+        for (std::size_t i = (std::size_t)r0 * w; i < (std::size_t)r1 * w; i++)
+            ref[i] = sp.ref_fx[i] * sp.ref_inv;
+    });
+    // accentuation : écart au flou 3 × 3 ; bornes : écart à la référence sur 3 × 3
+    blur121(d, w, h, s.data());
+    parallel_for(h, [&](int r0, int r1) {
+        for (std::size_t i = (std::size_t)r0 * w; i < (std::size_t)r1 * w; i++)
+        {
+            s[i] = d[i] - s[i];
+            e[i] = ref[i] - d[i];
+        }
+    });
+    minmax3(e.data(), w, h, mn.data(), mx.data());
+    // seconde borne : ce que le débruitage a retiré (source − sortie dosée, 3 × 3, comme le ContraSharpening) ; sans
+    // débruitage (part réinjectée 1), rien n'est rendu, même sur un contour où la référence s'écarte un peu de l'image
+    parallel_for(h, [&](int r0, int r1) {
+        for (std::size_t i = (std::size_t)r0 * w; i < (std::size_t)r1 * w; i++)
+            e[i] = (float)sample_at(src, bytes_per_sample, i) - d[i];
+    });
+    minmax3(e.data(), w, h, mn2.data(), mx2.data());
+    // texture de la référence : énergie locale (5 × 5) de son passe-haut
+    blur121(ref.data(), w, h, e.data());
+    parallel_for(h, [&](int r0, int r1) {
+        for (std::size_t i = (std::size_t)r0 * w; i < (std::size_t)r1 * w; i++)
+        {
+            const float hf = ref[i] - e[i];
+            e[i] = hf * hf;
+        }
+    });
+    box_replicate(e.data(), w, h, 5, ref.data());  // ref : énergie moyenne 5 × 5 (référence plus utile ensuite)
+    // seuil selon le grain attendu : courbe du plan à la luma de la source, σ × 1,25 / √5, au moins 0,25 code 10 bits
+    const int levels = 1 << sp.bit_depth;
+    std::vector<float> thr(levels);
+    for (int v = 0; v < levels; v++)
+    {
+        const double y10 = v / (double)scale;
+        double sg;
+        const auto& c = sp.curve->center;
+        const auto& g = sp.curve->sigma;
+        if (y10 <= c[0])
+            sg = std::max(g[0], 0.f);
+        else if (y10 >= c[GRAIN_BINS - 1])
+            sg = std::max(g[GRAIN_BINS - 1], 0.f);
+        else
+        {
+            int b0 = 0;
+            while (y10 > c[b0 + 1])
+                b0++;
+            const double t = (y10 - c[b0]) / (c[b0 + 1] - c[b0]);
+            sg = std::max(g[b0], 0.f) + t * (std::max(g[b0 + 1], 0.f) - std::max(g[b0], 0.f));
+        }
+        thr[v] = (float)(std::max(sg * 1.25 / std::sqrt(5.0), 0.25) * scale);
+    }
+    const float k = (float)sp.strength;
+    parallel_for(h, [&](int r0, int r1) {
+        for (std::size_t i = (std::size_t)r0 * w; i < (std::size_t)r1 * w; i++)
+        {
+            // intersection des deux bornes (détail stable dans le temps et retiré par le débruitage) ; disjointes : rien
+            const float lo = std::max(mn[i], mn2[i]), hi = std::min(mx[i], mx2[i]);
+            const float lim = lo > hi ? 0.f : std::min(std::max(s[i], lo), hi);
+            const float ss = std::fabs(lim) < std::fabs(s[i]) ? lim : s[i];
+            const float t = thr[std::min<unsigned>(sample_at(src, bytes_per_sample, i), (unsigned)levels - 1)];
+            const float mask = std::clamp((std::sqrt(ref[i]) - t) / t, 0.f, 1.f);
+            d[i] += k * ss * mask;
+        }
+    });
+}
+}  // namespace
+
+void dose_frame(const uint8_t* src, int bytes_per_sample, const uint16_t* out_fx, float inv_fx, std::size_t n, double kk,
+                uint16_t lo, uint16_t hi, uint8_t* dst, long long dither_frame, int dither_step, const SharpenParams* sharpen)
+{
+    // mêmes opérations flottantes que dose() sur of = out_fx × inv_fx et la source en codes ; contre-accentuage de la
+    // luma (facultatif) entre le dosage et l'arrondi
     const float k = (float)kk;
     const float step = (float)std::max(1, dither_step);
+    const bool sharpening = sharpen && sharpen->strength > 0.0 && sharpen->ref_fx && sharpen->curve;
+    const std::size_t nl = sharpening ? (std::size_t)sharpen->width * sharpen->height : 0;
+    std::vector<float> luma(nl);
+    if (sharpening)
+    {
+        parallel_for(sharpen->height, [&](int r0, int r1) {
+            for (std::size_t i = (std::size_t)r0 * sharpen->width; i < (std::size_t)r1 * sharpen->width; i++)
+            {
+                const float o = out_fx[i] * inv_fx;
+                luma[i] = o + k * ((float)(uint16_t)sample_at(src, bytes_per_sample, i) - o);
+            }
+        });
+        contrasharpen(luma.data(), src, bytes_per_sample, *sharpen);
+    }
     const int blocks = (int)((n + 65535) / 65536);
     parallel_for(blocks, [&](int b0, int b1) {
     for (std::size_t i = (std::size_t)b0 * 65536; i < std::min(n, (std::size_t)b1 * 65536); i++)
     {
-        const float o = out_fx[i] * inv_fx;
-        float v = o + k * ((float)(uint16_t)sample_at(src, bytes_per_sample, i) - o);
+        float v;
+        if (i < nl)
+            v = luma[i];
+        else
+        {
+            const float o = out_fx[i] * inv_fx;
+            v = o + k * ((float)(uint16_t)sample_at(src, bytes_per_sample, i) - o);
+        }
         uint16_t q;
         if (dither_frame >= 0)
         {

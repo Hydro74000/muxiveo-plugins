@@ -49,12 +49,14 @@ public:
         int x0 = 0, y0 = 0, w = 0, h = 0;
     };
 
+    // `ref` non nul : référence temporelle du contre-accentuage, luma médiane de l'image t et de ses 4 voisines recalées
+    // (w × h codes, même virgule fixe que la sortie, deux valeurs par mot), calculée dans la même soumission.
     // Image t : voisines nb[4] (déjà ajoutées), carte de grain (w × h octets, σ × 20). Sortie : codes Y'CbCr
     // [Y (w × h) | Cb (cw × ch) | Cr (cw × ch)] en virgule fixe 16 bits (code × fixed_scale(), arrondi pair, converti sur
     // le GPU), deux valeurs par mot de 32 bits, dans le tampon rapatrié lui-même ; flux recadrés si `crop` et `flows`
     // non nuls.
     bool process(int64_t t, const int64_t nb[4], const uint8_t* grain_map, ncnn::Mat& yuv, const Crop* crop,
-                 std::vector<float>* flows, std::string& error);
+                 std::vector<float>* flows, std::string& error, ncnn::Mat* ref = nullptr);
 
     // Inférence par le plugin TensorRT (interface 2) : graphes <onnx_dir>/r2_flow.onnx et r2_body.onnx, moteurs en cache
     // sous le nom « <tag>-r2_* » ; corps calculé sur l'image entière. Faux = Vulkan conservé (reason).
@@ -96,7 +98,8 @@ private:
     void crop_flows(const ncnn::Mat host_flows[4], const Crop& crop, std::vector<float>& flows) const;
     void copy_dense(ncnn::VkCompute& cmd, const ncnn::VkMat& src, int c, const ncnn::VkMat& dst);
     bool process_trt(int64_t t, const int64_t nb[4], const uint8_t* grain_map, ncnn::Mat& yuv, const Crop* crop,
-                     std::vector<float>* flows, std::string& error);
+                     std::vector<float>* flows, std::string& error, ncnn::Mat* ref);
+    bool record_reference(ncnn::VkCompute& cmd, const ncnn::VkMat& rgb, const ncnn::VkMat warped[4], ncnn::Mat& host_ref);
     void release();
 
     ncnn::VulkanDevice* vkdev = nullptr;
@@ -113,6 +116,7 @@ private:
     ncnn::Pipeline* p_rgb_to_yuv = nullptr;
     ncnn::Pipeline* p_copy = nullptr;
     ncnn::Pipeline* p_fixed16 = nullptr;
+    ncnn::Pipeline* p_median_luma = nullptr;
     std::unique_ptr<TrtBackend> trt_flow, trt_body;
     bool trt_on = false;
     std::string trt_summary;

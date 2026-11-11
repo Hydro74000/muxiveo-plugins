@@ -50,7 +50,8 @@ void RestoreStage::run_item(const Item& it, Job& r)
     // mémoire GPU insuffisante : repli sur des tuiles plus petites au lieu d'un échec
     for (;;)
     {
-        if (net->process(it.u, it.nb.data(), it.map->data(), r.yuv, it.want ? &crop : nullptr, it.want ? &r.flows : nullptr, r.error))
+        if (net->process(it.u, it.nb.data(), it.map->data(), r.yuv, it.want ? &crop : nullptr, it.want ? &r.flows : nullptr, r.error,
+                         o.sharpen > 0.0 ? &r.ref : nullptr))
             break;
         if (!net->out_of_memory() || net->tile_size() <= 128)
             return;
@@ -288,6 +289,8 @@ int RestoreStage::collect(bool block)
     // sortie déjà en virgule fixe (convertie sur le GPU) ; σ du résidu ensuite, dans ce fil, pendant que le fil GPU
     // calcule les images suivantes
     out[r.u] = r.yuv;
+    if (o.sharpen > 0.0)
+        refs[r.u] = r.ref;
     pending_sig = r.u;
     if (r.want)
         ana_flows[r.u] = std::move(r.flows);
@@ -359,8 +362,19 @@ bool RestoreStage::emit()
     // 6,8 fois l'écart source − sortie : points saturés (10 000 nits en PQ), MaxCLL mesuré faussé (2026-11-11)
     const double kk = std::min(1.0, part * eq);
     std::vector<uint8_t> frame = take_buffer(spare_out);
+    SharpenParams sp;
+    if (o.sharpen > 0.0)
+    {
+        sp.strength = o.sharpen;
+        sp.ref_fx = (const uint16_t*)refs.at(t).data;
+        sp.ref_inv = 1.f / fx_scale;
+        sp.curve = &curves.at(s);
+        sp.width = fmt.width;
+        sp.height = fmt.height;
+        sp.bit_depth = fmt.bit_depth;
+    }
     dose_frame(src.at(t).data(), fmt.bytes_per_sample, (const uint16_t*)out.at(t).data, 1.f / fx_scale, (size_t)fmt.total_samples(), kk, lo, hi,
-               frame.data(), o.dither_step > 0 ? t : -1, std::max(1, o.dither_step));
+               frame.data(), o.dither_step > 0 ? t : -1, std::max(1, o.dither_step), o.sharpen > 0.0 ? &sp : nullptr);
     ready.push_back(std::move(frame));
     logs[t] = Log{r, part, kk};
     next_out = t + 1;
@@ -380,6 +394,8 @@ void RestoreStage::release()
     }
     for (auto it = out.begin(); it != out.end() && it->first < next_out;)
         it = out.erase(it);
+    for (auto it = refs.begin(); it != refs.end() && it->first < next_out;)
+        it = refs.erase(it);
     for (auto it = sig.begin(); it != sig.end() && it->first < next_out - o.dose_look;)
         it = sig.erase(it);
 }

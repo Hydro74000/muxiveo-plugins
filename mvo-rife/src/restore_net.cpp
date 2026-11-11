@@ -13,6 +13,7 @@
 #include "restore_assemble.comp.hex.h"
 #include "restore_copy.comp.hex.h"
 #include "restore_fixed16.comp.hex.h"
+#include "restore_median_luma.comp.hex.h"
 #include "restore_luma_area.comp.hex.h"
 #include "restore_resize.comp.hex.h"
 #include "restore_rgb_to_yuv_aa.comp.hex.h"
@@ -99,7 +100,7 @@ void RestoreNet::release()
     trt_flow.reset();
     trt_body.reset();
     trt_on = false;
-    for (ncnn::Pipeline** p : {&p_yuv_to_rgb, &p_luma_area, &p_resize, &p_assemble, &p_tile, &p_rgb_to_yuv, &p_copy, &p_fixed16})
+    for (ncnn::Pipeline** p : {&p_yuv_to_rgb, &p_luma_area, &p_resize, &p_assemble, &p_tile, &p_rgb_to_yuv, &p_copy, &p_fixed16, &p_median_luma})
     {
         delete *p;
         *p = nullptr;
@@ -164,7 +165,9 @@ bool RestoreNet::init(ncnn::VulkanDevice* dev, const ncnn::Option& base, const s
     p_rgb_to_yuv = make_pipeline(restore_rgb_to_yuv_aa_comp_data, sizeof(restore_rgb_to_yuv_aa_comp_data), 8, 8, 1);
     p_copy = make_pipeline(restore_copy_comp_data, sizeof(restore_copy_comp_data), 8, 8, 1);
     p_fixed16 = make_pipeline(restore_fixed16_comp_data, sizeof(restore_fixed16_comp_data), 256, 1, 1);
-    if (!p_yuv_to_rgb || !p_luma_area || !p_resize || !p_assemble || !p_tile || !p_rgb_to_yuv || !p_copy || !p_fixed16)
+    p_median_luma = make_pipeline(restore_median_luma_comp_data, sizeof(restore_median_luma_comp_data), 8, 8, 1);
+    if (!p_yuv_to_rgb || !p_luma_area || !p_resize || !p_assemble || !p_tile || !p_rgb_to_yuv || !p_copy || !p_fixed16
+        || !p_median_luma)
     {
         error = "compilation des shaders de restauration impossible";
         return false;
@@ -336,6 +339,30 @@ std::vector<ncnn::vk_constant_type> RestoreNet::tile_constants(int mode, const n
     return k;
 }
 
+bool RestoreNet::record_reference(ncnn::VkCompute& cmd, const ncnn::VkMat& rgb, const ncnn::VkMat warped[4], ncnn::Mat& host_ref)
+{
+    ncnn::VkMat luma, packed;
+    luma.create(fmt.width * fmt.height, (size_t)4u, 1, blob_alloc);
+    if (luma.empty())
+        return false;
+    const Scale s = code_scale(fmt, color.full_range);
+    std::vector<ncnn::vk_constant_type> k(9);
+    k[0].i = W;
+    k[1].i = (int)rgb.cstep;
+    k[2].i = fmt.width;
+    k[3].i = fmt.height;
+    k[4].i = EDGE;
+    k[5].f = color.kr;
+    k[6].f = color.kb;
+    k[7].f = s.y_off;
+    k[8].f = s.y_range;
+    cmd.record_pipeline(p_median_luma, {rgb, warped[0], warped[1], warped[2], warped[3], luma}, k, dispatch_of(fmt.width, fmt.height, 1));
+    if (!to_fixed16(cmd, luma, packed))
+        return false;
+    cmd.record_clone(packed, host_ref, opt);
+    return !host_ref.empty();
+}
+
 bool RestoreNet::to_fixed16(ncnn::VkCompute& cmd, const ncnn::VkMat& yuv, ncnn::VkMat& packed)
 {
     const int n = yuv.w;
@@ -409,7 +436,7 @@ void RestoreNet::crop_flows(const ncnn::Mat host_flows[4], const Crop& crop, std
 }
 
 bool RestoreNet::process(int64_t t, const int64_t nb[4], const uint8_t* grain_map, ncnn::Mat& yuv, const Crop* crop,
-                         std::vector<float>* flows, std::string& error)
+                         std::vector<float>* flows, std::string& error, ncnn::Mat* ref)
 {
     oom = false;
     auto fail = [&](const char* what) {
@@ -427,7 +454,7 @@ bool RestoreNet::process(int64_t t, const int64_t nb[4], const uint8_t* grain_ma
         if (!cache.count(nb[j]))
             return fail("voisine absente du cache");
     if (trt_on)
-        return process_trt(t, nb, grain_map, yuv, crop, flows, error);
+        return process_trt(t, nb, grain_map, yuv, crop, flows, error, ref);
     const Cached& ct = cache.at(t);
     ncnn::VkCompute cmd(vkdev);
 
@@ -457,6 +484,10 @@ bool RestoreNet::process(int64_t t, const int64_t nb[4], const uint8_t* grain_ma
         if (!warp_from_flow(cmd, f_pack1, cn.rgb, full[j], warped[j], error))
             return oom ? false : fail("recalage en échec");
     }
+
+    // référence du contre-accentuage (voisines recalées), rapatriée avec la sortie
+    if (ref && !record_reference(cmd, ct.rgb, warped, *ref))
+        return fail_oom();
 
     // entrée du corps (17 canaux), corps par tuiles, accumulation pondérée (fenêtre de Hann), comme r1r_infer.run
     ncnn::VkMat x, acc, wsum, dummy;
@@ -590,7 +621,7 @@ bool RestoreNet::enable_trt(const std::filesystem::path& plugin_dir, const std::
 }
 
 bool RestoreNet::process_trt(int64_t t, const int64_t nb[4], const uint8_t* grain_map, ncnn::Mat& yuv, const Crop* crop,
-                             std::vector<float>* flows, std::string& error)
+                             std::vector<float>* flows, std::string& error, ncnn::Mat* ref)
 {
     // TensorRT (plugin mvo-rife-trt, interface 2) : graphes exécutés dans des tampons partagés Vulkan / CUDA, chaque
     // inférence encadrée par des soumissions Vulkan terminées (écriture des entrées, lecture de la sortie).
@@ -624,6 +655,8 @@ bool RestoreNet::process_trt(int64_t t, const int64_t nb[4], const uint8_t* grai
         if (j < 3)
             cmd = std::make_unique<ncnn::VkCompute>(vkdev);
     }
+    if (ref && !record_reference(*cmd, ct.rgb, warped, *ref))
+        return fail_oom();
     ncnn::VkMat x, acc, wsum, dummy;
     if (!assemble(*cmd, ct.rgb, warped, grain_map, x))
         return fail_oom();

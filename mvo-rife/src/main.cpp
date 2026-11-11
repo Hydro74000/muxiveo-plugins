@@ -378,6 +378,7 @@ struct Options
     bool restore_animation = false;       // contenu animé (niveau auto : un cran vers fort)
     bool restore_fast = false;            // poids du mode rapide (flux au quart)
     std::string restore_model;            // dossier des graphes (défaut : <exe>/restore-models/r2 ou r2q)
+    double restore_sharpen = 0.0;          // contre-accentuage temporel après le dosage (0 : aucun)
     std::string restore_dither = "auto";  // auto (±1 code) | off | 8 (±1 pas 8 bits : sortie 10 bits vers un encodeur 8 bits)
     std::string transfer;                 // sdr | pq | hlg : canal de transfert du réseau (PQ ou non)
     int restore_tile = 512;               // côté des tuiles du réseau de restauration
@@ -429,6 +430,8 @@ static void print_usage(FILE* fp)
             "  --restore-animation     contenu animé (niveau auto : un cran vers fort)\n"
             "  --restore-fast          Restauration rapide (flux au quart de la définition)\n"
             "  --restore-model <dir>   graphes de restauration (défaut : <exe>/restore-models/r2, r2q avec --restore-fast)\n"
+            "  --restore-sharpen <s>   contre-accentuage temporel de la luma après le dosage (0 : aucun, défaut ; 1 : réglage\n"
+            "                          de référence) : rend un peu de la netteté retirée, seulement là où le détail est stable\n"
             "  --restore-dither <d>    arrondi de sortie : auto (tramé ±1 code, défaut) | off | 8 (±1 pas 8 bits, sortie\n"
             "                          10 bits destinée à un encodeur 8 bits)\n"
             "  --transfer <t>          sdr | pq | hlg : fonction de transfert de la source (Restauration ; défaut : sdr)\n"
@@ -576,6 +579,10 @@ static bool parse_args(const std::vector<std::string>& args, Options& o, std::st
         else if (a == "--restore-animation") o.restore_animation = true;
         else if (a == "--restore-fast") o.restore_fast = true;
         else if (a == "--restore-model") { if (!value(o.restore_model)) return false; }
+        else if (a == "--restore-sharpen")
+        {
+            if (!value(v) || !parse_double_option(a, v, 0.0, 2.0, o.restore_sharpen, error)) return false;
+        }
         else if (a == "--restore-dither")
         {
             if (!value(v)) return false;
@@ -780,7 +787,7 @@ static int print_capabilities(const Options& o, const fs::path& exe_dir)
         "fp32", "feature-cache", "feature-cache-reserve", "tta", "engine", "trt-plugin", "trt-cache", "backend", "nvof", "large-motion", "selector",
         "selector-weights", "ultra", "padding", "threads", "allow-interlaced", "progress-interval", "quiet", "verbose",
         "list-gpus", "capabilities", "version", "restore", "restore-animation", "restore-fast", "restore-model",
-        "restore-dither", "transfer", "restore-tile", "frame-statistics", "source-statistics", "watchdog", "scene-marks"};
+        "restore-dither", "transfer", "restore-tile", "frame-statistics", "source-statistics", "watchdog", "scene-marks", "restore-sharpen"};
     std::vector<std::string> models;
     std::error_code ec;
     for (fs::directory_iterator it(exe_dir / "rife-models", ec), end; !ec && it != end; it.increment(ec))
@@ -1134,6 +1141,7 @@ static int run(const Options& o, const fs::path& exe_dir)
         ro.k = o.restore == "fort" ? 0.5 : (o.restore == "leger" ? 1.5 : 1.0);
         ro.animation = o.restore == "auto" && o.restore_animation;
         ro.dither_step = o.restore_dither == "off" ? 0 : (o.restore_dither == "8" ? 4 : 1);
+        ro.sharpen = o.restore_sharpen;
         if (!restore_net.init(rdev, ropt, rdir, rfs, error)
                 || !restore_net.configure(fmt, color, o.transfer == "pq", o.restore_tile, error)
                 || !restore_stage.init(&restore_net, fmt, color, ro, error))
@@ -1159,8 +1167,10 @@ static int run(const Options& o, const fs::path& exe_dir)
             return EXIT_GPU;
         }
         if (!o.quiet)
-            fprintf(stderr, "info: restauration : niveau %s%s | graphes %s (flux x%g) | tramage %s | %s | transfert %s | GPU %s | %s\n",
-                    o.restore.c_str(), ro.animation ? " (animation)" : "", path_to_utf8(rdir.filename()).c_str(), rfs,
+            fprintf(stderr, "info: restauration : niveau %s%s%s | graphes %s (flux x%g) | tramage %s | %s | transfert %s | GPU %s | %s\n",
+                    o.restore.c_str(), ro.animation ? " (animation)" : "",
+                    ro.sharpen > 0.0 ? (" | contre-accentuage " + std::to_string(ro.sharpen).substr(0, 4)).c_str() : "",
+                    path_to_utf8(rdir.filename()).c_str(), rfs,
                     ro.dither_step == 0 ? "non" : (ro.dither_step == 4 ? "±1 pas 8 bits" : "±1 code"),
                     restore_net.uses_trt() ? "image entière" : ("tuiles " + std::to_string(o.restore_tile)).c_str(),
                     o.transfer.empty() ? "sdr" : o.transfer.c_str(), rdev->info.device_name(), restore_backend.c_str());

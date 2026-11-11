@@ -150,6 +150,60 @@ def test_source_statistics_precede_restoration(tmp_path):
     assert max(max(f["max_nits"]) for f in frames(restored)) < max(max(f["max_nits"]) for f in frames(source))
 
 
+def _detailed(grain: float) -> bytes:
+    """Damier fin qui défile (détail stable d'une image à l'autre) + grain gaussien indépendant (10 bits, 4:2:0)."""
+    rng = np.random.default_rng(5)
+    yy, xx = np.mgrid[0:H, 0:W]
+    out = [b"YUV4MPEG2 W%d H%d F24:1 Ip A1:1 C420p10 XYSCSS=420P10\n" % (W, H)]
+    for t in range(N):
+        base = 400 + 120 * (((xx + t) // 3 + yy // 3) % 2) + 80 * np.sin(yy / 11.0)
+        y = np.clip(np.rint(base + rng.normal(0, grain, base.shape)), 64, 940).astype("<u2")
+        c = np.full((H // 2, W // 2), 512, "<u2")
+        out.append(b"FRAME\n" + y.tobytes() + c.tobytes() + c.tobytes())
+    return b"".join(out)
+
+
+def _hf(y: np.ndarray) -> float:
+    """Énergie moyenne du passe-haut 3 × 3 (y − flou 1-2-1) de la luma."""
+    img = y[: W * H].reshape(H, W).astype(np.float64)
+    p = np.pad(img, 1, mode="edge")
+    k = np.array([1.0, 2.0, 1.0]) / 4.0
+    b = sum(k[i] * p[i:i + H, 1:-1] for i in range(3))
+    b = sum(k[i] * np.pad(b, ((0, 0), (1, 1)), mode="edge")[:, i:i + W] for i in range(3))
+    return float(np.mean(np.abs(img - b)))
+
+
+def test_restore_sharpen_luma_only_and_bounded():
+    src = _detailed(8.0)
+    plain, _ = _run(src, "--factor", "1", "--restore", "fort")
+    zero, _ = _run(src, "--factor", "1", "--restore", "fort", "--restore-sharpen", "0")
+    sharp, log = _run(src, "--factor", "1", "--restore", "fort", "--restore-sharpen", "1")
+    assert "contre-accentuage" in log and len(sharp) == N
+    assert all(np.array_equal(a, b) for a, b in zip(plain, zero))  # force 0 = sans contre-accentuage
+    assert all(np.array_equal(a[W * H:], b[W * H:]) for a, b in zip(plain, sharp))  # chroma intacte
+    assert any(not np.array_equal(a[: W * H], b[: W * H]) for a, b in zip(plain, sharp))
+    assert np.mean([_hf(f) for f in sharp]) > np.mean([_hf(f) for f in plain])  # détail rendu
+    sharp2, _ = _run(src, "--factor", "1", "--restore", "fort", "--restore-sharpen", "1")
+    assert all(np.array_equal(a, b) for a, b in zip(sharp, sharp2))  # déterministe
+
+
+def test_restore_sharpen_needs_removed_detail():
+    # source sans grain : sur les images que le dosage rend telles quelles (part réinjectée 1), le contre-accentuage n'a
+    # rien à rendre, même sur les arêtes du damier où la référence temporelle s'écarte de l'image
+    src = _grain_then_clean(0.0, 0)
+    plain, _ = _run(src, "--factor", "1", "--restore", "auto", "--restore-dither", "off")
+    sharp, _ = _run(src, "--factor", "1", "--restore", "auto", "--restore-dither", "off", "--restore-sharpen", "2")
+    raw = []
+    i = src.index(b"\n") + 1
+    size = (W * H + 2 * (W // 2) * (H // 2)) * 2
+    while i < len(src):
+        j = src.index(b"\n", i) + 1
+        raw.append(np.frombuffer(src[j:j + size], "<u2").astype(np.int32))
+        i = j + size
+    untouched = [t for t in range(N) if np.array_equal(plain[t], raw[t])]
+    assert untouched  # images rendues telles quelles
+    assert all(np.array_equal(sharp[t], plain[t]) for t in untouched)
+
 def _grain_then_clean(grain: float, clean: int) -> bytes:
     """Un seul plan : dégradé et damier qui défilent, grain gaussien puis `clean` dernières images sans grain (fin de plan
     propre)."""

@@ -122,10 +122,27 @@ double auto_part(std::optional<double> ratio, double k);
 void dose(const uint16_t* src, const float* out, std::size_t n, double kk, uint16_t lo, uint16_t hi, uint16_t* dst,
           long long dither_frame = -1, std::size_t dither_offset = 0, int dither_step = 1);
 
+// Contre-accentuage temporel de la luma dosée (option du dosage, avant l'arrondi) : rend un peu du détail retiré, borné
+// par la référence temporelle (luma médiane de l'image et de ses voisines recalées, où le grain s'annule) et par ce que le
+// débruitage a retiré (source − sortie dosée, 3 × 3 ; écart au banc : rien n'est rendu sans débruitage), pondéré par
+// la texture de cette référence (nul sur les aplats) — r1_csharp.contrasharpen_temporal du banc (A/B du 2026-11-03,
+// rayon 2 au lieu de 3, courbe de grain du plan au lieu de celle de l'image). Codes natifs ; seuils de la courbe (codes
+// 10 bits) mis à l'échelle de la profondeur.
+struct SharpenParams
+{
+    double strength = 0.0;              // 0 : sans contre-accentuage
+    const uint16_t* ref_fx = nullptr;   // référence (w × h, virgule fixe : code = valeur × ref_inv)
+    float ref_inv = 1.f;
+    const GrainCurve* curve = nullptr;  // courbe de grain du plan
+    int width = 0, height = 0, bit_depth = 10;
+};
+
 // dose() sur une trame entière (n échantillons) lue dans les octets de la source et la sortie en virgule fixe, écrite
 // dans les octets de la trame de sortie (même disposition, petit-boutiste) : mêmes calculs, sans copie intermédiaire.
+// `sharpen` (force > 0) : luma contre-accentuée avant l'arrondi ; sinon calcul identique sans lui.
 void dose_frame(const uint8_t* src, int bytes_per_sample, const uint16_t* out_fx, float inv_fx, std::size_t n, double kk,
-                uint16_t lo, uint16_t hi, uint8_t* dst, long long dither_frame, int dither_step);
+                uint16_t lo, uint16_t hi, uint8_t* dst, long long dither_frame, int dither_step,
+                const SharpenParams* sharpen = nullptr);
 
 // Fils processeur des calculs par image (0 : selon le processeur ; résultats identiques quel que soit le nombre).
 void set_threads(int n);

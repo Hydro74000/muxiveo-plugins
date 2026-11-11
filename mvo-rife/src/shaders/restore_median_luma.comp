@@ -1,0 +1,41 @@
+// Restauration (R2) : référence temporelle du contre-accentuage — luma (codes de la source, en flottant) médiane de
+// l'image t et de ses 4 voisines recalées par le réseau, sur la zone utile (marge `edge` retirée) : le grain, aléatoire
+// d'une image à l'autre, s'y annule ; le détail stable reste.
+#version 450
+#if NCNN_fp16_storage
+#extension GL_EXT_shader_16bit_storage: require
+#endif
+layout (binding = 0) readonly buffer t_blob { sfp t_data[]; };
+layout (binding = 1) readonly buffer w0_blob { sfp w0_data[]; };
+layout (binding = 2) readonly buffer w1_blob { sfp w1_data[]; };
+layout (binding = 3) readonly buffer w2_blob { sfp w2_data[]; };
+layout (binding = 4) readonly buffer w3_blob { sfp w3_data[]; };
+layout (binding = 5) writeonly buffer dst_blob { float dst_data[]; };
+layout (push_constant) uniform parameter { int W; int cstep; int w; int h; int edge; float kr; float kb; float y_off; float y_rng; } p;
+
+void sort2(inout float a, inout float b)
+{
+    float lo = min(a, b);
+    b = max(a, b);
+    a = lo;
+}
+
+void main()
+{
+    int gx = int(gl_GlobalInvocationID.x);
+    int gy = int(gl_GlobalInvocationID.y);
+    if (gx >= p.w || gy >= p.h || int(gl_GlobalInvocationID.z) >= 1)
+        return;
+    int i = (gy + p.edge) * p.W + gx + p.edge;
+    int g = p.cstep, b = 2 * p.cstep;
+    float kg = 1.0 - p.kr - p.kb;
+    float v0 = p.kr * float(t_data[i]) + kg * float(t_data[g + i]) + p.kb * float(t_data[b + i]);
+    float v1 = p.kr * float(w0_data[i]) + kg * float(w0_data[g + i]) + p.kb * float(w0_data[b + i]);
+    float v2 = p.kr * float(w1_data[i]) + kg * float(w1_data[g + i]) + p.kb * float(w1_data[b + i]);
+    float v3 = p.kr * float(w2_data[i]) + kg * float(w2_data[g + i]) + p.kb * float(w2_data[b + i]);
+    float v4 = p.kr * float(w3_data[i]) + kg * float(w3_data[g + i]) + p.kb * float(w3_data[b + i]);
+    // tri complet de 5 valeurs (médiane exacte)
+    sort2(v0, v1); sort2(v3, v4); sort2(v2, v4); sort2(v2, v3); sort2(v1, v4);
+    sort2(v0, v3); sort2(v0, v2); sort2(v1, v3); sort2(v1, v2);
+    dst_data[gy * p.w + gx] = p.y_off + v2 * p.y_rng;
+}

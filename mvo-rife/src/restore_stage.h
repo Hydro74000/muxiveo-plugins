@@ -36,6 +36,7 @@ struct RestoreOptions
     int look = 24;           // courbe de grain : images [s, s + look) du plan
     int dose_look = 24;      // égalisation : [t − dose_look, t + dose_look] ∩ plan
     int cut_look = 12;       // décision de coupe : écarts jusqu'à t + cut_look
+    double sharpen = 0.0;    // contre-accentuage temporel après le dosage (0 : aucun ; voir restore_auto::SharpenParams)
 };
 
 class RestoreStage
@@ -83,6 +84,7 @@ private:
         bool ok = false;
         std::string error;
         ncnn::Mat yuv;  // codes Y'CbCr en virgule fixe 16 bits, rapatriés
+        ncnn::Mat ref;  // référence du contre-accentuage (luma, virgule fixe), si demandée
         std::vector<float> flows;
         int tile = 0;
     };
@@ -134,6 +136,7 @@ private:
     int64_t net_low = 0;  // trames déjà retirées du cache du réseau (fil GPU seulement)
     std::map<int64_t, std::vector<uint8_t>> src;
     std::map<int64_t, ncnn::Mat> out;  // sorties du réseau en virgule fixe 16 bits (tampons rapatriés)
+    std::map<int64_t, ncnn::Mat> refs;  // références du contre-accentuage, jusqu'au dosage
     std::map<int64_t, float> sig;
     std::map<int, restore_auto::GrainCurve> curves;
     std::map<int64_t, std::vector<float>> ana_luma, ana_flows;
