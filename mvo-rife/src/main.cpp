@@ -839,6 +839,19 @@ static int print_capabilities(const Options& o, const fs::path& exe_dir)
     return EXIT_OK;
 }
 
+// Périphérique que le moteur ne pilote pas : GPU Metal paravirtuel des machines virtuelles macOS (runners GitHub, UTM,
+// Parallels) — MoltenVK y plante dès la création du périphérique ncnn (image factice liée par vkBindImageMemory, pilote
+// AppleParavirt). Absent de --list-gpus, refusé à l'exécution (code 3) au lieu d'un plantage.
+static bool gpu_unsupported(int i, std::string* why = nullptr)
+{
+    const std::string name = ncnn::get_gpu_info(i).device_name();
+    if (name.find("Paravirtual") == std::string::npos)
+        return false;
+    if (why)
+        *why = "GPU " + name + " non pris en charge (pilote Metal paravirtuel d'une machine virtuelle)";
+    return true;
+}
+
 static int list_gpus(const Options& o)
 {
     const int count = ncnn::get_gpu_count();
@@ -851,10 +864,24 @@ static int list_gpus(const Options& o)
         trt_api = TrtBackend::load_api(path_from_utf8(o.trt_plugin), handle, trt_plugin_error);
     }
     const int cuda_version = CudaDriver::get().driver_version();
-    const int def = count > 0 ? ncnn::get_default_gpu_index() : -1;
+    int def = count > 0 ? ncnn::get_default_gpu_index() : -1;
+    if (def >= 0 && gpu_unsupported(def))
+    {
+        def = -1;
+        for (int i = 0; i < count && def < 0; i++)
+            if (!gpu_unsupported(i))
+                def = i;
+    }
     printf("{\"version\": \"%s\", \"default\": %d, \"gpus\": [", MUXIVEO_RIFE_VERSION, def);
+    bool first = true;
     for (int i = 0; i < count; i++)
     {
+        std::string why;
+        if (gpu_unsupported(i, &why))
+        {
+            fprintf(stderr, "info: %s : ignoré\n", why.c_str());
+            continue;
+        }
         const ncnn::GpuInfo& info = ncnn::get_gpu_info(i);
         const char* type = "other";
         switch (info.type())
@@ -901,9 +928,10 @@ static int list_gpus(const Options& o)
         if (info.vendor_id() == NVIDIA_VENDOR_ID && cuda_version > 0)
             trt_fields += ", \"cuda_driver\": \"" + std::to_string(cuda_version / 1000) + "." + std::to_string((cuda_version % 1000) / 10) + "\"";
         printf("%s{\"index\": %d, \"name\": \"%s\", \"type\": \"%s\", \"fp16\": %s, \"nvof\": %s, \"nvof_status\": \"%s\"%s}",
-               i ? ", " : "", i, json_escape(info.device_name()).c_str(), type,
+               first ? "" : ", ", i, json_escape(info.device_name()).c_str(), type,
                info.support_fp16_storage() ? "true" : "false", nvof_ok ? "true" : "false",
                json_escape(nvof_status).c_str(), trt_fields.c_str());
+        first = false;
     }
     printf("]}\n");
     return EXIT_OK;
@@ -1003,6 +1031,16 @@ struct OutFrame
 
 static int run(const Options& o, const fs::path& exe_dir)
 {
+    if (ncnn::get_gpu_count() > 0)
+    {
+        std::string why;
+        const int gi = o.gpu >= 0 ? o.gpu : ncnn::get_default_gpu_index();
+        if (gi < ncnn::get_gpu_count() && gpu_unsupported(gi, &why))
+        {
+            fprintf(stderr, "error: %s\n", why.c_str());
+            return EXIT_GPU;
+        }
+    }
     FILE* in = stdin;
     FILE* out = stdout;
     if (o.input != "-")
