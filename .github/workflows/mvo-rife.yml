@@ -40,7 +40,7 @@ jobs:
           - os: windows-2022
             platform: windows-x86_64
             exe: muxiveo-rife.exe
-          - os: macos-14
+          - os: macos-15
             platform: macos-arm64
             exe: muxiveo-rife
     runs-on: ${{ matrix.os }}
