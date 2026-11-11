@@ -1031,16 +1031,6 @@ struct OutFrame
 
 static int run(const Options& o, const fs::path& exe_dir)
 {
-    if (ncnn::get_gpu_count() > 0)
-    {
-        std::string why;
-        const int gi = o.gpu >= 0 ? o.gpu : ncnn::get_default_gpu_index();
-        if (gi < ncnn::get_gpu_count() && gpu_unsupported(gi, &why))
-        {
-            fprintf(stderr, "error: %s\n", why.c_str());
-            return EXIT_GPU;
-        }
-    }
     FILE* in = stdin;
     FILE* out = stdout;
     if (o.input != "-")
@@ -1168,6 +1158,12 @@ static int run(const Options& o, const fs::path& exe_dir)
             fprintf(stderr, "error: aucun GPU Vulkan pour la Restauration\n");
             return EXIT_GPU;
         }
+        std::string why;
+        if (gpu_unsupported(gpu_index, &why))
+        {
+            fprintf(stderr, "error: %s\n", why.c_str());
+            return EXIT_GPU;
+        }
         ncnn::VulkanDevice* rdev = ncnn::get_gpu_device(gpu_index);
         ncnn::Option ropt;
         ropt.num_threads = std::max(1, o.threads);
@@ -1271,6 +1267,12 @@ static int run(const Options& o, const fs::path& exe_dir)
     const int IN_SLOTS = 8;   // file de lecture (3), trame d'avance, paire courante, trame en cours de lecture
     if (needs_gpu)
     {
+        const int engine_gpu = o.gpu >= 0 ? o.gpu : ncnn::get_default_gpu_index();
+        if (engine_gpu >= 0 && engine_gpu < ncnn::get_gpu_count() && gpu_unsupported(engine_gpu, &error))
+        {
+            fprintf(stderr, "error: %s\n", error.c_str());
+            return EXIT_GPU;
+        }
         if (!engine.init(o.gpu, o.fp32, o.threads, error)
                 || !engine.load_model(model_dir,
                                       o.padding > 0 ? o.padding : model_padding(model_name) * (o.uhd || large_motion ? 2 : 1),
