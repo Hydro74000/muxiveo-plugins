@@ -2,6 +2,7 @@
 
 import ctypes as C
 from pathlib import Path
+import os
 import shutil
 import subprocess
 import sys
@@ -25,6 +26,8 @@ def lib(tmp_path_factory):
     subprocess.run([compiler, '-std=c++17', '-O2', '-Wall', '-Wextra', '-Werror', '-shared', *flags, '-I' + str(ROOT / 'src'),
                     str(ROOT / 'src' / 'restore_auto.cpp'), str(ROOT / 'tests' / 'restore_auto_capi.cpp'), '-o', str(out)],
                    check=True, capture_output=True, timeout=120)
+    if sys.platform == 'win32':  # MinGW : libstdc++ / libgcc / winpthread à côté du compilateur
+        os.add_dll_directory(str(Path(compiler).resolve().parent))
     lib = C.CDLL(str(out))
     lib.ra_grain_curve.argtypes = [u16p, C.c_int, C.c_int, f32p, f32p]
     lib.ra_median_curve.argtypes = [f32p, C.c_int, f32p]

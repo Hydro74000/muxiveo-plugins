@@ -90,8 +90,9 @@ jobs:
           lib = ctypes.CDLL(sys.argv[1] + "/libmvo_rife_trt.so")
           lib.mvo_trt_get_api.restype = ctypes.c_void_p
           assert lib.mvo_trt_get_api(1), "interface 1 absente"
-          assert not lib.mvo_trt_get_api(2), "interface inconnue acceptée"
-          print("plugin chargé, interface 1")
+          assert lib.mvo_trt_get_api(2), "interface 2 (sessions de graphe, débruitage MVO-R2) absente"
+          assert not lib.mvo_trt_get_api(3), "interface inconnue acceptée"
+          print("plugin chargé, interfaces 1 et 2")
           PY
       - uses: actions/upload-artifact@v4
         with:

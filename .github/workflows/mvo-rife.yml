@@ -142,8 +142,16 @@ jobs:
         run: |
           set -euo pipefail
           python -m pip install --quiet pytest numpy
-          # Sans GPU Vulkan (Windows/macOS hébergés), les tests fonctionnels sont ignorés.
+          # Sans GPU Vulkan (Windows hébergé), les tests fonctionnels sont ignorés.
           python -m pytest -q -p no:cacheprovider mvo-rife/tests
+
+      - name: Rapports de plantage (macOS)
+        if: failure() && runner.os == 'macOS'
+        shell: bash
+        run: |
+          for f in $(ls -t ~/Library/Logs/DiagnosticReports/muxiveo-rife*.ips 2>/dev/null | head -2); do
+            echo "=== $f"; head -c 60000 "$f"; echo
+          done
 
       - uses: actions/upload-artifact@v4
         with:
