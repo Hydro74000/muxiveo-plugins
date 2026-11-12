@@ -10,6 +10,23 @@ Extension de Muxiveo : installée, mise à jour et supprimée par l'application 
 utilisateur. Le moteur, ses modèles, les poids de son sélecteur et ses préréglages évoluent sans release de
 Muxiveo : l'application retient la version la plus récente dont le contrat (`--capabilities`) lui est connu.
 
+## Nouveautés 1.14.0
+
+Débruitage MVO-R2 plus rapide, sans nouvelle option : en 4K, +42 % en mode rapide et +46 % en mode normal face à la
+1.13.0 (Vulkan, débruitage seul ; le mode normal dépasse désormais le mode rapide de la 1.13.0).
+
+- **Lecture et GPU en parallèle** : l'étage attendait que le GPU soit vide avant de lire la suite quand sa réserve
+  d'images était pleine ; à chaque début de plan, la courbe de grain et le rapport du plan bloquaient l'envoi de travail
+  au GPU. La courbe du plan suivant est désormais calculée dès que ses images sont lues, et jusqu'à 8 images sont
+  confiées au GPU. Sorties identiques ; gain d'autant plus grand que les plans sont courts.
+- **Flux à ± 2 composés** : le flux vers t ± 2 est composé des flux à ± 1, gardés d'une image à l'autre (2 calculs du
+  flux par image au lieu de 4). Les images qui servent à mesurer le grain de chaque plan gardent les flux directs
+  (dosage de l'Auto inchangé). Sorties très légèrement différentes ; banc sur des scènes d'action très animées : grain,
+  détail, instabilité et pompage inchangés.
+- Moins de copies : flux de mesure recadrés sur le GPU avant leur rapatriement, sortie et entrées TensorRT écrites
+  sans tampon intermédiaire (sorties identiques).
+- Interpolation sans `--restore` : calculs inchangés depuis la 1.11.0.
+
 ## Nouveautés 1.13.0
 
 Première version publiée avec le débruitage (la 1.12.0, interne, n'a pas été publiée).
@@ -234,7 +251,8 @@ muxiveo-rife --factor 1 --restore auto [--restore-fast] [--restore-animation] --
 muxiveo-rife --factor 2 --restore moyen ...          # débruitage puis interpolation, même passage
 ```
 
-- Réseau : flux optique entre l'image courante et ses 4 voisines (t ± 2), recalage, puis image débruitée ;
+- Réseau : flux optique entre l'image courante et ses 4 voisines (t ± 2 composé des flux à ± 1 depuis la 1.14.0,
+  sauf sur les images de mesure du grain), recalage, puis image débruitée ;
   fenêtre glissante sans état (aucune image future au-delà de t + 2). Coupes de scène respectées.
 - **Dosage par plan** : le réseau rend l'estimation propre ; une part du résidu réel (source − sortie) est
   réinjectée, égalisée par image sur le niveau du plan. `auto` dose d'après le grain mesuré du plan
