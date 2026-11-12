@@ -381,7 +381,7 @@ struct Options
     double restore_sharpen = 0.0;          // contre-accentuage temporel après le dosage (0 : aucun)
     std::string restore_dither = "auto";  // auto (±1 code) | off | 8 (±1 pas 8 bits : sortie 10 bits vers un encodeur 8 bits)
     std::string transfer;                 // sdr | pq | hlg : canal de transfert du réseau (PQ ou non)
-    int restore_tile = 512;               // côté des tuiles du réseau de restauration
+    int restore_tile = 640;               // côté maximal des tuiles du réseau de restauration (tuiles égales)
     std::string frame_statistics;         // statistiques de chaque trame produite (JSON Lines, sources PQ)
     std::string source_statistics;        // mêmes statistiques des trames lues, avant la Restauration
 };
@@ -435,7 +435,8 @@ static void print_usage(FILE* fp)
             "  --restore-dither <d>    arrondi de sortie : auto (tramé ±1 code, défaut) | off | 8 (±1 pas 8 bits, sortie\n"
             "                          10 bits destinée à un encodeur 8 bits)\n"
             "  --transfer <t>          sdr | pq | hlg : fonction de transfert de la source (Restauration ; défaut : sdr)\n"
-            "  --restore-tile <n>      côté des tuiles du réseau de restauration (défaut : 512)\n"
+            "  --restore-tile <n>      côté maximal des tuiles du réseau de restauration, image découpée en tuiles\n"
+            "                          égales (défaut : 640)\n"
             "  --frame-statistics <f>  statistiques de chaque trame produite (MaxCLL / MaxFALL, format mvo-fel-frame-\n"
             "                          statistics) ; exige --transfer pq\n"
             "  --source-statistics <f> mêmes statistiques des trames lues, avant la Restauration ; exige --transfer pq\n"
@@ -1206,7 +1207,7 @@ static int run(const Options& o, const fs::path& exe_dir)
                     ro.sharpen > 0.0 ? (" | contre-accentuage " + std::to_string(ro.sharpen).substr(0, 4)).c_str() : "",
                     path_to_utf8(rdir.filename()).c_str(), rfs,
                     ro.dither_step == 0 ? "non" : (ro.dither_step == 4 ? "±1 pas 8 bits" : "±1 code"),
-                    restore_net.uses_trt() ? "image entière" : ("tuiles " + std::to_string(o.restore_tile)).c_str(),
+                    restore_net.uses_trt() ? "image entière" : ("tuiles ≤ " + std::to_string(o.restore_tile)).c_str(),
                     o.transfer.empty() ? "sdr" : o.transfer.c_str(), rdev->info.device_name(), restore_backend.c_str());
     }
 

@@ -267,8 +267,8 @@ muxiveo-rife --factor 2 --restore moyen ...          # débruitage puis interpol
 - Sortie : dosage en flottant à un seul arrondi, tramé ±1 code (`--restore-dither auto`, déterministe) ;
   `--restore-dither 8` pour un encodeur 8 bits. `--transfer` indique la fonction de transfert de la source (PQ,
   HLG ou SDR).
-- Mémoire GPU : tuiles de 512 avec marge miroir (`--restore-tile`), repli sur des tuiles plus petites au lieu d'un
-  échec. Avec TensorRT, image entière.
+- Mémoire GPU : image découpée en tuiles égales d'au plus 640 px de côté (`--restore-tile`, 512 jusqu'à la 1.14.0),
+  avec marge miroir, repli sur des tuiles plus petites au lieu d'un échec. Avec TensorRT, image entière.
 - Déterministe : deux passes identiques (GPU non partagé avec un autre programme ; sinon, écarts d'un pas de la
   virgule fixe sur certaines images).
 - Graphes : `<exe>/restore-models/<modèle>/r2_{flow,body}.ncnn.{param,bin}` (Vulkan) et `.onnx` (TensorRT) ;

@@ -2,7 +2,8 @@
 // la région [x0, x0 + tw) × [y0, y0 + th) de l'entrée (c canaux) dans la tuile tpw × tph (multiple de 4 : bords droit
 // et bas répliqués, comme UNetRestore.forward) ; mode 3 : copie directe de la sortie (image entière) ; mode 1 :
 // accumulation de la partie utile de la sortie de la tuile (3 canaux), pondérée par une fenêtre de
-// Hann (taille n, arrondie au format de stockage puis bornée à 1e-3), dans acc (3 canaux) et wsum (flottants 32 bits).
+// Hann (taille n en x, ny en y, arrondie au format de stockage puis bornée à 1e-3), dans acc (3 canaux) et wsum
+// (flottants 32 bits).
 #version 450
 #if NCNN_fp16_storage
 #extension GL_EXT_shader_16bit_storage: require
@@ -14,11 +15,12 @@ layout (binding = 3) buffer wsum_blob { float wsum_data[]; };
 layout (push_constant) uniform parameter
 {
     int mode; int W; int H; int cstep; int c; int x0; int y0; int tw; int th; int tcstep; int wx0; int wy0; int n; int acstep; int tpw; int tph;
+    int ny;
 } p;
 
-float hann(int i)
+float hann(int i, int n)
 {
-    float v = 0.5 - 0.5 * cos(6.283185307179586 * float(i) / float(p.n - 1));
+    float v = 0.5 - 0.5 * cos(6.283185307179586 * float(i) / float(n - 1));
     return max(float(sfp(v)), 1e-3);
 }
 
@@ -55,7 +57,7 @@ void main()
         wsum_data[gi] = 0.0;
         return;
     }
-    float wgt = hann(p.wy0 + gy) * hann(p.wx0 + gx);
+    float wgt = hann(p.wy0 + gy, p.ny) * hann(p.wx0 + gx, p.n);
     for (int k = 0; k < 3; k++)
         acc_data[k * p.acstep + gi] += float(src_data[k * p.tcstep + ti]) * wgt;
     wsum_data[gi] += wgt;

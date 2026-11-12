@@ -335,7 +335,7 @@ bool RestoreNet::assemble(ncnn::VkCompute& cmd, const ncnn::VkMat& rgb, const nc
 std::vector<ncnn::vk_constant_type> RestoreNet::tile_constants(int mode, const ncnn::VkMat& x, const ncnn::VkMat& acc, int c, int x0,
                                                                int y0, int tw, int th, int tcstep, int wx0, int wy0, int tpw, int tph) const
 {
-    std::vector<ncnn::vk_constant_type> k(16);
+    std::vector<ncnn::vk_constant_type> k(17);
     k[0].i = mode;
     k[1].i = W;
     k[2].i = H;
@@ -348,10 +348,11 @@ std::vector<ncnn::vk_constant_type> RestoreNet::tile_constants(int mode, const n
     k[9].i = tcstep;
     k[10].i = wx0;
     k[11].i = wy0;
-    k[12].i = tile + 2 * PAD;
+    k[12].i = tile_w + 2 * PAD;
     k[13].i = (int)acc.cstep;
     k[14].i = tpw;
     k[15].i = tph;
+    k[16].i = tile_h + 2 * PAD;
     return k;
 }
 
@@ -565,11 +566,20 @@ bool RestoreNet::process(int64_t t, const int64_t nb[4], const uint8_t* grain_ma
     if (acc.empty() || wsum.empty() || dummy.empty())
         return fail_oom();
     cmd.record_pipeline(p_tile, {x, dummy, acc, wsum}, tile_constants(2, x, acc, 0, 0, 0, W, H, 0, 0, 0, W, H), dispatch_of(W, H, 1));
-    for (int ty = 0; ty < H; ty += tile)
-        for (int tx = 0; tx < W; tx += tile)
+    // tuiles presque égales, d'au plus `tile` de côté : une dernière rangée étroite coûtait presque une rangée entière de
+    // calcul. Côtés arrondis au multiple de 32 (débuts de tuile, marge comprise, sur la grille de sous-échantillonnage
+    // du réseau, comme l'image entière : sorties plus proches de celle-ci)
+    auto side = [&](int n) {
+        const int k = (n + tile - 1) / tile;
+        return std::min(std::max(32, tile / 32 * 32), ((n + k - 1) / k + 31) / 32 * 32);
+    };
+    tile_w = side(W);
+    tile_h = side(H);
+    for (int ty = 0; ty < H; ty += tile_h)
+        for (int tx = 0; tx < W; tx += tile_w)
         {
-            const int ya = std::max(0, ty - PAD), yb = std::min(H, ty + tile + PAD);
-            const int xa = std::max(0, tx - PAD), xb = std::min(W, tx + tile + PAD);
+            const int ya = std::max(0, ty - PAD), yb = std::min(H, ty + tile_h + PAD);
+            const int xa = std::max(0, tx - PAD), xb = std::min(W, tx + tile_w + PAD);
             const int tw = xb - xa, th = yb - ya, tpw = (tw + 3) / 4 * 4, tph = (th + 3) / 4 * 4;
             ncnn::VkMat tin, tout, tout1;
             tin.create(tpw, tph, 17, elemsize, 1, blob_alloc);

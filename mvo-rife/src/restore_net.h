@@ -35,7 +35,8 @@ public:
     // pour les poids du mode rapide). opt : options du moteur (fp16 de stockage selon le GPU).
     bool init(ncnn::VulkanDevice* vkdev, const ncnn::Option& opt, const std::filesystem::path& dir, double flow_scale,
               std::string& error);
-    // pq : canal de transfert du réseau (1 pour SMPTE ST 2084, 0 sinon) ; tile : côté des tuiles du corps (multiple de 4).
+    // pq : canal de transfert du réseau (1 pour SMPTE ST 2084, 0 sinon) ; tile : côté maximal des tuiles du corps
+    // (multiple de 4), image découpée en tuiles égales.
     bool configure(const FrameFormat& fmt, const ColorParams& color, bool pq, int tile, std::string& error);
 
     // Image source (trame y4m brute, tampon lisible sur padded_frame_bytes()) : conversion et luma du flux, en cache.
@@ -140,7 +141,8 @@ private:
     ColorParams color;
     float pq = 0.f;
     float fx_scale = 64.f;
-    int tile = 512;
+    int tile = 640;
+    int tile_w = 640, tile_h = 640;  // tuiles égales de l'image (calculées à chaque image d'après tile)
     int W = 0, H = 0;    // image avec marge
     int ws = 0, hs = 0;  // définition du flux
     int wu = 0, hu = 0;  // entrée du graphe de flux (multiple de 32)
