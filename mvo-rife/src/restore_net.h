@@ -102,6 +102,8 @@ private:
     void crop_flows(const ncnn::Mat host_flows[4], const Crop& crop, std::vector<float>& flows) const;
     void copy_dense(ncnn::VkCompute& cmd, const ncnn::VkMat& src, int c, const ncnn::VkMat& dst);
     // région (x0, y0, w × h) de c canaux de src copiée dans dst (créé, pas ncnn) ; faux si l'allocation échoue
+    // flux composé f13 = f12 + f23 lu au point déplacé par f12 (même grille) ; faux si l'allocation échoue
+    bool compose_flow(ncnn::VkCompute& cmd, const ncnn::VkMat& f12, const ncnn::VkMat& f23, ncnn::VkMat& f13);
     bool copy_region(ncnn::VkCompute& cmd, const ncnn::VkMat& src, int c, int x0, int y0, int w, int h, ncnn::VkMat& dst);
     bool process_trt(int64_t t, const int64_t nb[4], const uint8_t* grain_map, ncnn::Mat& yuv, const Crop* crop,
                      std::vector<float>* flows, std::string& error, ncnn::Mat* ref);
@@ -123,6 +125,10 @@ private:
     ncnn::Pipeline* p_copy = nullptr;
     ncnn::Pipeline* p_fixed16 = nullptr;
     ncnn::Pipeline* p_median_luma = nullptr;
+    ncnn::Pipeline* p_flow_compose = nullptr;
+    // flux à ± 2 composés de deux flux à ± 1 (2 inférences du graphe de flux par image en régime établi au lieu de 4) ;
+    // flux (a → b) de la grille du graphe gardés d'une image à l'autre, retirés avec leurs images (drop_frame)
+    std::map<std::pair<int64_t, int64_t>, ncnn::VkMat> flow_cache;
     std::unique_ptr<TrtBackend> trt_flow, trt_body;
     bool trt_on = false;
     std::string trt_summary;

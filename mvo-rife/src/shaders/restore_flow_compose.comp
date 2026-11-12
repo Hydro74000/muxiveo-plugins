@@ -1,0 +1,44 @@
+// Restauration (R2), essai perf/r2-cout : composition de flux sur la grille du graphe de flux (2 canaux, pixels) :
+// f13(x) = f12(x) + f23(x + f12(x)), lecture bilinéaire de f23, bords répliqués (convention du recalage rife.Warp).
+#version 450
+#if NCNN_fp16_storage
+#extension GL_EXT_shader_16bit_storage: require
+#endif
+layout (binding = 0) readonly buffer f12_blob { sfp f12_data[]; };
+layout (binding = 1) readonly buffer f23_blob { sfp f23_data[]; };
+layout (binding = 2) writeonly buffer f13_blob { sfp f13_data[]; };
+layout (push_constant) uniform parameter
+{
+    int w; int h; int cstep12; int cstep23; int cstep13;
+} p;
+
+void main()
+{
+    int gx = int(gl_GlobalInvocationID.x);
+    int gy = int(gl_GlobalInvocationID.y);
+    if (gx >= p.w || gy >= p.h)
+        return;
+    int i = gy * p.w + gx;
+    float ux = float(f12_data[i]);
+    float uy = float(f12_data[p.cstep12 + i]);
+    float sx = float(gx) + ux;
+    float sy = float(gy) + uy;
+    int x0 = int(floor(sx));
+    int y0 = int(floor(sy));
+    float ax = sx - float(x0);
+    float ay = sy - float(y0);
+    int x1 = clamp(x0 + 1, 0, p.w - 1);
+    int y1 = clamp(y0 + 1, 0, p.h - 1);
+    x0 = clamp(x0, 0, p.w - 1);
+    y0 = clamp(y0, 0, p.h - 1);
+    for (int c = 0; c < 2; c++)
+    {
+        int b = c * p.cstep23;
+        float v0 = float(f23_data[b + y0 * p.w + x0]);
+        float v1 = float(f23_data[b + y0 * p.w + x1]);
+        float v2 = float(f23_data[b + y1 * p.w + x0]);
+        float v3 = float(f23_data[b + y1 * p.w + x1]);
+        float v = (1.0 - ay) * ((1.0 - ax) * v0 + ax * v1) + ay * ((1.0 - ax) * v2 + ax * v3);
+        f13_data[c * p.cstep13 + i] = sfp((c == 0 ? ux : uy) + v);
+    }
+}

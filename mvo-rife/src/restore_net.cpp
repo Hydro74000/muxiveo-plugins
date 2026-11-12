@@ -14,6 +14,7 @@
 #include "restore_copy.comp.hex.h"
 #include "restore_fixed16.comp.hex.h"
 #include "restore_median_luma.comp.hex.h"
+#include "restore_flow_compose.comp.hex.h"
 #include "restore_luma_area.comp.hex.h"
 #include "restore_resize.comp.hex.h"
 #include "restore_rgb_to_yuv_aa.comp.hex.h"
@@ -97,10 +98,11 @@ RestoreNet::~RestoreNet() { release(); }
 void RestoreNet::release()
 {
     cache.clear();
+    flow_cache.clear();
     trt_flow.reset();
     trt_body.reset();
     trt_on = false;
-    for (ncnn::Pipeline** p : {&p_yuv_to_rgb, &p_luma_area, &p_resize, &p_assemble, &p_tile, &p_rgb_to_yuv, &p_copy, &p_fixed16, &p_median_luma})
+    for (ncnn::Pipeline** p : {&p_yuv_to_rgb, &p_luma_area, &p_resize, &p_assemble, &p_tile, &p_rgb_to_yuv, &p_copy, &p_fixed16, &p_median_luma, &p_flow_compose})
     {
         delete *p;
         *p = nullptr;
@@ -166,8 +168,9 @@ bool RestoreNet::init(ncnn::VulkanDevice* dev, const ncnn::Option& base, const s
     p_copy = make_pipeline(restore_copy_comp_data, sizeof(restore_copy_comp_data), 8, 8, 1);
     p_fixed16 = make_pipeline(restore_fixed16_comp_data, sizeof(restore_fixed16_comp_data), 256, 1, 1);
     p_median_luma = make_pipeline(restore_median_luma_comp_data, sizeof(restore_median_luma_comp_data), 8, 8, 1);
+    p_flow_compose = make_pipeline(restore_flow_compose_comp_data, sizeof(restore_flow_compose_comp_data), 8, 8, 1);
     if (!p_yuv_to_rgb || !p_luma_area || !p_resize || !p_assemble || !p_tile || !p_rgb_to_yuv || !p_copy || !p_fixed16
-        || !p_median_luma)
+        || !p_median_luma || !p_flow_compose)
     {
         error = "compilation des shaders de restauration impossible";
         return false;
@@ -287,7 +290,12 @@ bool RestoreNet::add_frame(int64_t index, const void* frame, std::string& error)
     return true;
 }
 
-void RestoreNet::drop_frame(int64_t index) { cache.erase(index); }
+void RestoreNet::drop_frame(int64_t index)
+{
+    cache.erase(index);
+    for (auto it = flow_cache.begin(); it != flow_cache.end();)
+        it = (it->first.first == index || it->first.second == index) ? flow_cache.erase(it) : std::next(it);
+}
 
 bool RestoreNet::assemble(ncnn::VkCompute& cmd, const ncnn::VkMat& rgb, const ncnn::VkMat warped[4], const uint8_t* grain_map,
                           ncnn::VkMat& x, const ncnn::VkMat* into)
@@ -470,29 +478,59 @@ bool RestoreNet::process(int64_t t, const int64_t nb[4], const uint8_t* grain_ma
     const Cached& ct = cache.at(t);
     ncnn::VkCompute cmd(vkdev);
 
-    // flux et voisines recalées
+    // flux et voisines recalées : flux à ± 2 composés de deux flux à ± 1, sauf sur les images d'analyse (mesure du grain
+    // du plan : flux directs, sinon le rapport et le dosage de l'Auto changent)
+    const bool composing = !(crop && flows);
+    auto flow_pair = [&](int64_t a, int64_t b, ncnn::VkMat& outf) -> int {
+        const auto hit = flow_cache.find({a, b});
+        if (hit != flow_cache.end())
+        {
+            outf = hit->second;
+            return 0;
+        }
+        ncnn::VkMat f;
+        {
+            ncnn::Extractor ex = flow_net.create_extractor();
+            ex.input("in0", cache.at(a).flowin);
+            ex.input("in1", cache.at(b).flowin);
+            const int r = ex.extract("out0", f, cmd);
+            if (r != 0)
+                return r;
+        }
+        ncnn::VkMat f1;
+        if (f.elempack != 1)
+            vkdev->convert_packing(f, f1, 1, cmd, opt);
+        else
+            f1 = f;
+        if (f1.empty())  // allocation refusée : jamais de tampon vide lié à un shader
+            return -100;
+        flow_cache[{a, b}] = f1;
+        outf = f1;
+        return 0;
+    };
     ncnn::VkMat warped[4], full[4];
     for (int j = 0; j < 4; j++)
     {
         const Cached& cn = cache.at(nb[j]);
-        ncnn::VkMat f;
-        {
-            ncnn::Extractor ex = flow_net.create_extractor();
-            ex.input("in0", ct.flowin);
-            ex.input("in1", cn.flowin);
-            const int r = ex.extract("out0", f, cmd);
-            if (r == -100)
-                return fail_oom();
-            if (r != 0)
-                return fail("graphe de flux en échec");
-        }
+        const int64_t d = nb[j] - t;
+        const int64_t m = t + d / 2;
         ncnn::VkMat f_pack1;
-        if (f.elempack != 1)
-            vkdev->convert_packing(f, f_pack1, 1, cmd, opt);
+        int r;
+        if (composing && (d == 2 || d == -2) && cache.count(m) && (nb[1] == m || nb[2] == m))
+        {
+            ncnn::VkMat f12, f23;
+            r = flow_pair(t, m, f12);
+            if (r == 0)
+                r = flow_pair(m, nb[j], f23);
+            if (r == 0 && !compose_flow(cmd, f12, f23, f_pack1))
+                r = -100;
+        }
         else
-            f_pack1 = f;
-        if (f_pack1.empty())  // allocation refusée : jamais de tampon vide lié à un shader
+            r = flow_pair(t, nb[j], f_pack1);
+        if (r == -100)
             return fail_oom();
+        if (r != 0)
+            return fail("graphe de flux en échec");
         if (!warp_from_flow(cmd, f_pack1, cn.rgb, full[j], warped[j], error))
             return oom ? false : fail("recalage en échec");
     }
@@ -609,6 +647,22 @@ void RestoreNet::copy_dense(ncnn::VkCompute& cmd, const ncnn::VkMat& src, int c,
     cmd.record_pipeline(p_copy, {src, dst}, k, dispatch_of(dst.w, dst.h, 1));
 }
 
+bool RestoreNet::compose_flow(ncnn::VkCompute& cmd, const ncnn::VkMat& f12, const ncnn::VkMat& f23, ncnn::VkMat& f13)
+{
+    // f13(x) = f12(x) + f23(x + f12(x)) sur la grille du graphe de flux (lecture bilinéaire, bords répliqués)
+    f13.create(f12.w, f12.h, 2, f12.elemsize, 1, blob_alloc);
+    if (f13.empty())
+        return false;
+    std::vector<ncnn::vk_constant_type> k(5);
+    k[0].i = f12.w;
+    k[1].i = f12.h;
+    k[2].i = (int)f12.cstep;
+    k[3].i = (int)f23.cstep;
+    k[4].i = (int)f13.cstep;
+    cmd.record_pipeline(p_flow_compose, {f12, f23, f13}, k, dispatch_of(f12.w, f12.h, 1));
+    return true;
+}
+
 bool RestoreNet::copy_region(ncnn::VkCompute& cmd, const ncnn::VkMat& src, int c, int x0, int y0, int w, int h, ncnn::VkMat& dst)
 {
     dst.create(w, h, c, src.elemsize, 1, blob_alloc);
@@ -676,24 +730,82 @@ bool RestoreNet::process_trt(int64_t t, const int64_t nb[4], const uint8_t* grai
     const Cached& ct = cache.at(t);
     ncnn::VkMat warped[4], full[4];
     auto cmd = std::make_unique<ncnn::VkCompute>(vkdev);
-    for (int j = 0; j < 4; j++)
+    if (!(crop && flows))
     {
-        const Cached& cn = cache.at(nb[j]);
-        copy_dense(*cmd, ct.flowin, 3, trt_flow->input(0));
-        copy_dense(*cmd, cn.flowin, 3, trt_flow->input(1));
-        if (cmd->submit_and_wait() != 0)
-            return fail("exécution GPU en échec");
-        if (!trt_flow->infer_graph(error))
-            return false;
-        cmd = std::make_unique<ncnn::VkCompute>(vkdev);
-        if (!warp_from_flow(*cmd, trt_flow->output(), cn.rgb, full[j], warped[j], error))
-            return oom ? false : fail("recalage en échec");
-        // la sortie du graphe de flux est réécrite par l'inférence suivante : redimensionnements exécutés avant
-        if (j < 3 && cmd->submit_and_wait() != 0)
-            return fail("exécution GPU en échec");
-        if (j < 3)
+        // flux à ± 2 composés (voir process) ; la sortie du graphe étant réécrite à chaque inférence, chaque flux est
+        // copié dans un tampon gardé d'une image à l'autre
+        auto trt_flow_pair = [&](int64_t a, int64_t b, ncnn::VkMat& outf) -> int {
+            const auto hit = flow_cache.find({a, b});
+            if (hit != flow_cache.end())
+            {
+                outf = hit->second;
+                return 0;
+            }
+            copy_dense(*cmd, cache.at(a).flowin, 3, trt_flow->input(0));
+            copy_dense(*cmd, cache.at(b).flowin, 3, trt_flow->input(1));
+            if (cmd->submit_and_wait() != 0)
+                return -1;
             cmd = std::make_unique<ncnn::VkCompute>(vkdev);
+            if (!trt_flow->infer_graph(error))
+                return -2;
+            const ncnn::VkMat& o = trt_flow->output();
+            outf.create(o.w, o.h, 2, o.elemsize, 1, blob_alloc);
+            if (outf.empty())
+                return -100;
+            copy_dense(*cmd, o, 2, outf);
+            if (cmd->submit_and_wait() != 0)
+                return -1;
+            cmd = std::make_unique<ncnn::VkCompute>(vkdev);
+            flow_cache[{a, b}] = outf;
+            return 0;
+        };
+        for (int j = 0; j < 4; j++)
+        {
+            const Cached& cn = cache.at(nb[j]);
+            const int64_t d = nb[j] - t;
+            const int64_t m = t + d / 2;
+            ncnn::VkMat fj;
+            int r;
+            if ((d == 2 || d == -2) && cache.count(m) && (nb[1] == m || nb[2] == m))
+            {
+                ncnn::VkMat f12, f23;
+                r = trt_flow_pair(t, m, f12);
+                if (r == 0)
+                    r = trt_flow_pair(m, nb[j], f23);
+                if (r == 0 && !compose_flow(*cmd, f12, f23, fj))
+                    r = -100;
+            }
+            else
+                r = trt_flow_pair(t, nb[j], fj);
+            if (r == -100)
+                return fail_oom();
+            if (r == -2)
+                return false;
+            if (r != 0)
+                return fail("exécution GPU en échec");
+            if (!warp_from_flow(*cmd, fj, cn.rgb, full[j], warped[j], error))
+                return oom ? false : fail("recalage en échec");
+        }
     }
+    else
+        for (int j = 0; j < 4; j++)
+        {
+            const Cached& cn = cache.at(nb[j]);
+            copy_dense(*cmd, ct.flowin, 3, trt_flow->input(0));
+            copy_dense(*cmd, cn.flowin, 3, trt_flow->input(1));
+            if (cmd->submit_and_wait() != 0)
+                return fail("exécution GPU en échec");
+            if (!trt_flow->infer_graph(error))
+                return false;
+            cmd = std::make_unique<ncnn::VkCompute>(vkdev);
+            if (!warp_from_flow(*cmd, trt_flow->output(), cn.rgb, full[j], warped[j], error))
+                return oom ? false : fail("recalage en échec");
+            // la sortie du graphe de flux est réécrite par l'inférence suivante : redimensionnements exécutés avant
+            if (j < 3 && cmd->submit_and_wait() != 0)
+                return fail("exécution GPU en échec");
+            if (j < 3)
+                cmd = std::make_unique<ncnn::VkCompute>(vkdev);
+        }
     if (ref && !record_reference(*cmd, ct.rgb, warped, *ref))
         return fail_oom();
     ncnn::VkMat x;
