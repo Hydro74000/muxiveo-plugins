@@ -5,15 +5,22 @@
 //          définition sous-échantillonnés horizontalement -> tmp (2 plans cwx × h).
 // pass 1 : sous-échantillonnage vertical de tmp -> Cb / Cr en codes.
 // Sortie : [Y (w × h) | Cb (cw × ch) | Cr (cw × ch)] en flottants 32 bits.
+// direct = 1 : R'G'B' lu tel quel dans la sortie du corps (src16, format de stockage, largeur dw, pas dcstep : image
+// entière TensorRT, sans accumulation ni division ; mêmes valeurs que acc = sortie, wsum = 1).
 #version 450
+#if NCNN_fp16_storage
+#extension GL_EXT_shader_16bit_storage: require
+#endif
 layout (binding = 0) readonly buffer acc_blob { float acc_data[]; };
 layout (binding = 1) readonly buffer wsum_blob { float wsum_data[]; };
 layout (binding = 2) buffer tmp_blob { float tmp_data[]; };
 layout (binding = 3) buffer out_blob { float out_data[]; };
+layout (binding = 4) readonly buffer src16_blob { sfp src16_data[]; };
 layout (push_constant) uniform parameter
 {
     int pass; int W; int acstep; int edge; int w; int h; int cw; int ch; int cx_mode; int cy_mode;
     float y_off; float y_rng; float c_off; float c_rng; float kr; float kb;
+    int direct; int dw; int dcstep;
 } p;
 
 float lanczos_tap(int i, int mode)
@@ -33,6 +40,11 @@ float lanczos_norm(int mode)
 
 vec3 rgb_at(int x, int y)
 {
+    if (p.direct == 1)
+    {
+        int d = (p.edge + y) * p.dw + (p.edge + x);
+        return vec3(float(src16_data[d]), float(src16_data[p.dcstep + d]), float(src16_data[2 * p.dcstep + d]));
+    }
     int i = (p.edge + y) * p.W + (p.edge + x);
     float ws = wsum_data[i];
     return vec3(acc_data[i], acc_data[p.acstep + i], acc_data[2 * p.acstep + i]) / ws;

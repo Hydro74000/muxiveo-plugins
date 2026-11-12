@@ -290,7 +290,7 @@ bool RestoreNet::add_frame(int64_t index, const void* frame, std::string& error)
 void RestoreNet::drop_frame(int64_t index) { cache.erase(index); }
 
 bool RestoreNet::assemble(ncnn::VkCompute& cmd, const ncnn::VkMat& rgb, const ncnn::VkMat warped[4], const uint8_t* grain_map,
-                          ncnn::VkMat& x)
+                          ncnn::VkMat& x, const ncnn::VkMat* into)
 {
     ncnn::VkMat map_gpu;
     {
@@ -300,10 +300,14 @@ bool RestoreNet::assemble(ncnn::VkCompute& cmd, const ncnn::VkMat& rgb, const nc
         ncnn::Mat host((int)words.size(), words.data(), (size_t)4u, 1);
         cmd.record_clone(host, map_gpu, opt);
     }
-    x.create(W, H, 17, elemsize, 1, blob_alloc);
+    if (into)
+        x = *into;  // tampon d'entrée TensorRT (dense, bords répliqués)
+    else
+        x.create(W, H, 17, elemsize, 1, blob_alloc);
     if (map_gpu.empty() || x.empty())
         return false;
-    std::vector<ncnn::vk_constant_type> k(8);
+    const int outw = into ? into->w : W, outh = into ? into->h : H;
+    std::vector<ncnn::vk_constant_type> k(10);
     k[0].i = W;
     k[1].i = H;
     k[2].i = (int)rgb.cstep;
@@ -312,7 +316,9 @@ bool RestoreNet::assemble(ncnn::VkCompute& cmd, const ncnn::VkMat& rgb, const nc
     k[5].i = EDGE;
     k[6].i = (int)x.cstep;
     k[7].f = pq;
-    cmd.record_pipeline(p_assemble, {rgb, warped[0], warped[1], warped[2], warped[3], map_gpu, x}, k, dispatch_of(W, H, 1));
+    k[8].i = outw;
+    k[9].i = outh;
+    cmd.record_pipeline(p_assemble, {rgb, warped[0], warped[1], warped[2], warped[3], map_gpu, x}, k, dispatch_of(outw, outh, 1));
     return true;
 }
 
@@ -376,7 +382,7 @@ bool RestoreNet::to_fixed16(ncnn::VkCompute& cmd, const ncnn::VkMat& yuv, ncnn::
     return true;
 }
 
-bool RestoreNet::to_yuv(ncnn::VkCompute& cmd, const ncnn::VkMat& acc, const ncnn::VkMat& wsum, ncnn::VkMat& out)
+bool RestoreNet::to_yuv(ncnn::VkCompute& cmd, const ncnn::VkMat& acc, const ncnn::VkMat& wsum, ncnn::VkMat& out, const ncnn::VkMat* direct)
 {
     const int cw = fmt.chroma_width(), ch = fmt.chroma_height();
     const int cmx = fmt.sub_x == 1 ? 0 : (color.siting == ChromaSiting::Center ? 2 : 1);
@@ -390,7 +396,7 @@ bool RestoreNet::to_yuv(ncnn::VkCompute& cmd, const ncnn::VkMat& acc, const ncnn
     const Scale s = code_scale(fmt, color.full_range);
     for (int pass = 0; pass < 2; pass++)
     {
-        std::vector<ncnn::vk_constant_type> k(16);
+        std::vector<ncnn::vk_constant_type> k(19);
         k[0].i = pass;
         k[1].i = W;
         k[2].i = (int)acc.cstep;
@@ -407,7 +413,13 @@ bool RestoreNet::to_yuv(ncnn::VkCompute& cmd, const ncnn::VkMat& acc, const ncnn
         k[13].f = s.c_range;
         k[14].f = color.kr;
         k[15].f = color.kb;
-        cmd.record_pipeline(p_rgb_to_yuv, {acc, wsum, tmp, out}, k,
+        k[16].i = direct ? 1 : 0;
+        k[17].i = direct ? direct->w : 0;
+        k[18].i = direct ? (int)direct->cstep : 0;
+        // liaisons inutilisées : un tampon valide quelconque (jamais lu)
+        const ncnn::VkMat& a = direct ? *direct : acc;
+        const ncnn::VkMat& ws = direct ? *direct : wsum;
+        cmd.record_pipeline(p_rgb_to_yuv, {a, ws, tmp, out, direct ? *direct : acc}, k,
                             pass == 0 ? dispatch_of(std::max(fmt.width, cwx), fmt.height, 1) : dispatch_of(cw, ch, 1));
     }
     return true;
@@ -430,7 +442,7 @@ void RestoreNet::crop_flows(const ncnn::Mat host_flows[4], const Crop& crop, std
             const float* plane = m.channel(c);
             for (int y = 0; y < crop.h; y++)
                 for (int xx = 0; xx < crop.w; xx++)
-                    flows[(((size_t)j * crop.h + y) * crop.w + xx) * 2 + c] = plane[(size_t)(EDGE + crop.y0 + y) * m.w + EDGE + crop.x0 + xx];
+                    flows[(((size_t)j * crop.h + y) * crop.w + xx) * 2 + c] = plane[(size_t)y * m.w + xx];  // déjà recadré
         }
     }
 }
@@ -538,9 +550,14 @@ bool RestoreNet::process(int64_t t, const int64_t nb[4], const uint8_t* grain_ma
     ncnn::Mat host_out, host_flows[4];
     cmd.record_clone(packed, host_out, opt);
     const bool want_flows = crop && flows;
-    if (want_flows)
+    if (want_flows)  // recadrage de la mesure seulement (≤ 1920 × 1080), recadré sur le GPU avant le rapatriement
         for (int j = 0; j < 4; j++)
-            cmd.record_clone(full[j], host_flows[j], opt);
+        {
+            ncnn::VkMat region;
+            if (!copy_region(cmd, full[j], 2, EDGE + crop->x0, EDGE + crop->y0, crop->w, crop->h, region))
+                return fail_oom();
+            cmd.record_clone(region, host_flows[j], opt);
+        }
     if (cmd.submit_and_wait() != 0)
         return fail("exécution GPU en échec");
     yuv = host_out;
@@ -579,14 +596,36 @@ bool RestoreNet::warp_from_flow(ncnn::VkCompute& cmd, const ncnn::VkMat& f, cons
 
 void RestoreNet::copy_dense(ncnn::VkCompute& cmd, const ncnn::VkMat& src, int c, const ncnn::VkMat& dst)
 {
-    std::vector<ncnn::vk_constant_type> k(6);
+    std::vector<ncnn::vk_constant_type> k(9);
     k[0].i = src.w;
     k[1].i = src.h;
     k[2].i = c;
     k[3].i = (int)src.cstep;
     k[4].i = dst.w;
     k[5].i = dst.h;
+    k[6].i = 0;
+    k[7].i = 0;
+    k[8].i = dst.w * dst.h;
     cmd.record_pipeline(p_copy, {src, dst}, k, dispatch_of(dst.w, dst.h, 1));
+}
+
+bool RestoreNet::copy_region(ncnn::VkCompute& cmd, const ncnn::VkMat& src, int c, int x0, int y0, int w, int h, ncnn::VkMat& dst)
+{
+    dst.create(w, h, c, src.elemsize, 1, blob_alloc);
+    if (dst.empty())
+        return false;
+    std::vector<ncnn::vk_constant_type> k(9);
+    k[0].i = src.w;
+    k[1].i = src.h;
+    k[2].i = c;
+    k[3].i = (int)src.cstep;
+    k[4].i = w;
+    k[5].i = h;
+    k[6].i = x0;
+    k[7].i = y0;
+    k[8].i = (int)dst.cstep;
+    cmd.record_pipeline(p_copy, {src, dst}, k, dispatch_of(w, h, 1));
+    return true;
 }
 
 bool RestoreNet::enable_trt(const std::filesystem::path& plugin_dir, const std::filesystem::path& onnx_dir, const std::string& tag,
@@ -657,32 +696,32 @@ bool RestoreNet::process_trt(int64_t t, const int64_t nb[4], const uint8_t* grai
     }
     if (ref && !record_reference(*cmd, ct.rgb, warped, *ref))
         return fail_oom();
-    ncnn::VkMat x, acc, wsum, dummy;
-    if (!assemble(*cmd, ct.rgb, warped, grain_map, x))
+    ncnn::VkMat x;
+    // image entière assemblée directement dans le tampon d'entrée du corps (bords répliqués jusqu'au multiple de 4)
+    if (!assemble(*cmd, ct.rgb, warped, grain_map, x, &trt_body->input(0)))
         return fail_oom();
-    copy_dense(*cmd, x, 17, trt_body->input(0));  // image entière, bords répliqués jusqu'au multiple de 4
     if (cmd->submit_and_wait() != 0)
         return fail("exécution GPU en échec");
     if (!trt_body->infer_graph(error))
         return false;
     cmd = std::make_unique<ncnn::VkCompute>(vkdev);
-    acc.create(W, H, 3, 4u, 1, blob_alloc);
-    wsum.create(W, H, 1, 4u, 1, blob_alloc);
-    dummy.create(4, 1, 1, elemsize, 1, blob_alloc);
-    if (acc.empty() || wsum.empty() || dummy.empty())
-        return fail_oom();
+    // sortie du corps (image entière, tampon dense o.w × o.h) lue directement par la conversion Y'CbCr : mêmes valeurs
+    // que la copie dans un accumulateur de poids 1, sans les 130 Mo écrits puis relus
     const ncnn::VkMat& o = trt_body->output();
-    cmd->record_pipeline(p_tile, {o, dummy, acc, wsum}, tile_constants(3, x, acc, 3, 0, 0, W, H, o.w * o.h, 0, 0, o.w, o.h),
-                         dispatch_of(W, H, 1));
     ncnn::VkMat out, packed;
-    if (!to_yuv(*cmd, acc, wsum, out) || !to_fixed16(*cmd, out, packed))
+    if (!to_yuv(*cmd, o, o, out, &o) || !to_fixed16(*cmd, out, packed))
         return fail_oom();
     ncnn::Mat host_out, host_flows[4];
     cmd->record_clone(packed, host_out, opt);
     const bool want_flows = crop && flows;
-    if (want_flows)
+    if (want_flows)  // recadrage de la mesure seulement, recadré sur le GPU avant le rapatriement
         for (int j = 0; j < 4; j++)
-            cmd->record_clone(full[j], host_flows[j], opt);
+        {
+            ncnn::VkMat region;
+            if (!copy_region(*cmd, full[j], 2, EDGE + crop->x0, EDGE + crop->y0, crop->w, crop->h, region))
+                return fail_oom();
+            cmd->record_clone(region, host_flows[j], opt);
+        }
     if (cmd->submit_and_wait() != 0)
         return fail("exécution GPU en échec");
     yuv = host_out;

@@ -1,5 +1,7 @@
 // Restauration (R2) : entrée du corps, 17 canaux sur l'image avec marge (W × H) : image t (3), 4 voisines recalées
 // (4 × 3, ordre t − 2, t − 1, t + 1, t + 2), carte de grain (octet / 20 / 16, marge miroir), canal PQ (constante).
+// Sortie outw × outh (pas de ligne outw, pas de plan outcstep) : W × H pour les tuiles Vulkan, ou directement le tampon
+// d'entrée TensorRT (dimensions multiples de 4, bords droit et bas répliqués comme sa copie).
 #version 450
 #if NCNN_fp16_storage
 #extension GL_EXT_shader_16bit_storage: require
@@ -11,7 +13,7 @@ layout (binding = 3) readonly buffer w2_blob { sfp w2_data[]; };
 layout (binding = 4) readonly buffer w3_blob { sfp w3_data[]; };
 layout (binding = 5) readonly buffer map_blob { uint map_data[]; };
 layout (binding = 6) writeonly buffer dst_blob { sfp dst_data[]; };
-layout (push_constant) uniform parameter { int W; int H; int cstep; int w; int h; int edge; int outcstep; float pq; } p;
+layout (push_constant) uniform parameter { int W; int H; int cstep; int w; int h; int edge; int outcstep; float pq; int outw; int outh; } p;
 
 int reflect101(int i, int n)
 {
@@ -25,18 +27,21 @@ void main()
 {
     int gx = int(gl_GlobalInvocationID.x);
     int gy = int(gl_GlobalInvocationID.y);
-    if (gx >= p.W || gy >= p.H || int(gl_GlobalInvocationID.z) >= 1)
+    if (gx >= p.outw || gy >= p.outh || int(gl_GlobalInvocationID.z) >= 1)
         return;
-    int i = gy * p.W + gx;
+    int sx = min(gx, p.W - 1);
+    int sy = min(gy, p.H - 1);
+    int si = sy * p.W + sx;
+    int i = gy * p.outw + gx;
     for (int c = 0; c < 3; c++)
     {
-        dst_data[c * p.outcstep + i] = t_data[c * p.cstep + i];
-        dst_data[(3 + c) * p.outcstep + i] = w0_data[c * p.cstep + i];
-        dst_data[(6 + c) * p.outcstep + i] = w1_data[c * p.cstep + i];
-        dst_data[(9 + c) * p.outcstep + i] = w2_data[c * p.cstep + i];
-        dst_data[(12 + c) * p.outcstep + i] = w3_data[c * p.cstep + i];
+        dst_data[c * p.outcstep + i] = t_data[c * p.cstep + si];
+        dst_data[(3 + c) * p.outcstep + i] = w0_data[c * p.cstep + si];
+        dst_data[(6 + c) * p.outcstep + i] = w1_data[c * p.cstep + si];
+        dst_data[(9 + c) * p.outcstep + i] = w2_data[c * p.cstep + si];
+        dst_data[(12 + c) * p.outcstep + i] = w3_data[c * p.cstep + si];
     }
-    int mi = reflect101(gy - p.edge, p.h) * p.w + reflect101(gx - p.edge, p.w);
+    int mi = reflect101(sy - p.edge, p.h) * p.w + reflect101(sx - p.edge, p.w);
     float m = float((map_data[mi >> 2] >> (8 * (mi & 3))) & 0xffu) / 20.0 / 16.0;
     dst_data[15 * p.outcstep + i] = sfp(m);
     dst_data[16 * p.outcstep + i] = sfp(p.pq);

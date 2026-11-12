@@ -90,13 +90,19 @@ private:
                 ncnn::VkMat& dst);
     bool warp_from_flow(ncnn::VkCompute& cmd, const ncnn::VkMat& f, const ncnn::VkMat& rgb, ncnn::VkMat& full, ncnn::VkMat& warped,
                         std::string& error);
-    bool assemble(ncnn::VkCompute& cmd, const ncnn::VkMat& rgb, const ncnn::VkMat warped[4], const uint8_t* grain_map, ncnn::VkMat& x);
-    bool to_yuv(ncnn::VkCompute& cmd, const ncnn::VkMat& acc, const ncnn::VkMat& wsum, ncnn::VkMat& out);
+    // into : écrire directement dans ce tampon (entrée TensorRT : dense, dimensions ≥ W × H, bords répliqués)
+    bool assemble(ncnn::VkCompute& cmd, const ncnn::VkMat& rgb, const ncnn::VkMat warped[4], const uint8_t* grain_map, ncnn::VkMat& x,
+                  const ncnn::VkMat* into = nullptr);
+    // direct : sortie du corps lue telle quelle (image entière TensorRT : tampon dense, largeur direct->w), sans acc / wsum
+    bool to_yuv(ncnn::VkCompute& cmd, const ncnn::VkMat& acc, const ncnn::VkMat& wsum, ncnn::VkMat& out,
+                const ncnn::VkMat* direct = nullptr);
     bool to_fixed16(ncnn::VkCompute& cmd, const ncnn::VkMat& yuv, ncnn::VkMat& packed);
     std::vector<ncnn::vk_constant_type> tile_constants(int mode, const ncnn::VkMat& x, const ncnn::VkMat& acc, int c, int x0, int y0, int tw,
                                                        int th, int tcstep, int wx0, int wy0, int tpw, int tph) const;
     void crop_flows(const ncnn::Mat host_flows[4], const Crop& crop, std::vector<float>& flows) const;
     void copy_dense(ncnn::VkCompute& cmd, const ncnn::VkMat& src, int c, const ncnn::VkMat& dst);
+    // région (x0, y0, w × h) de c canaux de src copiée dans dst (créé, pas ncnn) ; faux si l'allocation échoue
+    bool copy_region(ncnn::VkCompute& cmd, const ncnn::VkMat& src, int c, int x0, int y0, int w, int h, ncnn::VkMat& dst);
     bool process_trt(int64_t t, const int64_t nb[4], const uint8_t* grain_map, ncnn::Mat& yuv, const Crop* crop,
                      std::vector<float>* flows, std::string& error, ncnn::Mat* ref);
     bool record_reference(ncnn::VkCompute& cmd, const ncnn::VkMat& rgb, const ncnn::VkMat warped[4], ncnn::Mat& host_ref);
