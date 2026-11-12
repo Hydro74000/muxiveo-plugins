@@ -134,8 +134,9 @@ bool RestoreStage::push(const uint8_t* frame)
     cuts_.push(y.data(), fmt.width, fmt.height, fmt.width);
     src[n_in] = std::move(buf);
     n_in++;
-    // contre-pression : au-delà de max_hold trames tenues, attendre le GPU
-    return pump(src.size() > max_hold);
+    // contre-pression : au-delà de max_hold trames tenues, attendre le GPU ; condition réévaluée dans pump, qui rend la main
+    // dès qu'une place est libérée (pump(true) attendait que le GPU soit vide : lecteur et GPU travaillaient à tour de rôle)
+    return pump(false);
 }
 
 bool RestoreStage::finish()
@@ -207,6 +208,23 @@ bool RestoreStage::shot_curve(int s)
     }
     curves[s] = median_curve(cs);
     return true;
+}
+
+bool RestoreStage::curve_ahead()
+{
+    // courbe de grain du prochain plan calculée dès que ses images sont lues, avant que le réseau atteigne le plan
+    // (≈ 0,6 s en 4K) : le fil GPU garde du travail pendant ce calcul au lieu d'attendre la première image du plan
+    for (; curve_scan < cut_list.size(); curve_scan++)
+    {
+        const int s = cut_list[curve_scan];
+        if (s <= next_net || curves.count(s))
+            continue;  // plan déjà atteint : courbe calculée par prepare()
+        if (!shot_curve(s))
+            return false;  // images pas encore lues
+        curve_scan++;
+        return true;
+    }
+    return false;
 }
 
 bool RestoreStage::prepare()
@@ -416,6 +434,8 @@ bool RestoreStage::pump(bool block)
         if (launch())
             progressed = true;
         if (in_flight > 0 && prepare())  // image suivante préparée pendant le travail GPU
+            progressed = true;
+        if (in_flight > 0 && curve_ahead())
             progressed = true;
         if (pending_sig >= 0)
         {

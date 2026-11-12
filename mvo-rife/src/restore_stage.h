@@ -90,6 +90,7 @@ private:
     };
     bool pump(bool block);
     bool prepare();
+    bool curve_ahead();
     bool launch();
     int collect(bool block);  // 1 : résultat collecté ; 0 : aucun ; −1 : erreur
     void gpu_worker();
@@ -119,9 +120,12 @@ private:
     restore_auto::CutDetector cuts_;
     std::vector<int> cut_list;
     int cuts_scanned = 0;
+    size_t curve_scan = 0;  // prochain début de plan de cut_list dont la courbe peut être calculée d'avance
     std::optional<int> n_total;
     int n_in = 0, next_net = 0, done_net = 0, next_out = 0;
-    static constexpr int MAX_IN_FLIGHT = 2;  // images confiées au fil GPU au plus (une en calcul, une prête)
+    // images confiées au fil GPU au plus : réserve de travail pendant les calculs processeur ponctuels de ce fil (rapport
+    // de grain d'un plan, ≈ 0,5 s en 4K), sans quoi le GPU attend
+    static constexpr int MAX_IN_FLIGHT = 8;
     std::thread worker;
     std::mutex wm;
     std::condition_variable wcv;
