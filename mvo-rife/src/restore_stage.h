@@ -75,6 +75,7 @@ private:
         std::vector<std::pair<int64_t, const uint8_t*>> inputs;
         std::shared_ptr<std::vector<uint8_t>> map;
         bool want = false;
+        unsigned flow_mask = 0;  // flux rapatriés pour la mesure (bit j : voisine j, ordre t − 2, t − 1, t + 1, t + 2)
     };
     // Résultat brut du fil GPU.
     struct Job
@@ -85,12 +86,15 @@ private:
         std::string error;
         ncnn::Mat yuv;  // codes Y'CbCr en virgule fixe 16 bits, rapatriés
         ncnn::Mat ref;  // référence du contre-accentuage (luma, virgule fixe), si demandée
-        std::vector<float> flows;
+        ncnn::Mat flows[4];  // flux recadrés tels que rapatriés (plans de flow_mask)
+        unsigned flow_mask = 0;
         int tile = 0;
     };
     bool pump(bool block);
     bool prepare();
     bool curve_ahead();
+    std::vector<int> ratio_centers(int s, std::optional<int> e) const;
+    unsigned measure_mask(int s, int u) const;
     bool launch();
     int collect(bool block);  // 1 : résultat collecté ; 0 : aucun ; −1 : erreur
     void gpu_worker();
@@ -143,7 +147,8 @@ private:
     std::map<int64_t, ncnn::Mat> refs;  // références du contre-accentuage, jusqu'au dosage
     std::map<int64_t, float> sig;
     std::map<int, restore_auto::GrainCurve> curves;
-    std::map<int64_t, std::vector<float>> ana_luma, ana_flows;
+    std::map<int64_t, std::vector<float>> ana_luma;
+    std::map<int64_t, std::unique_ptr<float[]>> ana_flows;
     std::map<int, std::optional<double>> ratios;
     std::optional<double> last_ratio;
     std::deque<std::vector<uint8_t>> ready;

@@ -53,10 +53,14 @@ public:
     // (w × h codes, même virgule fixe que la sortie, deux valeurs par mot), calculée dans la même soumission.
     // Image t : voisines nb[4] (déjà ajoutées), carte de grain (w × h octets, σ × 20). Sortie : codes Y'CbCr
     // [Y (w × h) | Cb (cw × ch) | Cr (cw × ch)] en virgule fixe 16 bits (code × fixed_scale(), arrondi pair, converti sur
-    // le GPU), deux valeurs par mot de 32 bits, dans le tampon rapatrié lui-même ; flux recadrés si `crop` et `flows`
-    // non nuls.
-    bool process(int64_t t, const int64_t nb[4], const uint8_t* grain_map, ncnn::Mat& yuv, const Crop* crop,
-                 std::vector<float>* flows, std::string& error, ncnn::Mat* ref = nullptr);
+    // le GPU), deux valeurs par mot de 32 bits, dans le tampon rapatrié lui-même. `crop` et `flows` non nuls : image
+    // d'analyse (flux directs) ; flows[j] reçoit, pour chaque bit j de `flow_mask`, le flux vers la voisine j recadré
+    // tel que rapatrié (unpack_flows le convertit, hors du fil GPU).
+    bool process(int64_t t, const int64_t nb[4], const uint8_t* grain_map, ncnn::Mat& yuv, const Crop* crop, ncnn::Mat* flows,
+                 unsigned flow_mask, std::string& error, ncnn::Mat* ref = nullptr);
+    // Flux rapatriés par process (plans du masque) → disposition de restore_auto::AnalysisFrame (4 plans h × w, x / y
+    // entrelacés, en pixels ; plans hors du masque à zéro), conversion en parallèle.
+    static std::unique_ptr<float[]> unpack_flows(const ncnn::Mat flows[4], unsigned mask, int w, int h);
 
     // Inférence par le plugin TensorRT (interface 2) : graphes <onnx_dir>/r2_flow.onnx et r2_body.onnx, moteurs en cache
     // sous le nom « <tag>-r2_* » ; corps calculé sur l'image entière. Faux = Vulkan conservé (reason).
@@ -99,14 +103,13 @@ private:
     bool to_fixed16(ncnn::VkCompute& cmd, const ncnn::VkMat& yuv, ncnn::VkMat& packed);
     std::vector<ncnn::vk_constant_type> tile_constants(int mode, const ncnn::VkMat& x, const ncnn::VkMat& acc, int c, int x0, int y0, int tw,
                                                        int th, int tcstep, int wx0, int wy0, int tpw, int tph) const;
-    void crop_flows(const ncnn::Mat host_flows[4], const Crop& crop, std::vector<float>& flows) const;
     void copy_dense(ncnn::VkCompute& cmd, const ncnn::VkMat& src, int c, const ncnn::VkMat& dst);
     // région (x0, y0, w × h) de c canaux de src copiée dans dst (créé, pas ncnn) ; faux si l'allocation échoue
     // flux composé f13 = f12 + f23 lu au point déplacé par f12 (même grille) ; faux si l'allocation échoue
     bool compose_flow(ncnn::VkCompute& cmd, const ncnn::VkMat& f12, const ncnn::VkMat& f23, ncnn::VkMat& f13);
     bool copy_region(ncnn::VkCompute& cmd, const ncnn::VkMat& src, int c, int x0, int y0, int w, int h, ncnn::VkMat& dst);
-    bool process_trt(int64_t t, const int64_t nb[4], const uint8_t* grain_map, ncnn::Mat& yuv, const Crop* crop,
-                     std::vector<float>* flows, std::string& error, ncnn::Mat* ref);
+    bool process_trt(int64_t t, const int64_t nb[4], const uint8_t* grain_map, ncnn::Mat& yuv, const Crop* crop, ncnn::Mat* flows,
+                     unsigned flow_mask, std::string& error, ncnn::Mat* ref);
     bool record_reference(ncnn::VkCompute& cmd, const ncnn::VkMat& rgb, const ncnn::VkMat warped[4], ncnn::Mat& host_ref);
     void release();
 

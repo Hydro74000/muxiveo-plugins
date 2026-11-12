@@ -1,6 +1,8 @@
 // Restauration (R2) : réseau de restauration sur GPU (voir restore_net.h).
 #include "restore_net.h"
 
+#include "restore_auto.h"
+
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -433,30 +435,44 @@ bool RestoreNet::to_yuv(ncnn::VkCompute& cmd, const ncnn::VkMat& acc, const ncnn
     return true;
 }
 
-void RestoreNet::crop_flows(const ncnn::Mat host_flows[4], const Crop& crop, std::vector<float>& flows) const
+std::unique_ptr<float[]> RestoreNet::unpack_flows(const ncnn::Mat flows[4], unsigned mask, int w, int h)
 {
-    flows.assign((size_t)4 * crop.w * crop.h * 2, 0.f);
-    for (int j = 0; j < 4; j++)
-    {
-        ncnn::Mat m = host_flows[j];
-        if (m.elemsize == 2)
+    const std::size_t n = (std::size_t)w * h;
+    std::unique_ptr<float[]> out(new float[4 * n * 2]);
+    restore_auto::detail::for_rows(4 * h, [&](int r0, int r1) {
+        for (int r = r0; r < r1; r++)
         {
-            ncnn::Mat f32;
-            ncnn::cast_float16_to_float32(m, f32, opt);
-            m = f32;
+            const int j = r / h, y = r % h;
+            float* dst = out.get() + ((std::size_t)j * h + y) * w * 2;
+            if (!(mask >> j & 1))
+            {
+                std::fill(dst, dst + (std::size_t)w * 2, 0.f);
+                continue;
+            }
+            const ncnn::Mat& m = flows[j];  // déjà recadré (w × h, 2 canaux)
+            for (int c = 0; c < 2; c++)
+            {
+                const ncnn::Mat ch = m.channel(c);
+                if (m.elemsize == 2)
+                {
+                    const unsigned short* row = (const unsigned short*)ch.data + (std::size_t)y * m.w;
+                    for (int x = 0; x < w; x++)
+                        dst[(std::size_t)x * 2 + c] = ncnn::float16_to_float32(row[x]);
+                }
+                else
+                {
+                    const float* row = (const float*)ch.data + (std::size_t)y * m.w;
+                    for (int x = 0; x < w; x++)
+                        dst[(std::size_t)x * 2 + c] = row[x];
+                }
+            }
         }
-        for (int c = 0; c < 2; c++)
-        {
-            const float* plane = m.channel(c);
-            for (int y = 0; y < crop.h; y++)
-                for (int xx = 0; xx < crop.w; xx++)
-                    flows[(((size_t)j * crop.h + y) * crop.w + xx) * 2 + c] = plane[(size_t)y * m.w + xx];  // déjà recadré
-        }
-    }
+    });
+    return out;
 }
 
-bool RestoreNet::process(int64_t t, const int64_t nb[4], const uint8_t* grain_map, ncnn::Mat& yuv, const Crop* crop,
-                         std::vector<float>* flows, std::string& error, ncnn::Mat* ref)
+bool RestoreNet::process(int64_t t, const int64_t nb[4], const uint8_t* grain_map, ncnn::Mat& yuv, const Crop* crop, ncnn::Mat* flows,
+                         unsigned flow_mask, std::string& error, ncnn::Mat* ref)
 {
     oom = false;
     auto fail = [&](const char* what) {
@@ -474,7 +490,7 @@ bool RestoreNet::process(int64_t t, const int64_t nb[4], const uint8_t* grain_ma
         if (!cache.count(nb[j]))
             return fail("voisine absente du cache");
     if (trt_on)
-        return process_trt(t, nb, grain_map, yuv, crop, flows, error, ref);
+        return process_trt(t, nb, grain_map, yuv, crop, flows, flow_mask, error, ref);
     const Cached& ct = cache.at(t);
     ncnn::VkCompute cmd(vkdev);
 
@@ -585,22 +601,22 @@ bool RestoreNet::process(int64_t t, const int64_t nb[4], const uint8_t* grain_ma
     ncnn::VkMat out, packed;
     if (!to_yuv(cmd, acc, wsum, out) || !to_fixed16(cmd, out, packed))
         return fail_oom();
-    ncnn::Mat host_out, host_flows[4];
+    ncnn::Mat host_out;
     cmd.record_clone(packed, host_out, opt);
-    const bool want_flows = crop && flows;
-    if (want_flows)  // recadrage de la mesure seulement (≤ 1920 × 1080), recadré sur le GPU avant le rapatriement
+    if (crop && flows)  // flux lus par la mesure seulement, recadrés (≤ 1920 × 1080) sur le GPU avant le rapatriement
         for (int j = 0; j < 4; j++)
         {
+            flows[j].release();
+            if (!(flow_mask >> j & 1))
+                continue;
             ncnn::VkMat region;
             if (!copy_region(cmd, full[j], 2, EDGE + crop->x0, EDGE + crop->y0, crop->w, crop->h, region))
                 return fail_oom();
-            cmd.record_clone(region, host_flows[j], opt);
+            cmd.record_clone(region, flows[j], opt);
         }
     if (cmd.submit_and_wait() != 0)
         return fail("exécution GPU en échec");
     yuv = host_out;
-    if (want_flows)
-        crop_flows(host_flows, *crop, *flows);
     return true;
 }
 
@@ -713,8 +729,8 @@ bool RestoreNet::enable_trt(const std::filesystem::path& plugin_dir, const std::
     return true;
 }
 
-bool RestoreNet::process_trt(int64_t t, const int64_t nb[4], const uint8_t* grain_map, ncnn::Mat& yuv, const Crop* crop,
-                             std::vector<float>* flows, std::string& error, ncnn::Mat* ref)
+bool RestoreNet::process_trt(int64_t t, const int64_t nb[4], const uint8_t* grain_map, ncnn::Mat& yuv, const Crop* crop, ncnn::Mat* flows,
+                             unsigned flow_mask, std::string& error, ncnn::Mat* ref)
 {
     // TensorRT (plugin mvo-rife-trt, interface 2) : graphes exécutés dans des tampons partagés Vulkan / CUDA, chaque
     // inférence encadrée par des soumissions Vulkan terminées (écriture des entrées, lecture de la sortie).
@@ -823,21 +839,21 @@ bool RestoreNet::process_trt(int64_t t, const int64_t nb[4], const uint8_t* grai
     ncnn::VkMat out, packed;
     if (!to_yuv(*cmd, o, o, out, &o) || !to_fixed16(*cmd, out, packed))
         return fail_oom();
-    ncnn::Mat host_out, host_flows[4];
+    ncnn::Mat host_out;
     cmd->record_clone(packed, host_out, opt);
-    const bool want_flows = crop && flows;
-    if (want_flows)  // recadrage de la mesure seulement, recadré sur le GPU avant le rapatriement
+    if (crop && flows)  // flux lus par la mesure seulement, recadrés sur le GPU avant le rapatriement
         for (int j = 0; j < 4; j++)
         {
+            flows[j].release();
+            if (!(flow_mask >> j & 1))
+                continue;
             ncnn::VkMat region;
             if (!copy_region(*cmd, full[j], 2, EDGE + crop->x0, EDGE + crop->y0, crop->w, crop->h, region))
                 return fail_oom();
-            cmd->record_clone(region, host_flows[j], opt);
+            cmd->record_clone(region, flows[j], opt);
         }
     if (cmd->submit_and_wait() != 0)
         return fail("exécution GPU en échec");
     yuv = host_out;
-    if (want_flows)
-        crop_flows(host_flows, *crop, *flows);
     return true;
 }

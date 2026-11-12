@@ -44,14 +44,15 @@ void RestoreStage::run_item(const Item& it, Job& r)
 {
     r.u = it.u;
     r.want = it.want;
+    r.flow_mask = it.flow_mask;
     for (const auto& [index, data] : it.inputs)
         if (!net->add_frame(index, data, r.error))
             return;
     // mémoire GPU insuffisante : repli sur des tuiles plus petites au lieu d'un échec
     for (;;)
     {
-        if (net->process(it.u, it.nb.data(), it.map->data(), r.yuv, it.want ? &crop : nullptr, it.want ? &r.flows : nullptr, r.error,
-                         o.sharpen > 0.0 ? &r.ref : nullptr))
+        if (net->process(it.u, it.nb.data(), it.map->data(), r.yuv, it.want ? &crop : nullptr, it.want ? r.flows : nullptr, it.flow_mask,
+                         r.error, o.sharpen > 0.0 ? &r.ref : nullptr))
             break;
         if (!net->out_of_memory() || net->tile_size() <= 128)
             return;
@@ -268,6 +269,8 @@ bool RestoreStage::launch()
     prepared_u = -1;
     it.nb = {neighbour(u, -2), neighbour(u, -1), neighbour(u, 1), neighbour(u, 2)};
     it.want = s <= u && u <= s + 10;
+    if (it.want)
+        it.flow_mask = measure_mask(s, u);
     // trames tenues par le travail : pointeurs stables (aucune n'est retirée avant la collecte, voir release())
     for (int64_t i : {(int64_t)u, it.nb[0], it.nb[1], it.nb[2], it.nb[3]})
         it.inputs.emplace_back(i, src.at(i).data());
@@ -310,18 +313,14 @@ int RestoreStage::collect(bool block)
     if (o.sharpen > 0.0)
         refs[r.u] = r.ref;
     pending_sig = r.u;
-    if (r.want)
-        ana_flows[r.u] = std::move(r.flows);
+    if (r.want && r.flow_mask)  // conversion des flux de mesure ici, hors du fil GPU
+        ana_flows[r.u] = RestoreNet::unpack_flows(r.flows, r.flow_mask, crop.w, crop.h);
     return 1;
 }
 
-bool RestoreStage::shot_ratio(int s)
+std::vector<int> RestoreStage::ratio_centers(int s, std::optional<int> e) const
 {
-    if (ratios.count(s))
-        return true;
-    const std::optional<int> e = shot_end(s);
-    if (!e && done_net <= s + 10)
-        return false;
+    // centres de la mesure du rapport d'un plan [s, e) (fin inconnue : plan d'au moins 11 images)
     std::vector<int> centers;
     const int ln = e ? *e - s : 1 << 30;
     if (ln >= 11)
@@ -334,6 +333,38 @@ bool RestoreStage::shot_ratio(int s)
         if (centers.empty() && ln >= 5)
             centers.push_back((s + 2 + *e - 3) / 2);
     }
+    return centers;
+}
+
+unsigned RestoreStage::measure_mask(int s, int u) const
+{
+    // flux de l'image u lus par la mesure (sigma_bins) : tous ceux d'un centre, celui de chaque voisine vers son centre.
+    // Longueur du plan encore inconnue (fin non décidée avant s + 10) : tous, par prudence (le rapatriement ne change
+    // aucune sortie)
+    const std::optional<int> e = shot_end(s);
+    if (!e && cuts_.decided() < s + 10)
+        return 0xF;
+    static const int order[4] = {-2, -1, 1, 2};
+    unsigned m = 0;
+    for (int c : ratio_centers(s, e))
+    {
+        if (u == c)
+            m |= 0xF;
+        for (int j = 0; j < 4; j++)
+            if (u == c + order[j])
+                m |= 1u << (3 - j);
+    }
+    return m;
+}
+
+bool RestoreStage::shot_ratio(int s)
+{
+    if (ratios.count(s))
+        return true;
+    const std::optional<int> e = shot_end(s);
+    if (!e && done_net <= s + 10)
+        return false;
+    const std::vector<int> centers = ratio_centers(s, e);
     if (!centers.empty() && done_net <= *std::max_element(centers.begin(), centers.end()) + 2)
         return false;
     std::optional<double> r;
@@ -342,7 +373,7 @@ bool RestoreStage::shot_ratio(int s)
         std::map<int, AnalysisFrame> frames;
         for (const auto& [t, l] : ana_luma)
             if (ana_flows.count(t))
-                frames[(int)t] = AnalysisFrame{l.data(), ana_flows.at(t).data()};
+                frames[(int)t] = AnalysisFrame{l.data(), ana_flows.at(t).get()};
         r = ratio_from_sigma(sigma_bins(frames, centers, crop.w, crop.h, 1.0), fmt.width);
     }
     if (!r)
