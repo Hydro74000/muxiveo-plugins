@@ -30,7 +30,7 @@
 
 struct RestoreOptions
 {
-    double k = 1.0;          // niveau : Fort 0,5, Auto / Moyen 1, Léger 1,5
+    restore_auto::RestoreLevel level = restore_auto::MOYEN;  // niveau de dosage (restore_auto::level_of)
     bool animation = false;  // contenu animé : un cran vers Fort
     int dither_step = 1;     // 0 : arrondi simple ; 1 : tramage ±1 code ; 4 : ±1 pas 8 bits (sortie 10 bits vers un encodeur 8 bits)
     int look = 24;           // courbe de grain : images [s, s + look) du plan
@@ -115,7 +115,7 @@ private:
     FrameFormat fmt;
     ColorParams color;
     RestoreOptions o;
-    double k = 1.0;
+    restore_auto::RestoreLevel level = restore_auto::MOYEN;  // niveau effectif (contenu animé compris)
     uint16_t lo = 0, hi = 0;
     float fx_scale = 64.f;  // pas de la virgule fixe par code
     int tile = 512;

@@ -1173,7 +1173,7 @@ static int run(const Options& o, const fs::path& exe_dir)
         ropt.use_fp16_arithmetic = false;
         ropt.use_int8_storage = false;
         RestoreOptions ro;
-        ro.k = o.restore == "fort" ? 0.5 : (o.restore == "leger" ? 1.5 : 1.0);
+        ro.level = restore_auto::level_of(o.restore);
         ro.animation = o.restore == "auto" && o.restore_animation;
         ro.dither_step = o.restore_dither == "off" ? 0 : (o.restore_dither == "8" ? 4 : 1);
         ro.sharpen = o.restore_sharpen;

@@ -71,7 +71,7 @@ bool RestoreStage::init(RestoreNet* n, const FrameFormat& f, const ColorParams& 
     fmt = f;
     color = c;
     o = opt;
-    k = auto_k(o.k, o.animation);
+    level = auto_level(o.level, o.animation);
     cuts_ = CutDetector(48, o.cut_look);
     if (fmt.bit_depth < 8 || fmt.bit_depth > 16)
     {
@@ -405,7 +405,7 @@ bool RestoreStage::emit()
     for (int u = std::max(s, t - o.dose_look); u <= hi_t; u++)
         window.push_back(sig.at(u));
     const double eq = detail::percentile(window, 50.0) / sig.at(t);  // égalisation sur le plan
-    const double part = auto_part(r, k);
+    const double part = auto_part(r, level);
     // part réinjectée plafonnée à 1 : la sortie reste entre l'image débruitée et la source. Sans plafond, une image dont le
     // résidu est bien plus faible que celui du plan (σ 0,08 face à 0,48 : fin d'un plan, image presque propre) recevait
     // 6,8 fois l'écart source − sortie : points saturés (10 000 nits en PQ), MaxCLL mesuré faussé (2026-11-11)

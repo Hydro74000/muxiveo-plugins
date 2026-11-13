@@ -1,6 +1,7 @@
 // Interface C de restore_auto pour les tests (chargée par ctypes) : tableaux contigus, valeurs absentes = NaN.
 #include <cmath>
 #include <map>
+#include <string_view>
 
 #include "restore_auto.h"
 
@@ -89,6 +90,14 @@ void ra_dose(const uint16_t* src, const float* out, std::size_t n, double kk, ui
              int dither_step)
 {
     dose(src, out, n, kk, lo, hi, dst, dither_frame, 0, dither_step);
+}
+
+// Part réinjectée d'un niveau, comme main.cpp et l'étage (contenu animé pris en compte pour « auto » seulement) ;
+// rapport < 0 : grain non mesurable.
+double ra_level_part(const char* level, int animation, double ratio)
+{
+    const RestoreLevel l = auto_level(level_of(level), animation != 0 && std::string_view(level) == "auto");
+    return auto_part(ratio < 0 ? std::nullopt : std::optional<double>(ratio), l);
 }
 
 double ra_percentile(const float* v, std::size_t n, double q) { return detail::percentile(std::vector<float>(v, v + n), q); }

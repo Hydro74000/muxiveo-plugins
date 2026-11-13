@@ -39,6 +39,8 @@ def lib(tmp_path_factory):
     lib.ra_sigma_bins.argtypes = [f32p, f32p, C.c_int, C.c_int, i32p, C.c_int, C.c_int, C.c_int, C.c_double, f64p, f64p]
     lib.ra_ratio.argtypes = [f64p, f64p, C.c_int]
     lib.ra_ratio.restype = C.c_double
+    lib.ra_level_part.argtypes = [C.c_char_p, C.c_int, C.c_double]
+    lib.ra_level_part.restype = C.c_double
     lib.ra_dose.argtypes = [u16p, f32p, C.c_size_t, C.c_double, C.c_uint16, C.c_uint16, u16p, C.c_longlong, C.c_int]
     lib.ra_percentile.argtypes = [f32p, C.c_size_t, C.c_double]
     lib.ra_percentile.restype = C.c_double
@@ -283,3 +285,15 @@ def test_dose_dither_8bit_step(lib):
     exact = out + np.float32(0.3) * (src.astype(np.float32) - out)
     err = (dst.astype(np.float64) - exact) / 4
     assert abs(err.mean()) < 0.02 and 0.45 < err.std() < 0.55  # triangulaire ±1 pas 8 bits + arrondi
+
+
+def test_niveaux(lib):
+    """Parts des niveaux (recalage du 2026-11-13 : Auto / Moyen k 0,8) : min(1, k / rapport) ; grain non mesurable : parts de
+    repli inchangées (0,375 / 0,25 / 0,125) ; contenu animé (Auto seul) : Fort."""
+    def part(level, ratio, animation=False):
+        return lib.ra_level_part(level.encode(), int(animation), ratio)
+    assert [part(n, 2.0) for n in ('leger', 'moyen', 'auto', 'fort')] == pytest.approx([0.75, 0.4, 0.4, 0.25])
+    assert [part(n, -1) for n in ('leger', 'moyen', 'auto', 'fort')] == [0.375, 0.25, 0.25, 0.125]
+    assert part('auto', 0.5) == 1.0  # plafond : jamais plus que la source
+    assert (part('auto', 2.0, True), part('auto', -1, True)) == (0.25, 0.125)
+    assert (part('moyen', 2.0, True), part('leger', 2.0, True)) == pytest.approx((0.4, 0.75))  # animation : Auto seul

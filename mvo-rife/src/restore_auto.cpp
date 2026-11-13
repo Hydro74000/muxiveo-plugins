@@ -843,7 +843,10 @@ std::optional<double> ratio_from_sigma(const GrainBins& bins, int width)
     return std::min(r * flow_bias(width), 10.0);
 }
 
-double auto_part(std::optional<double> ratio, double k) { return ratio ? std::min(1.0, k / std::max(*ratio, 1e-3)) : 0.25 * k; }
+double auto_part(std::optional<double> ratio, const RestoreLevel& level)
+{
+    return ratio ? std::min(1.0, level.k / std::max(*ratio, 1e-3)) : level.unknown_part;
+}
 
 void dose(const uint16_t* src, const float* out, std::size_t n, double kk, uint16_t lo, uint16_t hi, uint16_t* dst,
           long long dither_frame, std::size_t dither_offset, int dither_step)

@@ -14,12 +14,14 @@
 // miroir sans répétition du bord) ; centiles à interpolation linéaire (NumPy) ; recalage bilinéaire, bords répliqués,
 // fraction au 1/32 de pixel (cv2.remap).
 #pragma once
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <map>
 #include <optional>
+#include <string_view>
 #include <vector>
 
 namespace restore_auto
@@ -109,11 +111,28 @@ double flow_bias(int width);
 // σ moyen face au niveau médian du profil ; aucune mesure : vide.
 std::optional<double> ratio_from_sigma(const GrainBins& bins, int width);
 
-// Niveau de l'Auto (Fort 0,5, Auto / Moyen 1, Léger 1,5) ; contenu animé : un cran vers Fort (k × 0,5).
-inline double auto_k(double k, bool animation) { return animation ? k * 0.5 : k; }
+// Niveau de dosage : part du résidu réinjectée = min(1, k / rapport du plan) ; grain non mesurable (aucun rapport) :
+// `unknown_part`. Auto / Moyen : k 1 → 0,8 le 2026-11-13 (grain jugé un peu trop présent ; banc de 48 extraits : grain
+// −10 % en médiane, −18 % sur un film très granuleux en 4K, détail médian inchangé). Parts de repli inchangées : à k 0,8,
+// les plus fortes hausses de pompage venaient des plans au grain non mesurable (sources très propres ou très sombres).
+struct RestoreLevel
+{
+    double k;
+    double unknown_part;
+};
+constexpr RestoreLevel LEGER{1.5, 0.375}, MOYEN{0.8, 0.25}, FORT{0.5, 0.125};
 
-// Part du résidu réinjectée : min(1, k / rapport) ; rapport inconnu : 0,25 × k.
-double auto_part(std::optional<double> ratio, double k);
+// Niveau d'après son nom : « leger », « moyen », « fort » ; « auto » (et tout autre nom) : Moyen.
+inline RestoreLevel level_of(std::string_view name) { return name == "fort" ? FORT : (name == "leger" ? LEGER : MOYEN); }
+
+// Niveau de l'Auto ; contenu animé : un cran vers Fort (jamais au-delà de Fort).
+inline RestoreLevel auto_level(RestoreLevel l, bool animation)
+{
+    return animation ? RestoreLevel{std::min(l.k, FORT.k), std::min(l.unknown_part, FORT.unknown_part)} : l;
+}
+
+// Part du résidu réinjectée : min(1, k / rapport) ; rapport inconnu : part de repli du niveau.
+double auto_part(std::optional<double> ratio, const RestoreLevel& level);
 
 // Dosage d'un plan (codes planaires, n valeurs) : dst = arrondi(sortie + kk × (source − sortie)) borné à [lo, hi].
 // `dither_frame` ≥ 0 : arrondi tramé (bruit triangulaire ±1 pas, déterministe d'après le numéro d'image et la position) ;
