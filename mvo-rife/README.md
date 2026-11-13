@@ -10,6 +10,22 @@ Extension de Muxiveo : installée, mise à jour et supprimée par l'application 
 utilisateur. Le moteur, ses modèles, les poids de son sélecteur et ses préréglages évoluent sans release de
 Muxiveo : l'application retient la version la plus récente dont le contrat (`--capabilities`) lui est connu.
 
+## Nouveautés 1.15.0
+
+Débruitage MVO-R2 : un peu moins de grain gardé en Auto et en Moyen, et un peu plus rapide en Vulkan.
+
+- **Auto et Moyen recalés** : la part du grain réinjectée vise un niveau plus bas (k 1 → 0,8), le grain restant
+  jugé un peu trop présent. Banc de 48 extraits : grain −10 % en médiane (−16 % en 4K, −18 % sur un film très
+  granuleux), détail médian inchangé, aucun banding visible. Léger, Fort, l'Auto sur un contenu animé (toujours
+  au niveau de Fort) et les plans dont le grain n'est pas mesurable (sources très propres ou très sombres) sont
+  inchangés.
+- **Images d'analyse** : seuls les flux lus par la mesure du grain sont rapatriés du GPU, convertis hors du fil GPU
+  (sorties identiques).
+- **Tuiles Vulkan presque égales** d'au plus 640 px, côtés multiples de 32 (4K : 6 × 4 tuiles de 640 × 544 au lieu de
+  8 × 5 de 512 dont une rangée de 112 px) : sorties aussi proches de l'image entière qu'avant.
+- En 4K, Vulkan : ≈ +10 % en mode rapide, +2 % en mode normal face à la 1.14.0 (débruitage seul).
+- Interpolation sans `--restore` : calculs inchangés depuis la 1.11.0.
+
 ## Nouveautés 1.14.0
 
 Débruitage MVO-R2 plus rapide, sans nouvelle option : en 4K, +42 % en mode rapide et +46 % en mode normal face à la
