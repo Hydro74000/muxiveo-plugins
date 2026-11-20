@@ -18,3 +18,11 @@ remplace ni la référence numérique, ni la validation visuelle d'un FEL réel.
 conforme dont les couches d'une même access unit ne sont pas affichées au même
 instant. Le plugin les apparie par rang de présentation et doit produire
 exactement l'image de `synthetic-fel.hevc`.
+
+`synthetic-fel-shifted-irap.mkv` : 48 images animées (`testsrc2`), BL 256×144 à IRAP toutes les
+16 images, EL 128×72 à IRAP toutes les 10, GOP ouverts à trois B-frames (CRA suivies de RASL dans les
+deux couches), même RPU que `synthetic-fel.hevc`. Les images clés BL et EL ne coïncident pas : un
+positionnement doit faire commencer chaque couche à sa propre IRAP et apparier les rangs.
+`synthetic-fel-shifted-irap-cut.mkv` en est l'extrait à partir de la CRA BL de l'image 16, au milieu
+d'un GOP EL. `../make_seek_fixture.py --muxiveo <dépôt Muxiveo>` reproduit les deux fichiers (le muxer
+Matroska natif de Muxiveo horodate le HEVC brut à images B, que FFmpeg ne sait pas encapsuler).

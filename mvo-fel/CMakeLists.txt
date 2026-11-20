@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.22)
-project(mvo-fel VERSION 0.6.0 LANGUAGES C CXX)
+project(mvo-fel VERSION 0.6.1 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -101,6 +101,9 @@ if(BUILD_TESTING)
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_package.py)
     add_test(NAME fel_layers COMMAND ${Python3_EXECUTABLE}
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/layers.py $<TARGET_FILE:mvo_fel>)
+    add_test(NAME fel_seek COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/seek.py $<TARGET_FILE:mvo_fel>)
+    set_tests_properties(fel_seek PROPERTIES WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/tests)
     add_test(NAME fel_pq_thresholds COMMAND ${Python3_EXECUTABLE}
         ${CMAKE_CURRENT_SOURCE_DIR}/scripts/generate_pq_thresholds.py --check)
     add_executable(fel_certified_dump tests/certified_dump.cpp)

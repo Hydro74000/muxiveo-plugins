@@ -164,6 +164,79 @@ struct Layer {
         if (!input) { check(avcodec_send_packet(decoder, nullptr), "Vidange HEVC"); receive(); }
     }
 };
+// Type NAL de la première tranche de chaque couche d'une unité d'accès (-1 : couche absente) ; l'EL est
+// encapsulée dans des NAL 63 (en-tête de la NAL EL deux octets plus loin), le RPU dans une NAL 62.
+// parsed faux : découpage illisible, aucun filtrage par couche.
+struct AccessUnitLayers { bool parsed = false; int bl = -1, el = -1; };
+AccessUnitLayers access_unit_layers(const AVPacket &packet, int nal_length_size) {
+    AccessUnitLayers au;
+    const uint8_t *data = packet.data;
+    const size_t size = packet.data ? size_t(packet.size) : 0;
+    const auto visit = [&au](const uint8_t *nal, size_t length) {
+        if (length < 2) return;
+        const int type = (nal[0] >> 1) & 0x3F;
+        if (type == 63) {
+            if (length >= 4 && au.el < 0 && ((nal[2] >> 1) & 0x3F) < 32) au.el = (nal[2] >> 1) & 0x3F;
+        } else if (type < 32 && au.bl < 0) {
+            au.bl = type;
+        }
+    };
+    if (nal_length_size > 0) {  // hvcC (Matroska, MP4) : NAL préfixées par leur longueur
+        for (size_t pos = 0; pos < size;) {
+            if (size - pos < size_t(nal_length_size)) return {};
+            size_t length = 0;
+            for (int i = 0; i < nal_length_size; ++i) length = (length << 8) | data[pos + i];
+            pos += size_t(nal_length_size);
+            if (length > size - pos) return {};
+            visit(data + pos, length);
+            pos += length;
+        }
+    } else {  // Annex B : codes de début 00 00 01 (zéros de tête retirés de la NAL précédente)
+        size_t start = SIZE_MAX;
+        for (size_t pos = 0; pos + 3 <= size;) {
+            if (data[pos] == 0 && data[pos + 1] == 0 && data[pos + 2] == 1) {
+                if (start != SIZE_MAX) {
+                    size_t end = pos;
+                    while (end > start && data[end - 1] == 0) --end;
+                    visit(data + start, end - start);
+                }
+                pos += 3;
+                start = pos;
+            } else {
+                ++pos;
+            }
+        }
+        if (start == SIZE_MAX) return {};
+        visit(data + start, size - start);
+    }
+    au.parsed = au.bl >= 0 || au.el >= 0;
+    return au;
+}
+// Début du décodage d'une couche : jamais avant sa propre image IRAP (une EL dont les images clés ne
+// suivent pas celles de la BL ne reçoit aucune image privée de ses références). Les images de tête
+// RASL de cette IRAP, ignorées par le décodeur, sont comptées : elles décalent le rang des images
+// produites. Index : unités d'accès lues depuis le dernier positionnement.
+struct LayerStart {
+    bool started = false, settled = false;  // IRAP reçue ; images de tête toutes lues
+    int64_t index = 0, rasl = 0, pts = AV_NOPTS_VALUE;
+    // false : image de la couche à ne pas transmettre au décodeur.
+    bool admit(int type, int64_t at, int64_t packet_pts) {
+        if (!started) {
+            if (type < 16 || type > 23) return false;
+            started = true; index = at; pts = packet_pts;
+            return true;
+        }
+        if (!settled) {
+            if (type == 8 || type == 9) ++rasl;            // RASL
+            else if (type != 6 && type != 7) settled = true;  // première image hors RADL / RASL
+        }
+        return type >= 0;
+    }
+    // Découpage illisible : couche transmise telle quelle depuis cette unité d'accès.
+    void accept_all(int64_t at, int64_t packet_pts) {
+        if (!started) { started = settled = true; index = at; pts = packet_pts; }
+    }
+};
 // Interruption d'un étage par l'aval (file abandonnée) : pas une erreur en soi.
 struct Stopped {};
 // File bornée, un producteur et un consommateur ; l'annulation interrompt les attentes.
@@ -348,6 +421,15 @@ struct mvo_fel_context {
     bool pulling = false;
     // Seek : cible en base de temps de la piste, ou nombre d'images ignorées (HEVC brut).
     int64_t start_us = 0, target = AV_NOPTS_VALUE, skip = 0, skipped = 0;
+    // Taille des préfixes de longueur des NAL (hvcC), 0 : Annex B.
+    int nal_length_size = 0;
+    // Début de chaque couche depuis le dernier positionnement, unités d'accès lues depuis celui-ci.
+    LayerStart bl_start, el_start;
+    int64_t au_index = 0;
+    // Repositionnement plus tôt (EL commencée après la cible) : image clé BL de la lecture précédente,
+    // aucune image clé antérieure (exhausted), demande en attente (traitée par decode_all).
+    int64_t reseek_floor = AV_NOPTS_VALUE;
+    bool seek_exhausted = false, reseek_requested = false;
     // Horodatages relatifs à la première image produite (comme FFmpeg en entrée d'un NUT).
     bool rebase_first = false;
     int64_t first_pts = AV_NOPTS_VALUE;
@@ -418,6 +500,8 @@ struct mvo_fel_context {
         check(avformat_find_stream_info(input, nullptr), "Inspection source", MVO_FEL_INPUT_ERROR);
         stream = input->streams[stream_index];
         if (stream->codecpar->codec_id != AV_CODEC_ID_HEVC) throw Failure("La source FEL doit être HEVC");
+        const auto *extra = stream->codecpar->extradata;
+        nal_length_size = stream->codecpar->extradata_size >= 23 && extra[0] == 1 ? (extra[21] & 3) + 1 : 0;
         raw = std::string(input->iformat->name) == "hevc";
         if (keyframes_only && raw) throw Failure("Échantillonnage par images clés : conteneur requis (horodatages)");
         if (fps.num <= 0 || fps.den <= 0) fps = av_guess_frame_rate(input, stream, nullptr);
@@ -582,6 +666,9 @@ struct mvo_fel_context {
                 }
             };
             bool eof = false;
+            // Chaque couche comparée à partir de sa propre image IRAP (positionnement en milieu de GOP EL).
+            std::array<LayerStart, 2> starts;
+            int64_t index = 0;
             while (same && (compared[0] < needed || (layer_count > 1 && compared[1] < needed)) && !eof) {
                 check_cancelled();
                 const int ret = av_read_frame(probe, p.get());
@@ -591,7 +678,13 @@ struct mvo_fel_context {
                 } else if (ret < 0) {
                     return false;
                 } else if (p->stream_index == stream_index) {
-                    for (int i = 0; i < 3*layer_count; ++i) layers[i].send(p.get());
+                    const auto au = access_unit_layers(*p, nal_length_size);
+                    for (int layer = 0; layer < layer_count; ++layer) {
+                        if (!au.parsed) starts[layer].accept_all(index, p->pts);
+                        else if (!starts[layer].admit(layer ? au.el : au.bl, index, p->pts)) continue;
+                        for (int i = 3*layer; i < 3*layer + 3; ++i) layers[i].send(p.get());
+                    }
+                    ++index;
                 }
                 av_packet_unref(p.get());
                 drain();
@@ -643,14 +736,18 @@ struct mvo_fel_context {
         }
         const int64_t origin = input->start_time != AV_NOPTS_VALUE ? input->start_time : 0;
         target = av_rescale_q(origin + start_us, AV_TIME_BASE_Q, stream->time_base);
+        seek_exhausted = false;
+        reseek_floor = AV_NOPTS_VALUE;
         // Image clé antérieure ; un échec garde la lecture depuis le début (même résultat).
         av_seek_frame(input, stream_index, target, AVSEEK_FLAG_BACKWARD);
     }
     // Images antérieures à la cible, dont les RASL/RADL d'un GOP ouvert : leurs PTS précèdent
-    // l'image clé atteinte. Écartées sur la BL, puis autant d'images sur l'EL (même rang de
-    // présentation : les PTS de l'EL ne sont pas fiables si sa structure de GOP diffère).
-    int64_t leading = 0, el_leading = 0;
+    // l'image clé atteinte. Écartées sur la BL ; sur l'EL, les images de même rang de présentation
+    // (les PTS de l'EL ne sont pas fiables si sa structure de GOP diffère), voir pair.
+    int64_t leading = 0;
     bool leading_done = false;
+    // Images EL écartées (leur image BL précède la cible) ; images BL gardées depuis la cible.
+    int64_t el_dropped = 0, kept = 0;
     void drop_leading() {
         while (!leading_done && !bl.ready.empty()) {
             const auto pts = bl.ready.front()->pts;
@@ -658,7 +755,60 @@ struct mvo_fel_context {
             bl.ready.pop_front();
             ++leading;
         }
-        while (el_leading < leading && !el.ready.empty()) { el.ready.pop_front(); ++el_leading; }
+    }
+    // Rang de la première image EL produite moins celui de la première image BL produite. Une couche
+    // commencée à l'unité d'accès i, dont le décodeur ignore les r images RASL, produit d'abord le rang
+    // D + i + r (D : unités d'accès antérieures au positionnement ; les images qui précèdent une IRAP
+    // dans l'ordre de décodage la précèdent à l'affichage, et ses RADL suivent ses RASL). Minimum tant
+    // que l'EL n'a pas commencé (IRAP à l'unité d'accès suivante) ou que ses RASL ne sont pas toutes lues.
+    int64_t rank_offset() const {
+        return ((el_start.started ? el_start.index : au_index) - bl_start.index) + el_start.rasl - bl_start.rasl;
+    }
+    // Décodage repris de zéro (positionnement, session de capture) : files, décodeurs, couches, rangs.
+    void reset_decoding() {
+        bl.ready.clear(); el.ready.clear();
+        if (bl.decoder) { avcodec_flush_buffers(bl.decoder); av_bsf_flush(bl.split); }
+        if (el.decoder) { avcodec_flush_buffers(el.decoder); av_bsf_flush(el.split); }
+        leading = el_dropped = kept = 0;
+        leading_done = reseek_requested = false;
+        bl_start = el_start = LayerStart{};
+        au_index = 0;
+        last_el.reset();
+    }
+    // EL commencée après la cible : lecture reprise à l'image clé BL précédente. Chaque reprise recule
+    // strictement ; sans image clé antérieure (début du flux), les images sans EL sont recomposées sans
+    // résiduel (pair).
+    void reseek() {
+        const int64_t from = bl_start.pts;
+        reset_decoding();
+        reseek_floor = from;
+        if (av_seek_frame(input, stream_index, from - 1, AVSEEK_FLAG_BACKWARD) < 0) {
+            seek_exhausted = true;
+            check(av_seek_frame(input, stream_index, from, AVSEEK_FLAG_BACKWARD), "Repositionnement", MVO_FEL_INPUT_ERROR);
+        }
+    }
+    bool can_seek_earlier() const {
+        return target != AV_NOPTS_VALUE && !raw && !seek_exhausted && bl_start.pts != AV_NOPTS_VALUE;
+    }
+    // Unité d'accès lue : chaque couche transmise à son décodeur à partir de sa propre IRAP.
+    void send_access_unit(AVPacket *p) {
+        const auto au = access_unit_layers(*p, nal_length_size);
+        const bool reconstructed = layer == LAYER_RECONSTRUCTED;
+        const bool bl_was_started = bl_start.started;
+        bool send_bl = true, send_el = reconstructed;
+        if (!au.parsed) {
+            bl_start.accept_all(au_index, p->pts);
+            el_start.accept_all(au_index, p->pts);
+        } else {
+            send_bl = bl_start.admit(au.bl, au_index, p->pts);
+            send_el = reconstructed && el_start.admit(au.el, au_index, p->pts);
+        }
+        // Reprise retombée sur la même image clé BL : aucune image clé antérieure.
+        if (!bl_was_started && bl_start.started && reseek_floor != AV_NOPTS_VALUE && p->pts >= reseek_floor)
+            seek_exhausted = true;
+        ++au_index;
+        if (send_bl) { Timer timer(timing[2]); bl.send(p); }
+        if (send_el) { Timer timer(timing[3]); el.send(p); }
     }
     int64_t output_pts(const AVFrame &base) const {
         if (raw) return emitted;
@@ -719,6 +869,10 @@ struct mvo_fel_context {
     // neutre (non lu). Aucune EL de ce rang n'est consommée.
     Frame last_el;
     std::atomic<long long> bl_only_frames{0};
+    // Images gardées d'un flux commençant avant la première IRAP de l'EL (extrait coupé en milieu de
+    // GOP EL, sans image clé antérieure) : RPU de l'image appliqué, résiduel désactivé, comme un lecteur
+    // Dolby Vision qui n'a pas encore pu décoder l'EL.
+    std::atomic<long long> el_unavailable_frames{0};
     static bool own_rpu(const AVFrame &f) { return av_frame_get_side_data(&f, AV_FRAME_DATA_DOVI_RPU_BUFFER); }
     static void disable_residual(AVFrame &base) {
         const auto *sd = av_frame_get_side_data(&base, AV_FRAME_DATA_DOVI_METADATA);
@@ -735,20 +889,32 @@ struct mvo_fel_context {
     }
     // Apparie BL/EL/RPU par rang de présentation (n-ième image BL avec la n-ième image EL), quelle
     // que soit la structure de GOP de chaque couche ; false si emit demande l'arrêt. Une EL manquante
-    // ou en trop décale les rangs suivants : couche orpheline en fin de flux, refusée.
+    // ou en trop décale les rangs suivants : couche orpheline en fin de flux, refusée. Chaque couche
+    // commence à sa propre IRAP : rank_offset aligne leurs premières images produites.
     bool pair(const Emit &emit) {
         if (layer != LAYER_RECONSTRUCTED) return pair_base(emit);
         drop_leading();
-        if (!leading_done || el_leading < leading) return true;
+        if (!bl_start.settled) return true;
+        const int64_t offset = rank_offset();
+        // EL dont l'image BL de même rang précède la cible.
+        if (el_start.settled)
+            while (!el.ready.empty() && el_dropped + offset < leading) { el.ready.pop_front(); ++el_dropped; }
+        if (!leading_done) return true;
+        // Images gardées sans EL de même rang (EL commencée après la cible) : lecture reprise plus tôt.
+        if (offset > leading && can_seek_earlier()) { reseek_requested = true; return true; }
         while (!bl.ready.empty()) {
             check_cancelled();
-            const bool base_only = !own_rpu(*bl.ready.front());
+            // Rang sans EL décodable (début du flux) ; au-delà du minimum connu, décalage exact attendu.
+            const bool unavailable = kept < offset - leading;
+            if (!unavailable && !el_start.settled) break;
+            const bool base_only = unavailable || !own_rpu(*bl.ready.front());
             if (!base_only && el.ready.empty()) break;  // EL de même rang encore en décodage
             auto base = std::move(bl.ready.front()); bl.ready.pop_front();
+            ++kept;
             Frame enhancement;
             if (base_only) {
-                if (!last_el) throw Failure("Image BL sans RPU ni EL avant la première image FEL");
-                enhancement.reset(av_frame_clone(last_el.get()));
+                // Plan EL neutre, non lu (résiduel désactivé) : EL précédente, sinon l'image BL.
+                enhancement.reset(av_frame_clone(last_el ? last_el.get() : base.get()));
                 if (!enhancement) throw std::bad_alloc();
                 disable_residual(*base);
             } else {
@@ -769,9 +935,10 @@ struct mvo_fel_context {
             muxiveo::fel::Mapping mapping(*metadata);
             if (!base_only && !mapping.residual) throw Failure("Résiduel désactivé pendant la reconstruction FEL");
             if (skipped < skip) { ++skipped; continue; }
-            if (base_only) ++bl_only_frames;
+            if (unavailable) ++el_unavailable_frames;
+            else if (base_only) ++bl_only_frames;
             // Changement de plan : RPU propre seulement (une courbe héritée ne commence pas de plan).
-            const bool scene_start = !base_only && av_dovi_get_color(metadata)->scene_refresh_flag;
+            const bool scene_start = own_rpu(*base) && av_dovi_get_color(metadata)->scene_refresh_flag;
             if (!emit_job(std::move(base), std::move(enhancement), metadata, std::move(mapping), scene_start,
                           active_area(metadata), emit))
                 return false;
@@ -889,21 +1056,28 @@ struct mvo_fel_context {
     void decode_all(const Emit &emit) {
         auto p = packet();
         for (;;) {
-            check_cancelled();
-            int ret;
-            { Timer timer(timing[1]); ret = av_read_frame(input, p.get()); }
-            if (ret == AVERROR_EOF) break;
-            check(ret, "Lecture source", MVO_FEL_INPUT_ERROR);
-            if (p->stream_index == stream_index) {
-                { Timer timer(timing[2]); bl.send(p.get()); }
-                if (layer == LAYER_RECONSTRUCTED) { Timer timer(timing[3]); el.send(p.get()); }
-                if (!pair(emit)) return;
+            for (;;) {
+                check_cancelled();
+                int ret;
+                { Timer timer(timing[1]); ret = av_read_frame(input, p.get()); }
+                if (ret == AVERROR_EOF) break;
+                check(ret, "Lecture source", MVO_FEL_INPUT_ERROR);
+                if (p->stream_index == stream_index) {
+                    send_access_unit(p.get());
+                    if (!pair(emit)) return;
+                }
+                av_packet_unref(p.get());
+                if (reseek_requested) reseek();
             }
-            av_packet_unref(p.get());
+            { Timer timer(timing[2]); bl.send(nullptr); }
+            if (layer == LAYER_RECONSTRUCTED) { Timer timer(timing[3]); el.send(nullptr); }
+            // Fin du flux : images de tête des couches commencées toutes lues.
+            bl_start.settled = bl_start.settled || bl_start.started;
+            el_start.settled = el_start.settled || el_start.started;
+            if (!pair(emit)) return;
+            if (!reseek_requested) break;
+            reseek();
         }
-        { Timer timer(timing[2]); bl.send(nullptr); }
-        if (layer == LAYER_RECONSTRUCTED) { Timer timer(timing[3]); el.send(nullptr); }
-        if (!pair(emit)) return;
         if (!leading_done) el.ready.clear();  // cible au-delà de la dernière image
         if (!bl.ready.empty() || !el.ready.empty())
             throw Failure("Fin de flux BL/EL désalignée : nombre d'images EL différent des images BL avec RPU");
@@ -1218,10 +1392,7 @@ struct mvo_fel_context {
             throw Failure("Capture : tampon trop petit");
         check_cancelled();
         // Repositionnement : files et décodeurs vidés, appariement et horodatages repris à zéro.
-        bl.ready.clear(); el.ready.clear();
-        avcodec_flush_buffers(bl.decoder); av_bsf_flush(bl.split);
-        avcodec_flush_buffers(el.decoder); av_bsf_flush(el.split);
-        leading = el_leading = 0; leading_done = false;
+        reset_decoding();
         last_pts = first_pts = AV_NOPTS_VALUE;
         start_us = std::max<int64_t>(0, at_us);
         seek();
@@ -1561,6 +1732,8 @@ const char *mvo_fel_statistics(mvo_fel_context *p) {
     text << ",\"certified_rescued\":" << rescued << ",\"certified_undecided\":" << undecided;
     // Images sans RPU ni EL recomposées sans résiduel (courbe du RPU précédent).
     text << ",\"bl_only_frames\":" << p->bl_only_frames.load();
+    // Images d'un flux commençant avant la première IRAP de l'EL, recomposées sans résiduel.
+    text << ",\"el_unavailable_frames\":" << p->el_unavailable_frames.load();
     // Images refaites sur le CPU certifié (liste des indécises du GPU saturée).
     text << ",\"cpu_rescue_frames\":" << p->cpu_rescue_frames.load();
     // Attentes des files : l'étage le plus attendu par les autres est le goulot.

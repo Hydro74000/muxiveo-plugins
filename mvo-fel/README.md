@@ -4,13 +4,23 @@ Extension facultative de Muxiveo. Le moteur reconstruit l'apport de la couche FE
 dans les pixels avant les filtres, le tone mapping, l'interpolation et l'encodage,
 indépendamment de la conservation du RPU en sortie.
 
-**Préversion `mvo-fel-v0.6.0`.** Trois précisions : Lent (exact certifié, identique au CPU au bit
+**Préversion `mvo-fel-v0.6.1`.** Trois précisions : Lent (exact certifié, identique au CPU au bit
 près), Standard (≤ 1 code 16 bits) et Rapide (float32). Le Lent en virgule fixe utilise une
 [EOTF à deux niveaux](docs/2026-10-16-eotf-deux-niveaux.md) et une sortie Y'CbCr exacte en
 entiers ; deux images sont en vol par défaut. Paquets : Linux x86_64 GPU (Vulkan, transport direct
 NVIDIA), Windows x86_64 GPU (Vulkan), macOS arm64 CPU. Attestations de schéma 5 sur RTX 4070 Ti
 SUPER, iGPU AMD Raphael, GTX 1070 et Intel UHD 630. L'épinglage dans Muxiveo attend l'accord du
 mainteneur. La lecture sur matériel Dolby Vision reste à valider avant une release générale.
+
+Correctif en 0.6.1 : positionnement et flux coupés au milieu d'un GOP de la couche EL. Chaque
+couche n'est décodée qu'à partir de sa propre image IRAP, et les images produites des deux couches
+sont réalignées par rang de présentation (images RASL de chaque IRAP comptées). Quand les images clés
+de l'EL ne suivent pas celles de la BL, un positionnement reprend la lecture à une image clé BL
+antérieure jusqu'à ce que l'EL couvre l'image demandée : mêmes images, au bit près, qu'un décodage
+complet depuis le début (auparavant « Envoi couche au décodeur : Invalid data found »). Un flux qui
+commence avant la première IRAP de l'EL (extrait) recompose ces premières images avec le RPU de
+l'image, sans résiduel, comme un lecteur Dolby Vision, et les compte (`el_unavailable_frames` des
+statistiques).
 
 Nouveau en 0.6.0 : session de capture (capacité `capture`, `mvo_fel_capture_frame_size` et
 `mvo_fel_capture_pair`) pour le FEL Analyzer de Muxiveo. La source, les décodeurs et le GPU sont
