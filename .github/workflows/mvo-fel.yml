@@ -85,8 +85,10 @@ jobs:
     # Sonde seulement : aucun contenu FEL réel ne peut valider le GPU ici. Le paquet macOS
     # reste CPU ; GPU proposé en choix manuel si cette sonde passe (borne validée 15/10/2026).
     if: github.event_name == 'workflow_dispatch' && inputs.prepare_gpu
-    runs-on: macos-14
+    runs-on: macos-15
     continue-on-error: true
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "14.0"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -149,9 +151,13 @@ jobs:
         include:
           - os: windows-2022
             platform: windows-x86_64
-          - os: macos-14
+          - os: macos-15
             platform: macos-arm64
     runs-on: ${{ matrix.os }}
+    env:
+      # Image macos-14 retirée par GitHub : compilation sur macos-15, macOS 14.0 minimal comme la 0.6.0
+      # (clang, CMake, Meson et Cargo lisent cette variable). Sans effet sous Windows.
+      MACOSX_DEPLOYMENT_TARGET: "14.0"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -179,6 +185,9 @@ jobs:
         working-directory: mvo-fel
         run: |
           python3 scripts/build.py build
+          minos=$(otool -l build/plugin/libmvo_fel.dylib | awk '/LC_BUILD_VERSION/{found=1} found && $1 == "minos" {print $2; exit}')
+          echo "macOS minimal de libmvo_fel.dylib : $minos"
+          test "$minos" = "$MACOSX_DEPLOYMENT_TARGET"
           python3 scripts/package.py macos-arm64 build build/dist
       - name: Build Windows
         if: runner.os == 'Windows'
