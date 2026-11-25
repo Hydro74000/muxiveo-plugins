@@ -4,13 +4,19 @@ Extension facultative de Muxiveo. Le moteur reconstruit l'apport de la couche FE
 dans les pixels avant les filtres, le tone mapping, l'interpolation et l'encodage,
 indépendamment de la conservation du RPU en sortie.
 
-**Préversion `mvo-fel-v0.6.1`.** Trois précisions : Lent (exact certifié, identique au CPU au bit
+**Préversion `mvo-fel-v0.6.2`.** Trois précisions : Lent (exact certifié, identique au CPU au bit
 près), Standard (≤ 1 code 16 bits) et Rapide (float32). Le Lent en virgule fixe utilise une
 [EOTF à deux niveaux](docs/2026-10-16-eotf-deux-niveaux.md) et une sortie Y'CbCr exacte en
 entiers ; deux images sont en vol par défaut. Paquets : Linux x86_64 GPU (Vulkan, transport direct
 NVIDIA), Windows x86_64 GPU (Vulkan), macOS arm64 CPU. Attestations de schéma 5 sur RTX 4070 Ti
 SUPER, iGPU AMD Raphael, GTX 1070 et Intel UHD 630. L'épinglage dans Muxiveo attend l'accord du
 mainteneur. La lecture sur matériel Dolby Vision reste à valider avant une release générale.
+
+Correctif en 0.6.2 : NAL à en-tête invalide (bit interdit à 1, `nuh_temporal_id_plus1` nul) et types
+VCL réservés ignorés pour reconnaître l'image de chaque couche, comme le décodeur. Un rip dont la
+première unité d'accès commence par une telle NAL (DVDFab : type 31 devant l'IDR) faisait attendre
+l'image clé suivante : premier GOP absent de la production et de la mesure, statistiques et HDR10+
+décalés d'autant.
 
 Correctif en 0.6.1 : positionnement et flux coupés au milieu d'un GOP de la couche EL. Chaque
 couche n'est décodée qu'à partir de sa propre image IRAP, et les images produites des deux couches

@@ -172,12 +172,19 @@ AccessUnitLayers access_unit_layers(const AVPacket &packet, int nal_length_size)
     AccessUnitLayers au;
     const uint8_t *data = packet.data;
     const size_t size = packet.data ? size_t(packet.size) : 0;
-    const auto visit = [&au](const uint8_t *nal, size_t length) {
-        if (length < 2) return;
+    // En-tête NAL invalide (forbidden_zero_bit à 1 ou nuh_temporal_id_plus1 nul) : ignoré par le décodeur
+    // (FFmpeg, comme H.265 § 7.4.2.2), donc jamais pris pour l'image de la couche (rip DVDFab : NAL de
+    // type 31 à bit interdit devant l'IDR, premier GOP perdu). Types VCL réservés : pas décodés non plus.
+    const auto valid_header = [](const uint8_t *header) { return !(header[0] & 0x80) && (header[1] & 0x07); };
+    const auto decoded_vcl = [](int type) { return type <= 9 || (type >= 16 && type <= 21); };
+    const auto visit = [&](const uint8_t *nal, size_t length) {
+        if (length < 2 || !valid_header(nal)) return;
         const int type = (nal[0] >> 1) & 0x3F;
         if (type == 63) {
-            if (length >= 4 && au.el < 0 && ((nal[2] >> 1) & 0x3F) < 32) au.el = (nal[2] >> 1) & 0x3F;
-        } else if (type < 32 && au.bl < 0) {
+            if (length < 4 || au.el >= 0 || !valid_header(nal + 2)) return;
+            const int inner = (nal[2] >> 1) & 0x3F;
+            if (decoded_vcl(inner)) au.el = inner;
+        } else if (decoded_vcl(type) && au.bl < 0) {
             au.bl = type;
         }
     };

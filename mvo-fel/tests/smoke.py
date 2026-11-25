@@ -102,10 +102,12 @@ def smoke(library: Path, fixture: Path, output: Path | None = None, device: str 
     yuv_output(lib, fixture)
     precision_modes(lib, fixture, device)
     missing_layers(lib, fixture, device)
+    invalid_nals(lib, fixture, device)
     frame_statistics(lib, fixture, device)
     measure(lib, fixture, device)
     capture(lib, fixture, device)
-    print("ABI, NUT, 12 images/B-frames, seek, descripteur, Y'CbCr, précisions, AU sans RPU ni EL, statistiques, mesure, "
+    print("ABI, NUT, 12 images/B-frames, seek, descripteur, Y'CbCr, précisions, AU sans RPU ni EL, NAL invalides, "
+          "statistiques, mesure, "
           "capture, fermeture aval, annulation, piste invalide et erreur de lecture : OK")
 
 
@@ -409,6 +411,71 @@ def missing_layers(lib, fixture: Path, device: str) -> None:
     for engine in ("cpu", device):
         result, data, statistics = render(mixed, engine)
         assert result == 0 and statistics["frames"] == 12 and data == complete, (engine, result, statistics)
+
+
+def with_invalid_nals(fixture: Path, output: Path) -> None:
+    """Copie du flux avec des NAL à en-tête invalide (ignorées par le décodeur) : bit interdit à 1 devant
+    l'IDR (rip DVDFab réel : type 31, SPS + PPS recopiés), dans une unité d'accès en milieu de flux, et
+    ``nuh_temporal_id_plus1`` nul devant une image."""
+    data = fixture.read_bytes()
+    junk_forbidden = b"\x00\x00\x00\x01\xbe\x42\x01\x01\x22\x20\x00\x00\x03\x00\xb0"
+    junk_tid = b"\x00\x00\x00\x01\x02\x00\x80\x55"  # type 1 (tranche), temporal_id_plus1 = 0
+    starts = [m.start() - (m.start() > 0 and data[m.start() - 1] == 0) for m in re.finditer(b"\x00\x00\x01", data)]
+    out, unit = bytearray(junk_forbidden), -1
+    for begin, end in zip(starts, starts[1:] + [len(data)]):
+        header = data.index(b"\x00\x00\x01", begin) + 3
+        kind = (data[header] >> 1) & 0x3F
+        if kind < 32 and data[header + 2] & 0x80:
+            unit += 1
+            if unit == 5:
+                out += junk_tid
+        out += data[begin:end]
+        if unit == 3 and kind < 32:
+            out += junk_forbidden
+    output.write_bytes(bytes(out))
+
+
+def invalid_nals(lib, fixture: Path, device: str) -> None:
+    """NAL à en-tête invalide : ignorées comme par le décodeur — aucune image perdue, mêmes octets produits
+    et mêmes statistiques mesurées que le flux propre (0.6.1 attendait l'image clé suivante)."""
+    for name in ("mvo_fel_set_measure",):
+        getattr(lib, name).argtypes = [c.c_void_p, c.c_char_p]
+        getattr(lib, name).restype = c.c_int
+    lib.mvo_fel_set_frame_statistics.argtypes = [c.c_void_p, c.c_char_p]
+    lib.mvo_fel_set_frame_statistics.restype = c.c_int
+
+    def run(path: Path, engine: str, stats: Path | None = None, measure: bool = False) -> tuple[int, bytes]:
+        handle = lib.mvo_fel_create(str(path).encode(), 0, 2, 24000, 1001)
+        assert handle
+        data = bytearray()
+        try:
+            assert lib.mvo_fel_set_precision(handle, b"exact") == 0
+            assert lib.mvo_fel_set_device(handle, engine.encode("ascii")) == 0
+            if stats is not None:
+                assert lib.mvo_fel_set_frame_statistics(handle, str(stats).encode()) == 0
+            if measure:
+                assert lib.mvo_fel_set_measure(handle, b"base") == 0
+            sink = (c.cast(None, WRITE) if measure
+                    else WRITE(lambda _o, p, n: data.extend(c.string_at(p, n)) or 0))
+            result = lib.mvo_fel_run(handle, sink, PROGRESS(lambda *_: None), None)
+            assert result == 0, (path.name, engine, lib.mvo_fel_error(handle))
+            return result, bytes(data)
+        finally:
+            lib.mvo_fel_destroy(handle)
+
+    with tempfile.TemporaryDirectory(prefix="fel-invalid-") as temporary:
+        folder = Path(temporary)
+        dirty = folder / "invalid-nal.hevc"
+        with_invalid_nals(fixture.resolve(), dirty)
+        _, clean_frames = run(fixture.resolve(), "cpu")
+        for engine in ("cpu", device):
+            _, frames = run(dirty, engine)
+            assert frames == clean_frames, engine
+            clean_stats, dirty_stats = folder / f"clean-{engine}.jsonl", folder / f"dirty-{engine}.jsonl"
+            run(fixture.resolve(), engine, clean_stats, measure=True)
+            run(dirty, engine, dirty_stats, measure=True)
+            assert dirty_stats.read_bytes() == clean_stats.read_bytes(), engine
+            assert sum('"frame"' in line for line in dirty_stats.read_text(encoding="utf-8").splitlines()) == 12
 
 
 def precision_modes(lib, fixture: Path, device: str) -> None:
