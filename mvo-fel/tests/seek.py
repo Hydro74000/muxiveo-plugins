@@ -12,9 +12,10 @@ from __future__ import annotations
 import ctypes as c
 import json
 import sys
+import tempfile
 from pathlib import Path
 
-from smoke import load
+from smoke import PROGRESS, WRITE, load
 
 FIXTURES = Path(__file__).parent / "fixtures"
 FRAME_US = 1001 * 1000000 / 24000
@@ -74,8 +75,54 @@ def main() -> None:
     assert unavailable == 4, unavailable
     assert [frame for frame, _ in frames[:4]] == [mapped for _, mapped in reference[16:20]]
     assert [frame for frame, _ in frames[4:]] == [frame for frame, _ in reference[20:48]]
+    invalid_packets(lib, frames, unavailable)
     print("Positionnements (46 rangs, retours en arrière) identiques au décodage complet ; extrait coupé en "
-          "milieu de GOP EL : 4 images sans EL (mapped) puis images reconstruites : OK")
+          "milieu de GOP EL : 4 images sans EL (mapped) puis images reconstruites ; paquets sans image "
+          "(NAL invalides) sans effet : OK")
+
+
+def produce(lib, path: Path, statistics: Path | None = None, measure: bool = False) -> tuple[bytes, dict]:
+    """Production (ou mesure « base ») depuis le début : (octets NUT, statistiques du plugin)."""
+    handle = lib.mvo_fel_create(str(path.resolve()).encode(), 0, 2, 24000, 1001)
+    assert handle
+    data = bytearray()
+    try:
+        assert lib.mvo_fel_set_device(handle, b"cpu") == 0
+        assert lib.mvo_fel_set_precision(handle, b"exact") == 0
+        if statistics is not None:
+            assert lib.mvo_fel_set_frame_statistics(handle, str(statistics).encode()) == 0
+        if measure:
+            assert lib.mvo_fel_set_measure(handle, b"base") == 0
+        sink = c.cast(None, WRITE) if measure else WRITE(lambda _o, p, n: data.extend(c.string_at(p, n)) or 0)
+        assert lib.mvo_fel_run(handle, sink, PROGRESS(lambda *_: None), None) == 0, lib.mvo_fel_error(handle)
+        return bytes(data), json.loads(lib.mvo_fel_statistics(handle) or b"{}")
+    finally:
+        lib.mvo_fel_destroy(handle)
+
+
+def invalid_packets(lib, reference: list[tuple[bytes, bytes]], unavailable: int) -> None:
+    """Extrait précédé d'un paquet sans image (NAL invalide seule) et un second entre la CRA BL et l'IRAP EL :
+    aucune couche démarrée ni rang décalé par ces paquets — capture, production et mesure identiques à
+    l'extrait propre (0.6.2 ; un paquet lisible sans image démarrait sinon les deux couches)."""
+    for name in ("mvo_fel_set_frame_statistics", "mvo_fel_set_measure"):
+        getattr(lib, name).argtypes = [c.c_void_p, c.c_char_p]
+        getattr(lib, name).restype = c.c_int
+    clean, dirty = FIXTURES / "synthetic-fel-shifted-irap-cut.mkv", FIXTURES / "synthetic-fel-shifted-irap-cut-invalid.mkv"
+    handle, size = session(lib, dirty)
+    try:
+        frames = capture(lib, handle, size, 0, 32)
+        statistics = json.loads(lib.mvo_fel_statistics(handle))
+    finally:
+        lib.mvo_fel_destroy(handle)
+    assert frames == reference and statistics["el_unavailable_frames"] == unavailable, statistics
+    produced, statistics = produce(lib, dirty)
+    assert produced == produce(lib, clean)[0] and statistics["el_unavailable_frames"] == unavailable, statistics
+    with tempfile.TemporaryDirectory(prefix="fel-invalid-") as temporary:
+        clean_stats, dirty_stats = Path(temporary) / "clean.jsonl", Path(temporary) / "dirty.jsonl"
+        produce(lib, clean, clean_stats, measure=True)
+        produce(lib, dirty, dirty_stats, measure=True)
+        assert dirty_stats.read_bytes() == clean_stats.read_bytes()
+        assert sum('"frame"' in line for line in dirty_stats.read_text(encoding="utf-8").splitlines()) == 32
 
 
 if __name__ == "__main__":

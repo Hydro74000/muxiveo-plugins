@@ -166,8 +166,9 @@ struct Layer {
 };
 // Type NAL de la première tranche de chaque couche d'une unité d'accès (-1 : couche absente) ; l'EL est
 // encapsulée dans des NAL 63 (en-tête de la NAL EL deux octets plus loin), le RPU dans une NAL 62.
-// parsed faux : découpage illisible, aucun filtrage par couche.
-struct AccessUnitLayers { bool parsed = false; int bl = -1, el = -1; };
+// parsed faux : découpage illisible, aucun filtrage par couche. picture faux : paquet lisible sans image
+// décodable (NAL invalides ou en-têtes seuls) : ne démarre aucune couche et ne compte pas comme unité d'accès.
+struct AccessUnitLayers { bool parsed = false, picture = false; int bl = -1, el = -1; };
 AccessUnitLayers access_unit_layers(const AVPacket &packet, int nal_length_size) {
     AccessUnitLayers au;
     const uint8_t *data = packet.data;
@@ -216,7 +217,8 @@ AccessUnitLayers access_unit_layers(const AVPacket &packet, int nal_length_size)
         if (start == SIZE_MAX) return {};
         visit(data + start, size - start);
     }
-    au.parsed = au.bl >= 0 || au.el >= 0;
+    au.parsed = true;
+    au.picture = au.bl >= 0 || au.el >= 0;
     return au;
 }
 // Début du décodage d'une couche : jamais avant sa propre image IRAP (une EL dont les images clés ne
@@ -688,10 +690,11 @@ struct mvo_fel_context {
                     const auto au = access_unit_layers(*p, nal_length_size);
                     for (int layer = 0; layer < layer_count; ++layer) {
                         if (!au.parsed) starts[layer].accept_all(index, p->pts);
-                        else if (!starts[layer].admit(layer ? au.el : au.bl, index, p->pts)) continue;
+                        else if (!au.picture ? !starts[layer].started
+                                 : !starts[layer].admit(layer ? au.el : au.bl, index, p->pts)) continue;
                         for (int i = 3*layer; i < 3*layer + 3; ++i) layers[i].send(p.get());
                     }
-                    ++index;
+                    if (!au.parsed || au.picture) ++index;
                 }
                 av_packet_unref(p.get());
                 drain();
@@ -806,6 +809,13 @@ struct mvo_fel_context {
         if (!au.parsed) {
             bl_start.accept_all(au_index, p->pts);
             el_start.accept_all(au_index, p->pts);
+        } else if (!au.picture) {
+            // Sans image décodable : transmis aux seules couches commencées, rangs inchangés.
+            send_bl = bl_start.started;
+            send_el = reconstructed && el_start.started;
+            if (send_bl) { Timer timer(timing[2]); bl.send(p); }
+            if (send_el) { Timer timer(timing[3]); el.send(p); }
+            return;
         } else {
             send_bl = bl_start.admit(au.bl, au_index, p->pts);
             send_el = reconstructed && el_start.admit(au.el, au_index, p->pts);

@@ -57,6 +57,9 @@ def main() -> None:
         # Recopie FFmpeg : un cluster indexé par image clé (positionnement au milieu de la mire).
         run("ffmpeg", "-v", "error", "-y", "-i", str(timed), "-map", "0:v:0", "-c", "copy", str(args.output.resolve()))
         cut_from_keyframe(args.output.resolve(), args.cut.resolve(), keyframe=1)
+        # Extrait précédé d'un paquet sans image (NAL invalide) et un second entre la CRA BL et l'IRAP EL.
+        with_invalid_blocks(args.cut.resolve(), args.cut.resolve().with_name(args.cut.stem + "-invalid.mkv"),
+                            before=(0, 2))
 
 
 def cut_from_keyframe(source: Path, output: Path, *, keyframe: int) -> None:
@@ -77,6 +80,38 @@ def cut_from_keyframe(source: Path, output: Path, *, keyframe: int) -> None:
         tracks=(MatroskaMuxTrack(source=source, source_track=track, output_number=1, output_uid=1),),
         packets=tuple(MatroskaMuxPacket(output_track_number=1, block=block, source_sequence=index)
                       for index, block in enumerate(kept)),
+    ))
+
+
+#: NAL à en-tête invalide (tranche, forbidden_zero_bit à 1, first_slice_segment_in_pic_flag à 1), ignorée par
+#: le décodeur ; préfixée par sa longueur (hvcC, 4 octets).
+INVALID_NAL = bytes([0x80 | (1 << 1), 0x01, 0x80, 0x55, 0xAA])
+
+
+def with_invalid_blocks(source: Path, output: Path, *, before: tuple[int, ...]) -> None:
+    """Copie de ``source`` avec, devant chacun des blocs ``before`` (ordre de décodage), un bloc ne contenant
+    qu'une NAL invalide (même horodatage que le bloc suivant, sans image clé) : paquet lisible sans image."""
+    import dataclasses
+
+    from core.matroska.mux_plan import MatroskaMuxPacket, MatroskaMuxPlan, MatroskaMuxTrack
+    from core.matroska.reader import MatroskaReader
+    from core.matroska.writer import MatroskaWriter
+
+    reader = MatroskaReader(source)
+    reader.segment()
+    (track,) = [item for item in reader.tracks() if item.track_type == 1]
+    junk = len(INVALID_NAL).to_bytes(4, "big") + INVALID_NAL
+    blocks = []
+    for index, block in enumerate(reader.blocks(track_numbers={track.number})):
+        if index in before:
+            blocks.append(dataclasses.replace(block, payload=junk, payload_bytes=len(junk), flags=block.flags & ~0x80,
+                                              is_keyframe=False, references=(), references_ns=()))
+        blocks.append(block)
+    MatroskaWriter().write(MatroskaMuxPlan(
+        output=output,
+        tracks=(MatroskaMuxTrack(source=source, source_track=track, output_number=1, output_uid=1),),
+        packets=tuple(MatroskaMuxPacket(output_track_number=1, block=block, source_sequence=index)
+                      for index, block in enumerate(blocks)),
     ))
 
 

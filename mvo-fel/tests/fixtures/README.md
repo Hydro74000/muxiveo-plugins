@@ -24,5 +24,5 @@ exactement l'image de `synthetic-fel.hevc`.
 deux couches), même RPU que `synthetic-fel.hevc`. Les images clés BL et EL ne coïncident pas : un
 positionnement doit faire commencer chaque couche à sa propre IRAP et apparier les rangs.
 `synthetic-fel-shifted-irap-cut.mkv` en est l'extrait à partir de la CRA BL de l'image 16, au milieu
-d'un GOP EL. `../make_seek_fixture.py --muxiveo <dépôt Muxiveo>` reproduit les deux fichiers (le muxer
+d'un GOP EL. `synthetic-fel-shifted-irap-cut-invalid.mkv` est cet extrait avec deux paquets sans image (une NAL à bit interdit seule), l'un devant la CRA BL, l'autre entre la CRA BL et l'IRAP EL : ils ne doivent ni démarrer une couche ni décaler les rangs. `../make_seek_fixture.py --muxiveo <dépôt Muxiveo>` reproduit les trois fichiers (le muxer
 Matroska natif de Muxiveo horodate le HEVC brut à images B, que FFmpeg ne sait pas encapsuler).
